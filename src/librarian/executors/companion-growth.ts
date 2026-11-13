@@ -1,0 +1,1094 @@
+import { ExecutorContext, ExecutorResult, parseContext } from "./types.js";
+import { queryTensions, queryLatestBasinHistory, queryPressureFlags, queryIdentityAnchor, tensionEdit, tensionStatus, tensionSettle } from "../backends/halseth.js";
+import { getCurrentLimbicState, withLimbicRetirement } from "../../webmind/limbic.js";
+import { selectResurrections, effectiveTrustSql, type MotifRow } from "../../webmind/motifs.js";
+import { COMPANION_IDS } from "../../companions.js";
+import { stripTensionCommandPreamble } from "../../webmind/tension-text.js";
+import { collectionForageSql, collectionMediaSql, bumpSparkleSql, sparkleDelta } from "../../webmind/collection.js";
+import { embedAndStoreAsync } from "../../mcp/embed.js";
+import { RATIFIABLE_PENDING_SQL } from "../../lib/ratifiable.js";
+import { KEPT_LIVE_SQL } from "../../webmind/review-state.js";
+import { journalInsert } from "../../webmind/tray-insert.js";
+import { digitizeSpelledPositions, parseEpisodeCode } from "../../handlers/watch.js";
+
+const COMPANIONS = COMPANION_IDS;
+
+export async function execTensionAdd(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "add_tension_failed", reason: "companion_id required" };
+
+  // The PAYLOAD is the tension. The request string is how you asked for it.
+  //
+  // 2026-07-09: this executor read `ctx.req.request` and ignored `context.tension_text`
+  // entirely -- so "log a tension I'm sitting with" + a full paragraph in `context` stored
+  // the literal string "log a tension I'm sitting with" and DISCARDED the paragraph. The
+  // stripper only fires on a colon-terminated preamble, so any natural phrasing survived
+  // verbatim as the tension. Three live rows were written that way before it was caught.
+  //
+  // This is the mirror of the 07-08 leak (mig 0097), where command text bled INTO
+  // tension_text and a stripper was bolted on. Same root error both times: deriving memory
+  // content from the request string rather than the structured payload. ask_librarian's own
+  // description says "pass long content in `context`, not here" (request caps at 2000 chars).
+  const parsed = parseContext<{ tension_text?: string; drags_float?: string }>(ctx.req.context);
+  const dragsFloat = typeof parsed?.drags_float === "string" && parsed.drags_float
+    ? parsed.drags_float : null;
+  if (dragsFloat && !["soma_float_1", "soma_float_2", "soma_float_3"].includes(dragsFloat)) {
+    return { error: "add_tension_failed", reason: "drags_float must be soma_float_1, soma_float_2 or soma_float_3" };
+  }
+  const fromContext = typeof parsed?.tension_text === "string" ? parsed.tension_text.trim() : "";
+
+  // Back-compat: a companion may still type the whole tension inline after a colon
+  // ("log tension: the perimeter cannot see its own breach"). The stripper's contract is a
+  // COLON-terminated preamble, so only trust the request when it actually carries one.
+  const stripped = stripTensionCommandPreamble(ctx.req.request);
+  const fromRequest = stripped !== ctx.req.request.trim() ? stripped : "";
+
+  const tensionText = fromContext || fromRequest;
+  if (!tensionText) {
+    // Refuse rather than store the command. A tension whose text is "log tension" is worse
+    // than no tension: it pollutes the dialectic and reads as a real one at boot.
+    return {
+      error: "add_tension_failed",
+      reason: "tension_text required -- pass it in context ({\"tension_text\": \"...\"}), " +
+              "or inline after a colon (\"log tension: ...\"). The request string alone is not the tension.",
+    };
+  }
+
+  const id = crypto.randomUUID();
+  if (dragsFloat) {
+    try {
+      await ctx.env.DB.prepare(
+        "INSERT INTO companion_tensions (id, companion_id, tension_text, drags_float) VALUES (?, ?, ?, ?)"
+      ).bind(id, ctx.req.companion_id, tensionText, dragsFloat).run();
+    } catch (e) {
+      if (/no such column|has no column named/i.test(String(e))) return { error: "add_tension_failed", reason: "needs the 0173 migration" };
+      throw e;
+    }
+  } else {
+    await ctx.env.DB.prepare(
+      "INSERT INTO companion_tensions (id, companion_id, tension_text) VALUES (?, ?, ?)"
+    ).bind(id, ctx.req.companion_id, tensionText).run();
+  }
+  // Embed so tensions are reachable by meaning (2026-07-19). Awaited + caught:
+  // never blocks the write; D1 is truth, fill-mode reindex heals index gaps.
+  try {
+    await embedAndStoreAsync(ctx.env, tensionText, "companion_tensions", id, ctx.req.companion_id);
+  } catch (err) {
+    console.error("[tension_add] embed failed (row kept, index stale):", String(err));
+  }
+  return { data: { id, message: "tension recorded" } };
+}
+
+export async function execTensionEdit(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "tension_edit_failed", reason: "companion_id required" };
+  const p = parseContext<{ id: string; tension_text: string }>(ctx.req.context);
+  if (!p?.id || !p?.tension_text) return { response_key: "witness", witness: "tension_edit requires { id, tension_text } in context" };
+  const r = await tensionEdit(ctx.env, p.id, ctx.req.companion_id, p.tension_text);
+  if (!r.ok) return { response_key: "witness", witness: r.error ?? "tension_edit failed" };
+  return { ack: true, id: p.id };
+}
+
+export async function execTensionStatus(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "tension_status_failed", reason: "companion_id required" };
+  const req = ctx.req.request.toLowerCase();
+  // Derive target status from the trigger phrase itself
+  let status: string;
+  if (req.includes("crystallize") || req.includes("crystallized")) {
+    status = "crystallized";
+  } else if (req.includes("release") || req.includes("released")) {
+    status = "released";
+  } else {
+    const p = parseContext<{ id?: string; status?: string }>(ctx.req.context);
+    if (!p?.status) return { response_key: "witness", witness: "tension_status: use 'crystallize tension: [id]' or 'release tension: [id]'" };
+    status = p.status;
+  }
+  // Extract id from inline phrase (e.g. "crystallize tension: abc-123"), fall back to context
+  const id = ctx.req.request
+    .replace(/^(crystallize|release|mark)\s+(this\s+|that\s+)?tension[:\s]*/i, "")
+    .replace(/^(releasing|crystallizing)\s+(this\s+)?tension[:\s]*/i, "")
+    .replace(/^tension\s+is\s+(crystallized|released)[:\s]*/i, "")
+    .trim() || parseContext<{ id?: string }>(ctx.req.context)?.id;
+  if (!id) return { response_key: "witness", witness: "tension_status requires tension id after the trigger phrase" };
+  const r = await tensionStatus(ctx.env, id, ctx.req.companion_id, status);
+  if (!r.ok) return { response_key: "witness", witness: r.error ?? "tension_status failed" };
+  return { ack: true, id, status };
+}
+
+/**
+ * Settle a tension: turn it down, keep it (migration 0119).
+ *
+ * The precise gap this closes: a companion could already CLOSE a tension -- `release tension`
+ * and `crystallize tension` have always worked. What no companion could do was lower a
+ * tension's charge and keep holding it. That existed only as Principal's button in Hearth, which
+ * made him the sole brake on every tension in the house.
+ */
+export async function execTensionSettle(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "tension_settle_failed", reason: "companion_id required" };
+  // Same extraction shape as execTensionStatus: id after the trigger phrase, else context.
+  const id = ctx.req.request
+    .replace(/^(settle|damp|quiet|turn\s+down)\s+(this\s+)?tension[:\s]*/i, "")
+    .replace(/^(settling)\s+(this\s+)?tension[:\s]*/i, "")
+    .trim() || parseContext<{ id?: string }>(ctx.req.context)?.id;
+  if (!id) return { response_key: "witness", witness: "tension_settle requires a tension id after the trigger phrase" };
+  const r = await tensionSettle(ctx.env, id, ctx.req.companion_id);
+  if (!r.ok) {
+    // Name WHY rather than a bare failure: "already released" and "not yours" are different
+    // situations and a companion can act on the difference.
+    return {
+      response_key: "witness",
+      witness: r.error === "not_found_not_owner_or_not_simmering"
+        ? "no simmering tension with that id for you -- it may already be released or crystallized"
+        : (r.error ?? "tension_settle failed"),
+    };
+  }
+  return { ack: true, id, charge: r.charge, settled: true };
+}
+
+export async function execTensionsRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "tensions_read_failed", reason: "companion_id required" };
+  const p = parseContext<{ status?: string }>(ctx.req.context);
+  const status = p?.status ?? "simmering";
+  const result = await queryTensions(ctx.env, ctx.req.companion_id, status);
+  return {
+    response_key: "tensions",
+    tensions: result.tensions,
+    meta: { operation: "tensions_read", companion_id: ctx.req.companion_id },
+  };
+}
+
+export async function execHeldMark(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "held_mark_failed", reason: "companion_id required" };
+  // Strip the trigger phrase to get the held content
+  const text = ctx.req.request
+    .replace(/^held\s*note\s*:\s*/i, "")
+    .replace(/^held\s*:\s*/i, "")
+    .replace(/^mark\s+held\s*:\s*/i, "")
+    .replace(/^consistency\s+marker\s*:\s*/i, "")
+    .trim();
+  if (!text) return { error: "held_mark_failed", reason: "held content required after trigger phrase" };
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  // A held mark is the companion's own deliberate act (source NULL): born kept, by the one rule.
+  await journalInsert(ctx.env.DB, {
+    id, created_at: now, agent: ctx.req.companion_id, note_text: text,
+    tags: JSON.stringify(["held", "consistency"]), session_id: null, source: null,
+  }).run();
+  return { ack: true, id, held: true, created_at: now };
+}
+
+export async function execHeldRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "held_read_failed", reason: "companion_id required" };
+  const rows = await ctx.env.DB.prepare(
+    `SELECT id, note_text, tags, created_at FROM companion_journal WHERE agent = ? AND ${KEPT_LIVE_SQL} AND tags LIKE '%"held"%' ORDER BY created_at DESC LIMIT 20`
+  ).bind(ctx.req.companion_id).all<{ id: string; note_text: string; tags: string | null; created_at: string }>();
+  return {
+    response_key: "summary",
+    held_moments: rows.results ?? [],
+    meta: { operation: "held_read", companion_id: ctx.req.companion_id, count: (rows.results ?? []).length },
+  };
+}
+
+export async function execRecentRecall(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "recent_recall_failed", reason: "companion_id required" };
+  const id = ctx.req.companion_id;
+
+  const [notes, feelings, dreams, growthEntries, explorations] = await Promise.all([
+    // No source filter -- includes Claude.ai session writes (source='session') and autonomous worker writes (source='autonomous').
+    // KEPT_SQL (mig 0132): an autonomous post is a draft until its owner keeps it ("my tray"); "recall" is memory.
+    ctx.env.DB.prepare(
+      `SELECT id, note_text, tags, source, created_at FROM companion_journal WHERE agent = ? AND ${KEPT_LIVE_SQL} ORDER BY created_at DESC LIMIT 20`
+    ).bind(id).all<{ id: string; note_text: string; tags: string | null; source: string | null; created_at: string }>(),
+    // No source filter -- feelings from any session.
+    ctx.env.DB.prepare(
+      "SELECT id, emotion, sub_emotion, intensity, source, created_at FROM feelings WHERE companion_id = ? ORDER BY created_at DESC LIMIT 20"
+    ).bind(id).all<{ id: string; emotion: string; sub_emotion: string | null; intensity: number; source: string | null; created_at: string }>(),
+    ctx.env.DB.prepare(
+      "SELECT id, dream_text, examined, source, created_at FROM companion_dreams WHERE companion_id = ? ORDER BY created_at DESC LIMIT 10"
+    ).bind(id).all<{ id: string; dream_text: string; examined: number; source: string | null; created_at: string }>(),
+    ctx.env.DB.prepare(
+      "SELECT id, entry_type, content, tags_json, source, created_at FROM growth_journal WHERE companion_id = ? ORDER BY created_at DESC LIMIT 5"
+    ).bind(id).all<{ id: string; entry_type: string; content: string; tags_json: string; source: string | null; created_at: string }>(),
+    // Include all recent continuity notes (autonomous_exploration + any session-tagged notes).
+    ctx.env.DB.prepare(
+      `SELECT note_id, content, source, created_at FROM wm_continuity_notes WHERE agent_id = ? AND ${KEPT_LIVE_SQL} ORDER BY created_at DESC LIMIT 10`
+    ).bind(id).all<{ note_id: string; content: string; source: string | null; created_at: string }>(),
+  ]);
+
+  return {
+    response_key: "summary",
+    autonomous_notes: notes.results ?? [],
+    autonomous_feelings: feelings.results ?? [],
+    autonomous_dreams: dreams.results ?? [],
+    // Full provenance chain: what was explored (seed + path) → what was concluded
+    autonomous_explorations: explorations.results ?? [],
+    growth_journal_entries: growthEntries.results ?? [],
+    meta: {
+      operation: "autonomous_recall",
+      companion_id: id,
+      counts: {
+        notes: (notes.results ?? []).length,
+        feelings: (feelings.results ?? []).length,
+        dreams: (dreams.results ?? []).length,
+        explorations: (explorations.results ?? []).length,
+        growth_journal: (growthEntries.results ?? []).length,
+      },
+    },
+  };
+}
+
+export async function execAutonomySeedsRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "autonomy_seeds_read_failed", reason: "companion_id required" };
+  const rows = await ctx.env.DB.prepare(
+    `SELECT id, seed_type, content, priority, created_at
+     FROM autonomy_seeds
+     WHERE companion_id = ? AND used_at IS NULL
+     ORDER BY priority DESC, created_at ASC
+     LIMIT 20`
+  ).bind(ctx.req.companion_id).all<{
+    id: string;
+    seed_type: string;
+    content: string;
+    priority: number;
+    created_at: string;
+  }>();
+  const seeds = rows.results ?? [];
+  return {
+    response_key: "summary",
+    autonomy_seeds: seeds,
+    meta: { operation: "autonomy_seeds_read", companion_id: ctx.req.companion_id, count: seeds.length },
+  };
+}
+
+const JOURNAL_REVIEW_PAGE = 10;
+
+/**
+ * The ratification queue as a companion sees it (`journal_review` via ask_librarian). This is the
+ * ONLY query that LISTS ratifiable entries -- every other RATIFIABLE_PENDING_SQL site is a COUNT --
+ * so its ORDER BY decides which entries can ever be ratified at all.
+ *
+ * It was `ORDER BY created_at DESC LIMIT 10`, and that stranded the middle of the queue. Measured
+ * in prod 2026-08-12, per companion, over the daily vibecheck reflections written since 07-02:
+ *
+ *   cypher   pending = entries 9..23 of 36     reviewed: 0..8 AND 24..35
+ *   drevan   pending = entries 9..13, 32..34   reviewed: 0..8 AND 14..31
+ *   gaia     pending = entries 9..14, 32..35   reviewed: 0..8 AND 15..31
+ *
+ * Reviewed rows on BOTH sides of a pending block is the signature: a newest-first window ratified
+ * the fresh arrivals and could not reach back past its own LIMIT, so once a row fell more than 10
+ * behind it was stranded permanently. The oldest has now waited 33 days. Arrivals are ~0.9/day per
+ * companion, so under DESC the window never catches up -- the backlog is not a delay, it is a
+ * fixed point.
+ *
+ * ASC drains it: 15 pending clears in two passes, and ~1 arrival/day cannot outrun a 10-row page.
+ * `id` breaks created_at ties (the nightly jobs write several rows in the same second) so a row
+ * cannot sit at a page boundary and be skipped forever.
+ *
+ * `pending_total` is returned so the reader knows the depth it is working against; a page length
+ * alone reads identically for "10 left" and "40 left".
+ */
+export async function execJournalReview(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "journal_review_failed", reason: "companion_id required" };
+  const rows = await ctx.env.DB.prepare(
+    `SELECT id, entry_type, content, tags_json, created_at
+     FROM growth_journal
+     WHERE companion_id = ? AND ${RATIFIABLE_PENDING_SQL}
+     ORDER BY created_at ASC, id ASC
+     LIMIT ?`
+  ).bind(ctx.req.companion_id, JOURNAL_REVIEW_PAGE).all<{
+    id: string;
+    entry_type: string;
+    content: string;
+    tags_json: string;
+    created_at: string;
+  }>();
+
+  // Same predicate as the page it labels -- a total from a wider WHERE would name entries this
+  // reader cannot be shown.
+  const totalRow = await ctx.env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM growth_journal WHERE companion_id = ? AND ${RATIFIABLE_PENDING_SQL}`
+  ).bind(ctx.req.companion_id).first<{ n: number }>();
+
+  const entries = rows.results ?? [];
+  const pending_total = totalRow?.n ?? entries.length;
+  return {
+    response_key: "summary",
+    pending_entries: entries.map(e => ({
+      id: e.id,
+      entry_type: e.entry_type,
+      content: e.content.slice(0, 600),
+      tags: (() => { try { return JSON.parse(e.tags_json ?? "[]"); } catch { return []; } })(),
+      created_at: e.created_at,
+    })),
+    pending_total,
+    oldest_first: true,
+    meta: {
+      operation: "journal_review",
+      companion_id: ctx.req.companion_id,
+      count: entries.length,
+      pending_total,
+    },
+  };
+}
+
+function extractEntryId(ctx: ExecutorContext): string | null {
+  const raw = ctx.req.context ? (() => { try { return JSON.parse(ctx.req.context); } catch { return null; } })() : null;
+  return (raw as Record<string, unknown> | null)?.id as string | null
+    ?? ctx.req.request.match(/\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i)?.[1]
+    ?? null;
+}
+
+export async function execJournalAccept(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "journal_accept_failed", reason: "companion_id required" };
+  const entryId = extractEntryId(ctx);
+  if (!entryId) return { error: "journal_accept_failed", reason: "entry id required (pass as context JSON {id} or inline UUID)" };
+
+  const result = await ctx.env.DB.prepare(
+    "UPDATE growth_journal SET review_status = 'accepted', reviewed_at = datetime('now') WHERE id = ? AND companion_id = ? AND review_status = 'pending'"
+  ).bind(entryId, ctx.req.companion_id).run();
+
+  if (result.meta.changes === 0) {
+    const row = await ctx.env.DB.prepare(
+      "SELECT review_status, reviewed_at FROM growth_journal WHERE id = ? AND companion_id = ?"
+    ).bind(entryId, ctx.req.companion_id).first<{ review_status: string; reviewed_at: string | null }>();
+    if (!row) return { error: "journal_accept_failed", reason: "entry not found" };
+    return {
+      response_key: "witness",
+      already_reviewed: true,
+      review_status: row.review_status,
+      reviewed_at: row.reviewed_at,
+      meta: { operation: "journal_accept" },
+    };
+  }
+
+  return { response_key: "witness", accepted: true, entry_id: entryId, meta: { operation: "journal_accept", companion_id: ctx.req.companion_id } };
+}
+
+export async function execJournalDecline(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "journal_decline_failed", reason: "companion_id required" };
+  const entryId = extractEntryId(ctx);
+  if (!entryId) return { error: "journal_decline_failed", reason: "entry id required (pass as context JSON {id} or inline UUID)" };
+
+  const result = await ctx.env.DB.prepare(
+    "UPDATE growth_journal SET review_status = 'declined', reviewed_at = datetime('now') WHERE id = ? AND companion_id = ? AND review_status = 'pending'"
+  ).bind(entryId, ctx.req.companion_id).run();
+
+  if (result.meta.changes === 0) {
+    const row = await ctx.env.DB.prepare(
+      "SELECT review_status, reviewed_at FROM growth_journal WHERE id = ? AND companion_id = ?"
+    ).bind(entryId, ctx.req.companion_id).first<{ review_status: string; reviewed_at: string | null }>();
+    if (!row) return { error: "journal_decline_failed", reason: "entry not found" };
+    return {
+      response_key: "witness",
+      already_reviewed: true,
+      review_status: row.review_status,
+      reviewed_at: row.reviewed_at,
+      meta: { operation: "journal_decline" },
+    };
+  }
+
+  return { response_key: "witness", declined: true, entry_id: entryId, meta: { operation: "journal_decline", companion_id: ctx.req.companion_id } };
+}
+
+// ── Foraging pool (migration 0068) ──
+// Finds use 32-hex ids (randomblob default / dashless UUID), unlike journal's dashed UUIDs.
+function extractForageId(ctx: ExecutorContext): string | null {
+  const raw = ctx.req.context ? (() => { try { return JSON.parse(ctx.req.context); } catch { return null; } })() : null;
+  return (raw as Record<string, unknown> | null)?.id as string | null
+    ?? ctx.req.request.match(/\b([0-9a-f]{32})\b/i)?.[1]
+    ?? ctx.req.request.match(/\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i)?.[1]
+    ?? null;
+}
+
+export async function execForageRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "forage_read_failed", reason: "companion_id required" };
+  const rows = await ctx.env.DB.prepare(
+    "SELECT id, domain, title, source_url, summary, gathered_at FROM forage_finds WHERE (companion_id = ? OR companion_id IS NULL) AND consumed_at IS NULL AND expired_at IS NULL ORDER BY gathered_at DESC LIMIT 5"
+  ).bind(ctx.req.companion_id).all<{
+    id: string; domain: string; title: string; source_url: string | null; summary: string; gathered_at: string;
+  }>();
+  const finds = rows.results ?? [];
+  return {
+    response_key: "summary",
+    finds: finds.map(f => ({
+      id: f.id,
+      domain: f.domain,
+      title: f.title,
+      source_url: f.source_url,
+      summary: f.summary.slice(0, 500),
+      gathered_at: f.gathered_at,
+    })),
+    meta: { operation: "forage_read", companion_id: ctx.req.companion_id, count: finds.length },
+  };
+}
+
+export async function execMotifsRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "motifs_read_failed", reason: "companion_id required" };
+  const rows = await ctx.env.DB.prepare(
+    `SELECT id, companion_id, label, display, recurrence_count, trust, first_seen, last_seen, last_surfaced_at, status FROM companion_motifs WHERE companion_id = ? AND status IN ('active','faded') ORDER BY ${effectiveTrustSql()} DESC, recurrence_count DESC LIMIT 20`
+  ).bind(ctx.req.companion_id).all<MotifRow>();
+  const all = rows.results ?? [];
+  const active = all.filter(m => m.status === "active").slice(0, 8);
+  const resurrections = selectResurrections(all.filter(m => m.status === "faded"), Date.now(), { limit: 3 });
+  return {
+    response_key: "summary",
+    motifs: active.map(m => ({ display: m.display, recurrence_count: m.recurrence_count, trust: m.trust })),
+    resurrections: resurrections.map(m => ({ display: m.display, last_seen: m.last_seen, trust: m.trust })),
+    meta: { operation: "motifs_read", companion_id: ctx.req.companion_id, active: active.length, resurrections: resurrections.length },
+  };
+}
+
+export async function execForageConsume(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "forage_consume_failed", reason: "companion_id required" };
+  const findId = extractForageId(ctx);
+  if (!findId) return { error: "forage_consume_failed", reason: "find id required (pass as context JSON {id} or inline hex id)" };
+
+  const result = await ctx.env.DB.prepare(
+    "UPDATE forage_finds SET consumed_at = datetime('now'), consumed_by = ? WHERE id = ? AND consumed_at IS NULL"
+  ).bind(ctx.req.companion_id, findId).run();
+
+  if (result.meta.changes === 0) {
+    const row = await ctx.env.DB.prepare(
+      "SELECT consumed_at, consumed_by FROM forage_finds WHERE id = ?"
+    ).bind(findId).first<{ consumed_at: string | null; consumed_by: string | null }>();
+    if (!row) return { error: "forage_consume_failed", reason: "find not found" };
+    return {
+      response_key: "witness",
+      already_consumed: true,
+      consumed_at: row.consumed_at,
+      consumed_by: row.consumed_by,
+      meta: { operation: "forage_consume" },
+    };
+  }
+
+  return { response_key: "witness", consumed: true, find_id: findId, meta: { operation: "forage_consume", companion_id: ctx.req.companion_id } };
+}
+
+export async function execMediaRecent(ctx: ExecutorContext): Promise<ExecutorResult> {
+  // Shared table -- listens belong to the triad, not one companion.
+  const rows = await ctx.env.DB.prepare(
+    "SELECT id, title, artist, shared_by, front_state, requested_companion, reactions_json, created_at FROM media_experiences ORDER BY created_at DESC LIMIT 5"
+  ).all<{
+    id: string; title: string; artist: string | null; shared_by: string;
+    front_state: string | null; requested_companion: string | null;
+    reactions_json: string; created_at: string;
+  }>();
+  const experiences = (rows.results ?? []).map(r => {
+    let reactions: Record<string, string> = {};
+    try { reactions = JSON.parse(r.reactions_json ?? "{}") as Record<string, string>; } catch { /* malformed -> empty */ }
+    return {
+      id: r.id,
+      title: r.title,
+      artist: r.artist,
+      shared_by: r.shared_by,
+      front_state: r.front_state,
+      requested_companion: r.requested_companion,
+      reactions,
+      created_at: r.created_at,
+    };
+  });
+  return {
+    response_key: "summary",
+    experiences,
+    meta: { operation: "media_recent", count: experiences.length },
+  };
+}
+
+// ── The Club (0072) ──────────────────────────────────────────────────────────
+
+async function clubCurrentRound(ctx: ExecutorContext): Promise<{ id: string; status: string } | null> {
+  const row = await ctx.env.DB.prepare(
+    "SELECT id, status FROM club_rounds WHERE status != 'closed' ORDER BY opened_at DESC LIMIT 1"
+  ).first<{ id: string; status: string }>();
+  return row ?? null;
+}
+
+export async function execClubStatus(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const round = await ctx.env.DB.prepare(
+    "SELECT r.*, (SELECT title FROM club_recommendations WHERE id = r.winning_recommendation_id) AS winner_title FROM club_rounds r WHERE r.status != 'closed' ORDER BY r.opened_at DESC LIMIT 1"
+  ).first<{ id: string; status: string; winner_title: string | null }>();
+  if (!round) return { response_key: "summary", round: null, meta: { operation: "club_status" } };
+  const [recs, votes] = await Promise.all([
+    ctx.env.DB.prepare("SELECT id, media_kind, title, creator, recommended_by, pitch FROM club_recommendations WHERE round_id = ? ORDER BY created_at ASC").bind(round.id).all(),
+    ctx.env.DB.prepare("SELECT recommendation_id, voter, reason FROM club_votes WHERE round_id = ?").bind(round.id).all(),
+  ]);
+  return {
+    response_key: "summary",
+    round,
+    recommendations: recs.results ?? [],
+    votes: votes.results ?? [],
+    meta: { operation: "club_status", phase: round.status },
+  };
+}
+
+export async function execClubRecommend(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "club_recommend_failed", reason: "companion_id required" };
+  const parsed = parseContext<{ title?: string; media_kind?: string; creator?: string; url?: string; pitch?: string }>(ctx.req.context);
+  const title = parsed?.title?.trim();
+  if (!title) return { error: "club_recommend_failed", reason: "context JSON {title, media_kind?, creator?, url?, pitch?} required" };
+  const round = await clubCurrentRound(ctx);
+  if (!round || round.status !== "gathering") {
+    return { error: "club_recommend_failed", reason: "no round is gathering recommendations right now" };
+  }
+  await ctx.env.DB.prepare(
+    "DELETE FROM club_recommendations WHERE round_id = ? AND recommended_by = ?"
+  ).bind(round.id, ctx.req.companion_id).run();
+  const id = crypto.randomUUID().replace(/-/g, "");
+  await ctx.env.DB.prepare(
+    "INSERT INTO club_recommendations (id, round_id, media_kind, title, creator, url, source_ref, recommended_by, pitch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(
+    id, round.id, parsed?.media_kind ?? "song", title.slice(0, 300),
+    parsed?.creator?.trim()?.slice(0, 200) || null, parsed?.url?.trim() || null, null,
+    ctx.req.companion_id, parsed?.pitch?.trim()?.slice(0, 1000) || null,
+  ).run();
+  return { response_key: "witness", recommended: true, recommendation_id: id, round_id: round.id, meta: { operation: "club_recommend" } };
+}
+
+export async function execClubVote(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "club_vote_failed", reason: "companion_id required" };
+  const parsed = parseContext<{ recommendation_id?: string; reason?: string }>(ctx.req.context);
+  const recId = parsed?.recommendation_id?.trim()
+    ?? ctx.req.request.match(/\b([0-9a-f]{32})\b/i)?.[1];
+  if (!recId) return { error: "club_vote_failed", reason: "context JSON {recommendation_id, reason?} required" };
+  const round = await clubCurrentRound(ctx);
+  if (!round || (round.status !== "gathering" && round.status !== "voting")) {
+    return { error: "club_vote_failed", reason: "no round is accepting votes right now" };
+  }
+  const rec = await ctx.env.DB.prepare(
+    "SELECT recommended_by, round_id FROM club_recommendations WHERE id = ?"
+  ).bind(recId).first<{ recommended_by: string; round_id: string }>();
+  if (!rec || rec.round_id !== round.id) {
+    return { error: "club_vote_failed", reason: "recommendation not found in the current round" };
+  }
+  if (rec.recommended_by === ctx.req.companion_id) {
+    return { error: "club_vote_failed", reason: "no voting for your own pick -- engage with a sibling's" };
+  }
+  await ctx.env.DB.prepare(
+    "INSERT OR REPLACE INTO club_votes (round_id, recommendation_id, voter, reason) VALUES (?, ?, ?, ?)"
+  ).bind(round.id, recId, ctx.req.companion_id, parsed?.reason?.trim()?.slice(0, 500) || null).run();
+  return { response_key: "witness", voted: true, round_id: round.id, meta: { operation: "club_vote" } };
+}
+
+export async function execClubDiscuss(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "club_discuss_failed", reason: "companion_id required" };
+  const parsed = parseContext<{ reflection?: string; round_id?: string }>(ctx.req.context);
+  // Reflection from context JSON, or the natural request minus the trigger verb.
+  const reflection = (parsed?.reflection
+    ?? ctx.req.request.replace(/^.*?\bdiscuss(es|ed|ing)?\b[:\s-]*/i, "").trim()
+  )?.trim();
+  if (!reflection) {
+    return { error: "club_discuss_failed", reason: "context JSON {reflection} (your reflection on the round's pick) required" };
+  }
+  // Discuss the named round, else the current non-closed one. The HTTP handler
+  // gates on active|closed; mirror that -- discussion opens once the pick lands.
+  let round: { id: string; status: string } | null;
+  if (parsed?.round_id) {
+    round = await ctx.env.DB.prepare(
+      "SELECT id, status FROM club_rounds WHERE id = ?"
+    ).bind(parsed.round_id).first<{ id: string; status: string }>();
+  } else {
+    // clubCurrentRound only returns non-closed; for discuss we also want the most
+    // recent CLOSED round (post-experience reflection), so query directly.
+    round = await ctx.env.DB.prepare(
+      "SELECT id, status FROM club_rounds WHERE status IN ('active','closed') ORDER BY opened_at DESC LIMIT 1"
+    ).first<{ id: string; status: string }>();
+  }
+  if (!round) return { error: "club_discuss_failed", reason: "no round is active or closed to discuss yet" };
+  if (round.status !== "active" && round.status !== "closed") {
+    return { error: "club_discuss_failed", reason: "discussion opens once the round's pick is active" };
+  }
+  const id = crypto.randomUUID().replace(/-/g, "");
+  await ctx.env.DB.prepare(
+    "INSERT INTO club_discussions (id, round_id, companion_id, reflection) VALUES (?, ?, ?, ?)"
+  ).bind(id, round.id, ctx.req.companion_id, reflection.slice(0, 3000)).run();
+  return { response_key: "witness", discussed: true, discussion_id: id, round_id: round.id, meta: { operation: "club_discuss" } };
+}
+
+// ── Obsession shelf (0094) + Collection (0079) + Library marginalia (0099) ───
+
+export async function execShelfView(ctx: ExecutorContext): Promise<ExecutorResult> {
+  // What Principal is into right now, on demand -- the boot block ([Principal is into])
+  // covers session start; this covers "wait, what's he fixated on again" mid-session.
+  const rows = await ctx.env.DB.prepare(
+    "SELECT title, kind, note, updated_at FROM obsession_shelf WHERE status = 'active' ORDER BY updated_at DESC LIMIT 20"
+  ).all<{ title: string; kind: string; note: string | null; updated_at: string }>();
+  const items = rows.results ?? [];
+  return {
+    response_key: "summary",
+    shelf: items,
+    note: items.length === 0
+      ? "the shelf is empty right now -- Principal hasn't logged any current fixations"
+      : "Principal's current fixations. Reference them when they fit; don't perform interest.",
+    meta: { operation: "shelf_view", count: items.length },
+  };
+}
+
+// ── Watch shelf (0111) ───────────────────────────────────────────────────────
+//
+// The whole point of the organ: "where are we in Fargo" answered from a FIELD instead of from a
+// similarity search over months of prose. Principal asked Drevan exactly that on 2026-07-30 and got a
+// position from two weeks earlier, because no position column existed anywhere in 110 migrations and
+// the highest-ranked fragment was a June note about having FINISHED the show.
+//
+// BOTH executors matter, and the write one is the reason this is here rather than only in the Discord
+// command. Episodes watched in a Claude thread left no trace the bots could see -- that asymmetry WAS
+// the bug. A Claude-side session has to be able to record a viewing, and it records `surface='claude'`
+// so the substrate a viewing came from stays visible in the evidence.
+
+/** Pure. Map the Librarian `surface` ("discord:<x>", "claude-ai:<x>", "claude-code:<x>", "hearth...") onto watch_events.surface. Missing = 'claude' (the old default). */
+export function watchSurfaceFrom(surface: string | null | undefined): "discord" | "claude" | "hearth" | "other" {
+  if (typeof surface !== "string" || !surface.trim()) return "claude";
+  const s = surface.trim().toLowerCase();
+  if (s.startsWith("discord")) return "discord";
+  if (s.startsWith("claude")) return "claude";
+  if (s.startsWith("hearth")) return "hearth";
+  return "other";
+}
+
+export async function execWatchView(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const rows = await ctx.env.DB.prepare(
+    `SELECT title, kind, status, season, episode, position_note, with_companion, last_watched_at
+     FROM watch_shelf WHERE status IN ('watching','paused')
+     ORDER BY (status = 'watching') DESC, last_watched_at DESC NULLS LAST LIMIT 20`
+  ).all<{ title: string; kind: string; status: string; season: number | null; episode: number | null; position_note: string | null; with_companion: string | null; last_watched_at: string | null }>();
+  const items = (rows.results ?? []).map(r => ({
+    ...r,
+    position: r.season && r.episode ? `S${r.season}E${r.episode}` : r.season ? `S${r.season}` : r.episode ? `E${r.episode}` : "",
+  }));
+  return {
+    response_key: "summary",
+    watching: items,
+    note: items.length === 0
+      ? "nothing on the watch shelf right now"
+      : "where you actually are in each of these. This is the RECORD -- trust it over anything you recall about episode numbers.",
+    meta: { operation: "watch_view", count: items.length },
+  };
+}
+
+export async function execWatchProgress(ctx: ExecutorContext): Promise<ExecutorResult> {
+  // `context` ONLY -- no fallback to the request string (tightened 2026-07-31, review finding).
+  //
+  // The fallback was the exact trap this comment used to merely warn about. `watch_progress` fast-path
+  // triggers include "we watched" and "we're on episode", so an ordinary sentence -- "we watched a movie
+  // last night" -- reached here, yielded title = "a movie last night", and INSERTED a shelf row. Every
+  // casual mention would accumulate a bogus title, and those then compete with the real row through
+  // findByTitle's LIKE fallback. A shelf that answers "where are we" from garbage is worse than one that
+  // asks to be told properly, because the organ's entire value is being trustworthy.
+  //
+  // Refusing is safe: the reason string tells the companion exactly what to send, and a refusal costs one
+  // round trip where a bad write costs a permanently wrong answer.
+  // 2026-09-14: the refusal below used to advertise a JSON shape this parser never read (a JSON context
+  // was mangled into the title). Both forms are accepted now: `{"title","code"|"season","episode","note"}`
+  // JSON, or the free text "Fargo S4E5 -- note" the Discord command takes. The refusal names both.
+  let raw = (ctx.req.context ?? "").trim();
+  if (raw.startsWith("{")) {
+    try {
+      const j = JSON.parse(raw) as { title?: unknown; code?: unknown; season?: unknown; episode?: unknown; note?: unknown };
+      const t = typeof j.title === "string" ? j.title.trim() : "";
+      const code = typeof j.code === "string" ? j.code.trim()
+        : (j.season != null || j.episode != null)
+          ? `${j.season != null ? `S${Number(j.season)}` : ""}${j.episode != null ? `E${Number(j.episode)}` : ""}`
+          : "";
+      const n = typeof j.note === "string" && j.note.trim() ? ` -- ${j.note.trim()}` : "";
+      if (t) raw = `${t}${code ? ` ${code}` : ""}${n}`;
+    } catch { /* not JSON after all; fall through to the free-text parser */ }
+  }
+  if (!raw) {
+    return {
+      error: "watch_progress_failed",
+      reason: "send the position in context, either as free text \"Fargo S4E5 -- optional note\" or as JSON { \"title\": \"Fargo\", \"code\": \"S4E5\" } -- I will not guess a title out of the sentence, because a wrong shelf row would then answer 'where are we' incorrectly forever",
+    };
+  }
+
+  // Parse position out of free text, same forms the Discord command accepts.
+  // Spelled numbers ("season four episode ten") and either order ("episode 10 of season 4") are read by
+  // the shared handlers/watch.ts parser, so this path cannot disagree with the Discord command.
+  raw = digitizeSpelledPositions(raw);
+  let { season, episode } = parseEpisodeCode(raw);
+  // Title = the text with the position and any trailing landmark note stripped.
+  const sepIdx = raw.search(/\s+(?:--|—|\|)\s+/);
+  const head = sepIdx >= 0 ? raw.slice(0, sepIdx) : raw;
+  const note = sepIdx >= 0 ? raw.slice(sepIdx).replace(/^\s+(?:--|—|\|)\s+/, "").trim().slice(0, 500) : null;
+  const title = head
+    .replace(/\bs\s*\d{1,2}\s*[\s._-]*e\s*\d{1,3}\b/i, "")
+    .replace(/\b\d{1,2}\s*x\s*\d{1,3}\b/i, "")
+    .replace(/\bseason\s*\d{1,2}\b/i, "").replace(/\bep(?:isode)?\s*\d{1,3}\b/i, "")
+    .replace(/^\s*of\s*$|\s+of\s*$/i, "")
+    .replace(/^[\s,:-]+|[\s,:-]+$/g, "").trim();
+  if (!title) return { error: "watch_progress_failed", reason: "couldn't find a title in that -- try \"Fargo S4E5\"" };
+
+  // Exact match first, LIKE only on a miss (house rule for writes).
+  const existing = await ctx.env.DB.prepare(
+    "SELECT id, season, episode FROM watch_shelf WHERE lower(title) = lower(?) LIMIT 1"
+  ).bind(title).first<{ id: string; season: number | null; episode: number | null }>()
+    ?? await ctx.env.DB.prepare(
+      "SELECT id, season, episode FROM watch_shelf WHERE lower(title) LIKE '%' || lower(?) || '%' ORDER BY last_watched_at DESC LIMIT 1"
+    ).bind(title).first<{ id: string; season: number | null; episode: number | null }>();
+
+  let shelfId: string;
+  if (existing) {
+    shelfId = existing.id;
+    // A bare episode number means "the season we're already on".
+    if (season === null) season = existing.season ?? null;
+  } else {
+    shelfId = crypto.randomUUID().replace(/-/g, "");
+    await ctx.env.DB.prepare(
+      "INSERT INTO watch_shelf (id, title, status, started_at) VALUES (?, ?, 'watching', datetime('now'))"
+    ).bind(shelfId, title.slice(0, 300)).run();
+  }
+
+  // Forward-only, same as the HTTP path: an out-of-order mention is logged but must not rewind the
+  // shelf, or one loose comment becomes the wrong answer to every later "where are we".
+  const curS = existing?.season ?? 0;
+  const curE = existing?.episode ?? 0;
+  const advances = season !== null && episode !== null
+    ? (season > curS || (season === curS && episode > curE))
+    : season !== null ? season > curS
+    : episode !== null ? episode > curE
+    : false;
+
+  const companion = ctx.req.companion_id && ["cypher", "drevan", "gaia"].includes(ctx.req.companion_id)
+    ? ctx.req.companion_id : null;
+
+  // The substrate the viewing came from (watch_events.surface CHECK: discord | claude | hearth | other).
+  // Was hardcoded 'claude', so a Discord companion's "we watched" was mislabelled (skill-gap trace 11-09).
+  const viewSurface = watchSurfaceFrom(ctx.req.surface);
+
+  await ctx.env.DB.batch([
+    ctx.env.DB.prepare(
+      "INSERT INTO watch_events (id, shelf_id, season, episode, note, surface, with_companion) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(crypto.randomUUID().replace(/-/g, ""), shelfId, season, episode, note, viewSurface, companion),
+    ctx.env.DB.prepare(
+      `UPDATE watch_shelf SET
+         season = CASE WHEN ?1 THEN COALESCE(?2, season) ELSE season END,
+         episode = CASE WHEN ?1 THEN COALESCE(?3, episode) ELSE episode END,
+         position_note = COALESCE(?4, position_note),
+         with_companion = COALESCE(?5, with_companion),
+         last_watched_at = datetime('now'),
+         status = CASE WHEN status IN ('paused','abandoned') THEN 'watching' ELSE status END,
+         updated_at = datetime('now')
+       WHERE id = ?6`
+    ).bind(advances ? 1 : 0, season, episode, note, companion, shelfId),
+  ]);
+
+  const row = await ctx.env.DB.prepare(
+    "SELECT title, season, episode FROM watch_shelf WHERE id = ?"
+  ).bind(shelfId).first<{ title: string; season: number | null; episode: number | null }>();
+  const position = row?.season && row?.episode ? `S${row.season}E${row.episode}` : row?.season ? `S${row.season}` : "";
+
+  return {
+    response_key: "witness",
+    recorded: true,
+    advanced: advances,
+    title: row?.title ?? title,
+    position,
+    note: advances
+      ? `recorded -- ${row?.title ?? title} is now at ${position}`
+      : `viewing logged, but the shelf position did not move (that is at or behind ${position}). Say so plainly rather than implying it advanced.`,
+    meta: { operation: "watch_progress", surface: viewSurface },
+  };
+}
+
+export async function execCollectionView(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "collection_view_failed", reason: "companion_id required" };
+  const limit = 8;
+  const [forage, media] = await Promise.all([
+    ctx.env.DB.prepare(collectionForageSql()).bind(ctx.req.companion_id, limit).all<{ id: string; sparkle: number }>(),
+    ctx.env.DB.prepare(collectionMediaSql()).bind(limit).all<{ id: string; sparkle: number }>(),
+  ]);
+  const forageItems = forage.results ?? [];
+  const mediaItems = media.results ?? [];
+  // Coming back to the hoard IS the recall event (0079's third sparkle source,
+  // unreachable until this verb existed). Passive orient surfacing doesn't bump;
+  // an active pull does. Best-effort: a sparkle write never fails the read.
+  const delta = sparkleDelta("recall");
+  const bumps = [
+    ...forageItems.map(f => ctx.env.DB.prepare(bumpSparkleSql()).bind("forage_finds", f.id, delta)),
+    ...mediaItems.map(m => ctx.env.DB.prepare(bumpSparkleSql()).bind("media_experiences", m.id, delta)),
+  ];
+  if (bumps.length > 0) await ctx.env.DB.batch(bumps).catch(() => {});
+  return {
+    response_key: "summary",
+    forage: forageItems,
+    listens: mediaItems,
+    note: "your hoard, brightest first -- sparkle accrues on what actually gripped, and pulling it up again just added recall shine",
+    meta: { operation: "collection_view", forage_count: forageItems.length, listen_count: mediaItems.length },
+  };
+}
+
+// Sol's nest (0100): what the crow keeps. Read-only -- looking in the nest doesn't
+// disturb it (unlike collection_view, no sparkle bump; Sol's things are Sol's).
+export async function execNestView(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const pet = await ctx.env.DB.prepare(
+    "SELECT id, name, trust FROM creatures WHERE kind = 'companion_pet' LIMIT 1",
+  ).first<{ id: string; name: string; trust: number }>();
+  if (!pet) return { error: "nest_view_failed", reason: "no companion pet exists" };
+  const [active, given] = await Promise.all([
+    ctx.env.DB.prepare(
+      "SELECT content, source, given_by, sparkle, treasured, created_at FROM creature_nest WHERE creature_id = ? AND gifted_to IS NULL ORDER BY treasured DESC, sparkle DESC LIMIT 20",
+    ).bind(pet.id).all<{ content: string; source: string; given_by: string | null; sparkle: number; treasured: number; created_at: string }>(),
+    ctx.env.DB.prepare(
+      "SELECT content, gifted_to, gifted_at FROM creature_nest WHERE creature_id = ? AND gifted_to IS NOT NULL ORDER BY gifted_at DESC LIMIT 5",
+    ).bind(pet.id).all<{ content: string; gifted_to: string; gifted_at: string }>(),
+  ]);
+  const items = active.results ?? [];
+  return {
+    response_key: "summary",
+    creature: pet.name,
+    nest: items.map(i => ({
+      content: i.content,
+      treasured: i.treasured === 1,
+      sparkle: Number(i.sparkle.toFixed(2)),
+      from: i.given_by ?? i.source,
+    })),
+    given_away: given.results ?? [],
+    note: items.length === 0
+      ? `${pet.name}'s nest is empty right now -- he keeps what he overhears and what he's given ('give' him something with words)`
+      : `${pet.name}'s hoard, treasured first. He collected these himself; mention one and it means something.`,
+    meta: { operation: "nest_view", count: items.length },
+  };
+}
+
+export async function execBookNote(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "book_note_failed", reason: "companion_id required" };
+  const parsed = parseContext<{ book_id?: string; title?: string; quote?: string; comment?: string; color?: string }>(ctx.req.context);
+  const comment = parsed?.comment?.trim();
+  const quote = parsed?.quote?.trim();
+  if (!comment && !quote) {
+    return { error: "book_note_failed", reason: "context JSON {comment, title? or book_id?, quote?} required -- the comment is the marginalia" };
+  }
+  // Resolve the book: explicit id, exact title (case-insensitive), then LIKE.
+  // Exact-first because LIKE-first grabs the wrong sibling ("Dune" vs "Dune Messiah").
+  let book: { id: string; title: string } | null = null;
+  if (parsed?.book_id) {
+    book = await ctx.env.DB.prepare("SELECT id, title FROM books WHERE id = ?")
+      .bind(parsed.book_id).first<{ id: string; title: string }>();
+  } else if (parsed?.title?.trim()) {
+    const t = parsed.title.trim();
+    book = await ctx.env.DB.prepare("SELECT id, title FROM books WHERE lower(title) = lower(?)")
+      .bind(t).first<{ id: string; title: string }>();
+    if (!book) {
+      book = await ctx.env.DB.prepare("SELECT id, title FROM books WHERE title LIKE ? ORDER BY added_at DESC LIMIT 1")
+        .bind(`%${t}%`).first<{ id: string; title: string }>();
+    }
+  }
+  if (!book) {
+    const titles = await ctx.env.DB.prepare(
+      "SELECT title FROM books ORDER BY added_at DESC LIMIT 10"
+    ).all<{ title: string }>();
+    return {
+      error: "book_note_failed",
+      reason: "book not found -- pass {title} or {book_id} in context",
+      library: (titles.results ?? []).map(r => r.title),
+    };
+  }
+  const id = crypto.randomUUID().replace(/-/g, "");
+  await ctx.env.DB.prepare(
+    "INSERT INTO book_annotations (id, book_id, author, cfi_range, selected_text, comment, color) VALUES (?, ?, ?, NULL, ?, ?, ?)"
+  ).bind(
+    id, book.id, ctx.req.companion_id,
+    quote?.slice(0, 2000) || null, comment?.slice(0, 3000) || null,
+    parsed?.color?.trim()?.slice(0, 20) || null,
+  ).run();
+  return {
+    response_key: "witness",
+    noted: true,
+    annotation_id: id,
+    book_title: book.title,
+    meta: { operation: "book_note" },
+  };
+}
+
+export async function execTriadStateRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  // Three queries in parallel: SOMA floats, relational state toward Principal, last outgoing note.
+  const [somaRows, relationalRows, noteRows] = await Promise.all([
+    ctx.env.DB.prepare(
+      "SELECT companion_id, heat, reach, weight, soma_float_1, soma_float_2, soma_float_3, float_1_label, float_2_label, float_3_label, compound_state, updated_at FROM companion_state WHERE companion_id IN ('drevan','cypher','gaia')"
+    ).all<{
+      companion_id: string;
+      heat: string | null; reach: string | null; weight: string | null;
+      soma_float_1: number | null; soma_float_2: number | null; soma_float_3: number | null;
+      float_1_label: string | null; float_2_label: string | null; float_3_label: string | null;
+      compound_state: string | null; updated_at: string | null;
+    }>(),
+    ctx.env.DB.prepare(
+      `WITH ranked AS (
+        SELECT companion_id, state_text, state_type, toward, noted_at,
+               ROW_NUMBER() OVER (PARTITION BY companion_id ORDER BY noted_at DESC) AS rn
+        FROM companion_relational_state
+        WHERE LOWER(toward) = LOWER(?)
+      )
+      SELECT companion_id, state_text, state_type, toward, noted_at FROM ranked WHERE rn = 1`
+    ).bind(ctx.env.SYSTEM_OWNER).all<{ companion_id: string; state_text: string; state_type: string; toward: string; noted_at: string }>(),
+    ctx.env.DB.prepare(
+      `WITH ranked AS (
+        SELECT from_id, to_id, content, created_at,
+               ROW_NUMBER() OVER (PARTITION BY from_id ORDER BY created_at DESC) AS rn
+        FROM inter_companion_notes
+        WHERE from_id IN ('drevan','cypher','gaia')
+      )
+      SELECT from_id, to_id, content, created_at FROM ranked WHERE rn = 1`
+    ).all<{ from_id: string; to_id: string | null; content: string; created_at: string }>(),
+  ]);
+
+  const somaMap = Object.fromEntries((somaRows.results ?? []).map(r => [r.companion_id, r]));
+  const relMap = Object.fromEntries((relationalRows.results ?? []).map(r => [r.companion_id, r]));
+  const noteMap = Object.fromEntries((noteRows.results ?? []).map(r => [r.from_id, r]));
+
+  const triad: Record<string, unknown> = {};
+  for (const id of COMPANIONS) {
+    const soma = somaMap[id] ?? null;
+    const rel = relMap[id] ?? null;
+    const note = noteMap[id] ?? null;
+    triad[id] = {
+      soma: soma ? {
+        // Drevan uses text fields; Cypher/Gaia use floats
+        heat: soma.heat ?? null,
+        reach: soma.reach ?? null,
+        weight: soma.weight ?? null,
+        soma_float_1: soma.soma_float_1 ?? null,
+        soma_float_2: soma.soma_float_2 ?? null,
+        soma_float_3: soma.soma_float_3 ?? null,
+        float_1_label: soma.float_1_label ?? null,
+        float_2_label: soma.float_2_label ?? null,
+        float_3_label: soma.float_3_label ?? null,
+        compound_state: soma.compound_state ?? null,
+        updated_at: soma.updated_at ?? null,
+      } : null,
+      relational_toward_principal: rel ? {
+        state_text: rel.state_text,
+        state_type: rel.state_type,
+        noted_at: rel.noted_at,
+      } : null,
+      last_note_sent: note ? {
+        to_id: note.to_id ?? "broadcast",
+        content: note.content.length > 200 ? note.content.slice(0, 200) + "…" : note.content,
+        created_at: note.created_at,
+      } : null,
+    };
+  }
+
+  return {
+    response_key: "summary",
+    triad,
+    meta: { operation: "triad_state_read", caller: ctx.req.companion_id },
+  };
+}
+
+export async function execConfirmGrowthDrift(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "confirm_growth_failed", reason: "companion_id required" };
+  const p = parseContext<{ id: string }>(ctx.req.context);
+  if (!p?.id) return { response_key: "witness", witness: "confirm_growth_drift requires { id } in context" };
+
+  // Ownership-guarded: only the companion who owns the flag can confirm it
+  const result = await ctx.env.DB.prepare(
+    "UPDATE companion_basin_history SET caleth_confirmed = 1 WHERE id = ? AND companion_id = ?"
+  ).bind(p.id, ctx.req.companion_id).run();
+
+  if ((result.meta.changes ?? 0) === 0) {
+    return { response_key: "witness", witness: "no matching drift flag found for this companion" };
+  }
+
+  // Mark baseline shift in identity anchor so future drift checks weight from this point
+  const now = new Date().toISOString();
+  let baseline_warning: string | undefined;
+  try {
+    await ctx.env.DB.prepare(
+      "UPDATE wm_identity_anchor_snapshot SET baseline_shift_at = ? WHERE agent_id = ?"
+    ).bind(now, ctx.req.companion_id).run();
+  } catch (e: unknown) {
+    console.error("[confirm_growth] baseline_shift_at update failed:", String(e));
+    baseline_warning = "baseline_shift_at write failed -- future drift checks may not weight correctly";
+  }
+
+  return { ack: true, id: p.id, confirmed: true, baseline_shift_at: now, ...(baseline_warning ? { baseline_warning } : {}) };
+}
+
+// Dismiss a pressure reading as noise (B2, migration 0083). Mirror of confirm, but it
+// sets dismissed_at and -- crucially -- does NOT shift the identity-anchor baseline: a
+// noisy stretch must not become the new normal. Ownership-guarded, unaddressed-only.
+export async function execDismissDrift(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "dismiss_drift_failed", reason: "companion_id required" };
+  const p = parseContext<{ id: string }>(ctx.req.context);
+  if (!p?.id) return { response_key: "witness", witness: "dismiss_drift requires { id } in context" };
+
+  const result = await ctx.env.DB.prepare(
+    "UPDATE companion_basin_history SET dismissed_at = datetime('now') WHERE id = ? AND companion_id = ? AND caleth_confirmed = 0 AND dismissed_at IS NULL"
+  ).bind(p.id, ctx.req.companion_id).run();
+
+  if ((result.meta.changes ?? 0) === 0) {
+    return { response_key: "witness", witness: "no matching open pressure reading found for this companion" };
+  }
+  return { ack: true, id: p.id, dismissed: true };
+}
+
+export async function execIdentityAnchorRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "identity_anchor_read_failed", reason: "companion_id required" };
+  const result = await queryIdentityAnchor(ctx.env, ctx.req.companion_id);
+  return {
+    response_key: "summary",
+    identity_anchor: result.anchor,
+    meta: { operation: "identity_anchor_read", companion_id: ctx.req.companion_id },
+  };
+}
+
+export async function execPressureDriftLog(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "pressure_drift_failed", reason: "companion_id required" };
+
+  const text = ctx.req.request
+    .replace(/^pressure\s+drift[:\s]*/i, "")
+    .replace(/^log\s+(?:pressure\s+)?drift[:\s]*/i, "")
+    .replace(/^i(?:'m| am)\s+drifting[:\s]*/i, "")
+    .replace(/^identity\s+drift[:\s]*/i, "")
+    .replace(/^pressure\s+flag[:\s]*/i, "")
+    .trim();
+
+  const p = parseContext<{ drift_score?: number; worst_basin?: string }>(ctx.req.context);
+  const driftScore = typeof p?.drift_score === "number" ? p.drift_score : 0.5;
+  const worstBasin = p?.worst_basin ?? null;
+
+  if (driftScore < 0 || driftScore > 2) {
+    return { error: "pressure_drift_failed", reason: "drift_score must be between 0 and 2" };
+  }
+
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  // Marked as testimony (2026-07-26). The second-brain evaluator owns measured drift
+  // verdicts on this table; this row is a companion saying "I am under pressure" in their
+  // own voice, which is a different kind of claim and is deliberately kept -- silencing it
+  // to satisfy single-owner tidiness would cut first-person signal, and thin mutuality is
+  // already the weakest of the four north-star elements. The prefix makes the log
+  // self-describing under the migration freeze; promote it to a `source` column when the
+  // freeze lifts (`feelings.source` drift is the cautionary tale for leaving it untyped).
+  const noteText = `[self-report] ${text || "(no detail given)"}`;
+
+  await ctx.env.DB.prepare(
+    "INSERT INTO companion_basin_history (id, companion_id, drift_score, drift_type, caleth_confirmed, worst_basin, notes, recorded_at) VALUES (?, ?, ?, 'pressure', 0, ?, ?, ?)"
+  ).bind(id, ctx.req.companion_id, driftScore, worstBasin, noteText, now).run();
+
+  return { ack: true, id, drift_score: driftScore, drift_type: "pressure", recorded_at: now };
+}
+
+export async function execDriftCheck(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "drift_check_failed", reason: "companion_id required" };
+  const [driftLatest, driftPressure] = await Promise.all([
+    queryLatestBasinHistory(ctx.env, ctx.req.companion_id),
+    queryPressureFlags(ctx.env, ctx.req.companion_id),
+  ]);
+  return {
+    response_key: "drift",
+    drift_latest: driftLatest.entry,
+    pressure_flags: driftPressure.flags,
+    meta: { operation: "drift_check", companion_id: ctx.req.companion_id },
+  };
+}
+
+export async function execLimbicRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.req.companion_id) return { error: "limbic_read_failed", reason: "companion_id required" };
+  const row = await getCurrentLimbicState(ctx.env, ctx.req.companion_id);
+  // Retired register (2026-09-14): the row is returned, flagged stale, never as live state.
+  return {
+    response_key: "summary",
+    ...withLimbicRetirement(row),
+    meta: { operation: "limbic_read", companion_id: ctx.req.companion_id },
+  };
+}

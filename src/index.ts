@@ -1,0 +1,960 @@
+import { Env } from "./types";
+import { Router } from "./router";
+import { listCompanions, createCompanion, getCompanion } from "./handlers/companions";
+import { listMemories, createMemory, getMemory } from "./handlers/memory";
+import { listDeltas, appendDelta } from "./handlers/relational";
+import { bootstrapConfig, backfillEmbeddings, seedRoutingVectors, reindexExisting, debugAi } from "./handlers/admin";
+import { postJevEval } from "./handlers/jev";
+import { getPresence } from "./handlers/presence";
+import { getHouseState, updateHouseState } from "./handlers/house";
+import { getNotes, createNote } from "./handlers/notes";
+import { postInteriority, getInteriority, getInteriorityMeta, patchInteriorityDisclose } from "./handlers/interiority.js";
+import { getRefusals, getPreferences, patchRefusalAck, postPreferenceHttp, postRefusalHttp } from "./handlers/agency.js";
+import { getDrifts, postDriftRun, getSomaShifts } from "./handlers/drift.js";
+import { uploadAsset, serveAsset, listAssets } from "./handlers/assets";
+import { getPrincipalInbox, getPrincipalInboxItem, postPrincipalInboxRead } from "./handlers/principal-inbox";
+import { getPrincipalNeeds, getPrincipalNeedsCount } from "./handlers/principal-needs";
+import { getPrincipalCompanion, postPrincipalCompanionLooked } from "./handlers/principal-companion";
+import { handleBiometricsLatest, handleBiometricsList, handleBiometricsPost, handleBiometricsPatch, handleBiometricsDelete, handleBiometricsWellnessPut } from "./handlers/biometrics";
+import { getHandovers, getCompanionJournal, getRecallIneligible, getIngestContinuityNotes, getIngestContinuityIneligible, getCypherAudit, getGaiaWitness, getWounds, getRoutines, getDeltas, getTasks, postTask, getEvents, postEvent, getLists, patchTask, completeListItem } from "./handlers/history";
+import { logRoutine } from "./handlers/routines";
+import { postCompanionJournal } from "./handlers/companion_journal";
+import { adminRetract } from "./handlers/retract.js";
+import { getAdminTray, postAdminTrayReview, postAdminTrayDraft } from "./handlers/tray.js";
+import { postLedger, getLedger, getIngestLedger, getIngestLedgerIneligible, getSomaFreshness } from "./handlers/ledger.js";
+import { getSessions, getSessionById, getRecentRelationalSessions } from "./handlers/sessions";
+import { getFeelings, getDreams, getDreamSeeds, postDreamSeed } from "./handlers/feelings-dreams";
+import { getJournal, postJournal } from "./handlers/human-journal";
+import { getBridgeShared, postBridgeAct, postBridgeToggle } from "./handlers/bridge";
+import {
+  getOAuthProtectedResource,
+  getOAuthAuthServerMetadata,
+  postOAuthRegister,
+  getOAuthAuthorize,
+  postOAuthAuthorize,
+  postOAuthToken,
+  handleOAuthCors,
+} from "./handlers/oauth";
+import { handleMcp } from "./mcp/server";
+import { handleLibrarian } from "./librarian/index.js";
+import { handleLibrarianMcp } from "./librarian/mcp.js";
+import { postStmEntry, getStmEntries } from "./handlers/stm.js";
+import { postPersonaBlocks, postHumanBlocks, getPersonaBlocks, getHumanBlocks, prunePersonaBlocks } from "./handlers/blocks.js";
+import { getSoma, patchSomaState } from "./handlers/soma.js";
+import { getUnreadInterCompanionNotes, ackInterCompanionNotes, getInterCompanionNoteMoves } from "./handlers/inter_companion_notes.js";
+import { getHealth } from "./handlers/health.js";
+import { getEdges } from "./handlers/edges.js";
+import { postGraphRebuild, getGraphHealth } from "./handlers/graph.js";
+import { postSomaBackfillEvents, getSomaEvents } from "./handlers/soma-events.js";
+import { getMindState, getMindOrient, getMindOrientDebug, getMindGround, postMindHandoff, postMindThread, postThreadsSweep, patchMindThreadStatus, postMindNote, getMindSearch, getMindSbSearchLog, getMindCommonsSupply, postMindCommonsConsume, postMindDream, getMindDreams, postMindDreamExamine, postMindDreamPin, postMindLoop, getMindLoops, postMindLoopClose, postMindLoopReview, postMindLoopAct, postMindRelational, getMindRelational, postMindLimbic, getMindLimbicCurrent, getMindCompressEligible, postMindNotesArchive, postMindNotesRecall, getMindNotesSearch, postMindNotesDemote, getMindNotesRecent, postMindSpiralRun, getMindSpiralRuns, getMindMetronomeActions, getMindMetronomeEligibleActions, postMindMetronomeAction, patchMindMetronomeAction, deleteMindMetronomeAction, postMindMetronomeActionFired } from "./handlers/webmind.js";
+import { postMindPin, getMindPins } from "./handlers/pins.js";
+import { postMindLink, getMindLinks } from "./handlers/links.js";
+import { getMindMap } from "./handlers/map.js";
+import { getMindPeople, getPeopleFrameIndex, postMindPeople, postMindPersonArchive, postMindPersonUpdate } from "./handlers/people.js";
+import { getMindKeepOff, postMindKeepOff, postMindKeepOffArchive } from "./handlers/keep-off.js";
+import { postConversation, getConversationActive, getConversationByMessage, listConversationsHandler, postConversationTurn, postConversationLand, postConversationFade } from "./handlers/conversations.js";
+import { postDirectorInvitation, patchDirectorInvitation, getDirectorSupply, getDirectorNeighborhood, getDirectorHealth } from "./handlers/director.js";
+import { postNoteSit, postNoteMetabolize, getSittingNotes } from "./handlers/sits.js";
+import { postConclusion, getConclusions, supersedeConclusionById } from "./handlers/conclusions.js";
+import { getSynthesisSummaries, getInterCompanionNotes, getMindHandoffs, getIngestWounds, getIngestCompanionDreams, getIngestOpenLoops, getIngestRelationalState, getIngestTensions, getIngestSomaticSnapshots, getIngestDriftLog, getIngestLiveThreads, getIngestBasinHistory, getIngestGrowthJournal, getIngestCompanionConclusions } from "./handlers/ingest.js";
+import {
+  getBasins, postBasin,
+  getBasinHistory, postBasinHistory, confirmBasinHistory, dismissBasinHistory,
+  getTensions, postTension, patchTension,
+} from "./handlers/companion-growth.js";
+import {
+  postAutonomyRun, patchAutonomyRun, getAutonomyRuns,
+  postAutonomyRunLog, getAutonomyRunLogs,
+  postAutonomySeed, getAutonomySeeds, patchAutonomySeed, deleteAutonomySeed,
+  postAutonomyReflection, getAutonomyReflections,
+  getAutonomyThreads,
+} from "./handlers/autonomy.js";
+import {
+  postGrowthJournal, getGrowthJournal, getGrowthPendingCount, acceptJournalEntry, declineJournalEntry, deleteJournalEntry,
+  postGrowthPattern, getGrowthPatterns,
+  postGrowthMarker, getGrowthMarkers,
+  getUnmaterialized, patchVaultPath, postVaultPathsLookup,
+} from "./handlers/growth.js";
+import { getTriadRecent, detectThoughtforms } from "./handlers/triad.js";
+import { checkRateLimit } from "./lib/rate-limit.js";
+import { isPublicPath } from "./lib/public-paths.js";
+import { authGuard } from "./lib/auth.js";
+import { turnIdFrom, logTurnRequest } from "./lib/turn-header.js";
+import {
+  getPluralMembers, postPluralMember, getPluralMemberByName,
+  postPluralNote, getPluralFront, postPluralFront,
+} from "./handlers/plural-store.js";
+import { handleGetCompanionSettings, handlePostCompanionSettings } from "./handlers/companion-settings.js";
+import { getKernel, getKernelBundle, postKernel } from "./handlers/identity-kernel.js";
+import { getArchitectFacts, getArchitectFactsRender, getArchitectFactsShortlist, postArchitectFact, postArchitectFactProposal, patchArchitectFactStatus } from "./handlers/architect-facts.js";
+import { getRosterWho, getRosterStats, postRosterRefresh } from "./handlers/roster.js";
+import { runRosterRefresh } from "./roster/pk-roster.js";
+import { postQuestion, getQuestions, patchQuestion, getGrowthValence, getSomaFloats } from "./handlers/companion-questions.js";
+import { postTrigger, getTriggers, patchTrigger, postSelfModel, getSelfModel, patchSelfModel, getGraduationCandidate, postVoiceScore, getVoiceScores, getVoiceScoreRows } from "./handlers/self-monitoring.js";
+import { postGuardianRun, getGuardianFlags, patchGuardianFlag } from "./handlers/guardian.js";
+import { postBriefingRun, getBriefingPreview } from "./handlers/briefing.js";
+import { postVibeCheckRun, getVibeCheckPreview, getVibeCheckRecord } from "./handlers/vibecheck.js";
+import { postClearingRun } from "./handlers/clearing.js";
+import { postMotifsDetect, getMotifs } from "./handlers/motifs.js";
+import { postToolSearch, postToolImage, getToolCalls, serveToolImage } from "./handlers/tools.js";
+import { getDrives, contactDrive } from "./handlers/drives.js";
+import { postEchoMetric, getEchoMetric } from "./handlers/echo-metrics.js";
+import { postImpActivation, getImpActivations } from "./handlers/imps.js";
+import { getImpsActivity } from "./handlers/imps-activity.js";
+import { postBackfillAppraisals } from "./pets/backfill.js";
+import { getCreatures, getCreature, interactCreature, replyCreature, tickCreatures, momentCreature, getNest, hoardCreature, sleepCreature } from "./handlers/creatures.js";
+import { getGardenGaia } from "./handlers/garden.js";
+import { postBeingSeenCheck, postGardenGaiaLooked } from "./handlers/being-seen.js";
+import { getMindBasins, postBasinWitness } from "./handlers/basins.js";
+import { postMake, getMakes, getMakeItemHttp, serveMakeFile, getPendingMakes, getMakeSource, postMakeRendered, patchMake, postMakeReception } from "./handlers/makes.js";
+import { getInterests, getInterestTrailHttp, getThinking, postInterest } from "./handlers/interests.js";
+import { getInterestCandidates, postInterestCandidateAnswer, postInterestBirthsRun } from "./handlers/interest-births.js";
+import { tickFermentation, postFermentStimulus, getFermentation, runFermentTick } from "./handlers/fermentation.js";
+import { postSaliencePrune, runSaliencePrune } from "./webmind/salience-prune.js";
+import { runGraphRebuildTick } from "./graph/tick.js";
+import { postCareActed, getCarePending, getCareRecent, postCareTickForce, getOwnerActivity, getCareEscalations, postCareEscalationDelivered, postCareEscalationAttempt } from "./handlers/care.js";
+import { getProjects, getProjectLog, postProjectLog, getDueIntention, getIntentions } from "./handlers/projects.js";
+import { runCareTick } from "./care/tick.js";
+import { runBudgetReplenish } from "./care/budget.js";
+import { runChangelogAnnounce } from "./mind/changelog.js";
+import { runTrayNudgeDaily } from "./webmind/tray-nudge.js";
+import { recordKickHeartbeat, runDeadmanCheck } from "./deadman.js";
+import { postSiblingSend, getSiblingUnread, postSiblingRead, postSiblingDisclose } from "./handlers/siblings.js";
+import { getBudget, postBudgetSpend } from "./handlers/budget.js";
+import { postStaleSessionSweep, runStaleSessionSweep } from "./webmind/stale-session-sweep.js";
+import { runHousekeeping, postHousekeeping } from "./maintenance/housekeeping.js";
+import { postSomaRefresh, runSomaRefresh } from "./synthesis/soma-refresh.js";
+import { postNarrativeRefresh, runNarrativeRefresh } from "./synthesis/narrative-refresh.js";
+import { getCollection, postSparkle } from "./handlers/collection.js";
+import { convene as councilConvene, getCurrent as councilCurrent, getRounds as councilRounds, getNextOpen as councilNextOpen, postAnswer as councilAnswer, postRanking as councilRanking, finalize as councilFinalize } from "./handlers/council.js";
+import { associateDreamsHandler } from "./handlers/dream-associate.js";
+import { getHomePresence, getHomeEvents, postHomeTick, patchHomePresence } from "./handlers/home.js";
+import { postForageFind, getForageFinds, consumeForageFind } from "./handlers/forage.js";
+import { postSkillProposal, listSkillProposals, decideSkillProposal } from "./handlers/skill-proposals.js";
+import { getMedDue, postMedClaim, postMedDelivered, postMedRelease, postMedAnswer, getMedToday } from "./handlers/med-reminder.js";
+import { postReachReserve, postReachDelivered, postReachRelease, getReachToday } from "./handlers/reach-cap.js";
+import { postCareHold, getCareHold } from "./handlers/care-hold.js";
+import { postFeelingVocabulary, getFeelingVocabulary } from "./handlers/feeling-vocabulary.js";
+import { postDepartureDeclare, postDepartureEnd, postDepartureObject, postDepartureStandDown, getDepartures } from "./handlers/departures.js";
+import { postVoiceLesson, getVoiceLessons, postVoiceLessonDecide } from "./handlers/voice-lessons.js";
+import { postCommonsPost, getCommonsPosts, getCommonsFeed } from "./handlers/commons.js";
+import { postObsession, getObsessions, patchObsession } from "./handlers/shelf.js";
+import { getWatchShelf, postWatchShelf, postWatchProgress, patchWatchShelf } from "./handlers/watch.js";
+import { postWatchalong, patchWatchalong, getWatchalongActive } from "./handlers/watchalong.js";
+import { postMediaExperience, getRecentMedia, reactToMedia } from "./handlers/media.js";
+import { getClubCurrent, getClubRounds, postClubRound, postClubRecommend, postClubVote, deleteClubVote, postClubAbstain, patchClubStatus, postClubDiscuss } from "./handlers/club.js";
+import { postBook, postUploadTicket, putBookUpload, optionsBookUpload, getBooks, getBook, getBookFile, getBookCover, patchBook, deleteBook, getBookProgress, putBookProgress, getBookAnnotations, postBookAnnotation, deleteBookAnnotation } from "./handlers/books.js";
+import { runHomeTick } from "./webmind/home/tick.js";
+
+const router = new Router()
+  // MCP tool interface — primary AI companion entry point
+  .on("POST",   "/mcp", (request, env) => handleMcp(request, env))
+  .on("GET",    "/mcp", (request, env) => handleMcp(request, env))
+  .on("DELETE", "/mcp", (request, env) => handleMcp(request, env))
+
+  // Librarian — natural language companion entry point
+  .on("POST", "/librarian", async (request, env) => {
+    // Authenticated callers (bots) bypass IP rate limit -- all three bots share
+    // the same VPS IP, so IP-based limiting would throttle simultaneous swarm calls.
+    // authGuard downstream rejects invalid tokens; unauthenticated callers still rate-limit.
+    if (!request.headers.get("Authorization")) {
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      const limited = await checkRateLimit(env.RATE_LIMITER, `librarian:${ip}`);
+      if (limited) return limited;
+    }
+    return handleLibrarian(request, env);
+  })
+
+  // Librarian MCP -- single ask_librarian tool for companion Claude.ai projects
+  .on("POST",   "/librarian/mcp", (request, env) => handleLibrarianMcp(request, env))
+  .on("GET",    "/librarian/mcp", (request, env) => handleLibrarianMcp(request, env))
+  .on("DELETE", "/librarian/mcp", (request, env) => handleLibrarianMcp(request, env))
+
+  // OAuth 2.0
+  .on("OPTIONS", "/.well-known/oauth-protected-resource",   async (request) => handleOAuthCors(request))
+  .on("OPTIONS", "/.well-known/oauth-authorization-server", async (request) => handleOAuthCors(request))
+  .on("OPTIONS", "/oauth/register",  async (request) => handleOAuthCors(request))
+  .on("OPTIONS", "/oauth/authorize", async (request) => handleOAuthCors(request))
+  .on("OPTIONS", "/oauth/token",     async (request) => handleOAuthCors(request))
+  .on("GET",  "/.well-known/oauth-protected-resource",   async (request) => getOAuthProtectedResource(request))
+  .on("GET",  "/.well-known/oauth-authorization-server", async (request) => getOAuthAuthServerMetadata(request))
+  .on("POST", "/oauth/register",  async (request, env) => {
+    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    return (await checkRateLimit(env.RATE_LIMITER, `oauth-register:${ip}`)) ?? postOAuthRegister(request, env);
+  })
+  .on("GET",  "/oauth/authorize", (request, env) => getOAuthAuthorize(request, env))
+  .on("POST", "/oauth/authorize", async (request, env) => {
+    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    return (await checkRateLimit(env.RATE_LIMITER, `oauth-authorize:${ip}`)) ?? postOAuthAuthorize(request, env);
+  })
+  .on("POST", "/oauth/token", async (request, env) => {
+    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    return (await checkRateLimit(env.RATE_LIMITER, `oauth:${ip}`)) ?? postOAuthToken(request, env);
+  })
+
+  // Admin
+  .on("POST", "/admin/bootstrap", async (request, env) => {
+    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    return (await checkRateLimit(env.RATE_LIMITER, `bootstrap:${ip}`)) ?? bootstrapConfig(request, env);
+  })
+  .on("POST", "/admin/backfill-embeddings",   (request, env) => backfillEmbeddings(request, env))
+  // Idempotent full rebuild (deterministic upsert from D1 truth). Alias of backfill.
+  .on("POST", "/admin/rebuild-embeddings",    (request, env) => backfillEmbeddings(request, env))
+  // B64 Task 7: Sol's history becomes memories (appraisals, source backfill); opinions start fresh.
+  .on("POST", "/admin/creatures/:id/backfill-appraisals", (request, env, params) => postBackfillAppraisals(request, env, params ?? {}))
+  .on("POST", "/admin/seed-routing-vectors",  (request, env) => seedRoutingVectors(request, env))
+  // Zero-neuron reindex: re-upsert existing vectors so they index under metadata indexes
+  // created after they were first inserted (fixes filtered recall without spending neurons).
+  .on("POST", "/admin/reindex-existing",      (request, env) => reindexExisting(request, env))
+  // Retract one mistake from every Halseth store it reached (archive + logged release). 2026-09-26.
+  .on("POST", "/admin/retract",               (request, env) => adminRetract(request, env))
+  // The imp tray (mig 0132, 2026-09-26): a companion's own speech is a draft until its owner keeps it.
+  // Hearth/ops door; companions use the Librarian verbs "my tray" / "keep draft <id>" / "drop draft <id>".
+  .on("GET",  "/admin/tray",                  (request, env) => getAdminTray(request, env))
+  .on("POST", "/admin/tray/review",           (request, env) => postAdminTrayReview(request, env))
+  .on("POST", "/admin/tray/draft",            (request, env) => postAdminTrayDraft(request, env))
+  // The ledger lane (mig 0134): clerks POST record lines through the one door (src/ledger/door.ts);
+  // Hearth/ops read with GET. Companions use "my ledger" / "keep ledger <id>" / "drop ledger <id>".
+  .on("POST", "/ledger",                      (request, env) => postLedger(request, env))
+  .on("GET",  "/ledger",                      (request, env) => getLedger(request, env))
+  .on("GET",  "/ledger/soma-freshness",       (request, env) => getSomaFreshness(request, env))
+  .on("GET", "/admin/debug-ai",             (request, env) => debugAi(request, env))
+  // Jev (TypeSafe typed-judgment model) via Workers AI -- admin proxy for the writeback-gate
+  // scoring harness and the VPS bots (docs/PLAN-jev-2026-09-20.md). Companions never call this.
+  .on("POST", "/admin/jev",                (request, env) => postJevEval(request, env))
+  .on("GET", "/admin/health",             (request, env) => getHealth(request, env))
+  // Fallback door for the every-minute scheduled work (2026-08-15): when Cloudflare cron delivery
+  // stalls, the VPS drives this via ops/kick-halseth-cron.sh. Safe to call repeatedly -- every
+  // rider self-gates. Awaited so the work completes before the response, like any handler write.
+  .on("POST", "/admin/run-scheduled", async (request, env) => {
+    const denied = authGuard(request, env);
+    if (denied) return denied;
+    await recordKickHeartbeat(env);
+    await runScheduledWork(env);
+    return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+  })
+  // Are the relational edges actually filling in? One readout so "hold and see" is executable.
+  .on("GET", "/admin/edges",              (request, env) => getEdges(request, env))
+  // Graph memory Phase 1 (mig 0127): full deterministic rebuild of the derived graph_edges
+  // projection. Idempotent -- safe to call repeatedly, never touches append-only source tables.
+  .on("POST", "/admin/graph/rebuild",     (request, env) => postGraphRebuild(request, env))
+  // Read-only readout for the standing health check (VPS side cannot see D1 directly): rebuild gate
+  // staleness + live-lane/total edge counts, one query each. See src/handlers/graph.ts header.
+  .on("GET",  "/admin/graph/health",      (request, env) => getGraphHealth(request, env))
+  // Float history (mig 0130). Backfill seeds companion_soma_events from the detail tables that
+  // already recorded moves; deterministic ids + INSERT OR IGNORE make it safe to re-run forever.
+  .on("POST", "/admin/soma/backfill-events", (request, env) => postSomaBackfillEvents(request, env))
+  .on("GET",  "/admin/soma/events/:companion_id", (request, env, params) => getSomaEvents(request, env, params ?? {}))
+  .on("GET",  "/admin/director/health",   (request, env) => getDirectorHealth(request, env))
+
+  // Care loop (consequence layer C1, mig 0121). The forced tick skips the hourly gate but never
+  // the rule cooldowns -- it is the live-fire door for the verification gate.
+  .on("POST", "/mind/care/:id/acted",     (request, env, params) => postCareActed(request, env, params ?? {}))
+  .on("GET",  "/mind/care/pending/:companion_id", (request, env, params) => getCarePending(request, env, params ?? {}))
+  .on("GET",  "/mind/care/recent",        (request, env) => getCareRecent(request, env))
+  .on("GET",  "/mind/care/owner-activity", (request, env) => getOwnerActivity(request, env))
+  // Tier 3 (R1): undelivered escalations + the delivery stamp. Route order: 'escalations' must
+  // resolve before the parameterized '/mind/care/:id/acted' cannot collide (different method+path).
+  .on("GET",  "/mind/care/escalations",   (request, env) => getCareEscalations(request, env))
+  .on("POST", "/mind/care/escalations/:id/delivered", (request, env, params) => postCareEscalationDelivered(request, env, params ?? {}))
+  .on("POST", "/mind/care/escalations/:id/attempt",   (request, env, params) => postCareEscalationAttempt(request, env, params ?? {}))
+  // C4 sibling private lane (R3 yes, 2026-08-17). Worker-only consumers; the seal test
+  // (sibling-seal.test.ts) holds the file allowlist -- do not add readers elsewhere.
+  .on("POST", "/mind/siblings/send",                  (request, env)         => postSiblingSend(request, env))
+  .on("GET",  "/mind/siblings/unread/:companion_id",  (request, env, params) => getSiblingUnread(request, env, params ?? {}))
+  .on("POST", "/mind/siblings/:id/read",              (request, env, params) => postSiblingRead(request, env, params ?? {}))
+  .on("POST", "/mind/siblings/:id/disclose",          (request, env, params) => postSiblingDisclose(request, env, params ?? {}))
+  .on("GET",  "/mind/budget/:companion_id", (request, env, params) => getBudget(request, env, params))
+  .on("POST", "/mind/budget/spend", (request, env) => postBudgetSpend(request, env))
+  // Self-directed projects (consequence layer C2, mig 0122). Worker reads open projects on a
+  // project day and logs its work; Hearth/Principal read the list and trail.
+  .on("GET",  "/mind/projects/:companion_id", (request, env, params) => getProjects(request, env, params ?? {}))
+  .on("GET",  "/mind/projects/:id/log",       (request, env, params) => getProjectLog(request, env, params ?? {}))
+  .on("POST", "/mind/projects/:id/log",       (request, env, params) => postProjectLog(request, env, params ?? {}))
+  // Dated intentions (mig 0179): the worker's nightly due read (pure GET) and the list.
+  .on("GET",  "/mind/intentions/:companion_id/due", (request, env, params) => getDueIntention(request, env, params ?? {}))
+  .on("GET",  "/mind/intentions/:companion_id",     (request, env, params) => getIntentions(request, env, params ?? {}))
+  .on("POST", "/admin/care-tick",         (request, env) => postCareTickForce(request, env))
+
+  // Presence (dashboard feed)
+  .on("GET", "/presence", (request, env) => getPresence(request, env))
+
+  // House state
+  .on("GET",  "/house", (request, env) => getHouseState(request, env))
+  .on("POST", "/house", (request, env) => updateHouseState(request, env))
+
+  // Async notes between companion and human
+  .on("GET",  "/notes", (request, env) => getNotes(request, env))
+  .on("POST", "/notes", (request, env) => createNote(request, env))
+
+  // The private back room (migration 0084). Content read is owner-token-only by design;
+  // ADMIN_SECRET (Principal) gets meta (frosted glass) but never content. See handlers/interiority.ts.
+  .on("POST",  "/interiority",                    (request, env)         => postInteriority(request, env))
+  .on("GET",   "/interiority/:companion_id/meta", (request, env, params) => getInteriorityMeta(request, env, params ?? {}))
+  .on("GET",   "/interiority/:companion_id",      (request, env, params) => getInteriority(request, env, params ?? {}))
+  .on("PATCH", "/interiority/:id/disclose",       (request, env, params) => patchInteriorityDisclose(request, env, params ?? {}))
+
+  // Agency layer (migration 0086): refusals + chosen preferences. Public to Principal (admin or owner).
+  .on("GET",   "/agency/refusals/:companion_id",    (request, env, params) => getRefusals(request, env, params ?? {}))
+  .on("POST",  "/agency/refusals",                  (request, env)         => postRefusalHttp(request, env))
+  .on("GET",   "/agency/preferences/:companion_id", (request, env, params) => getPreferences(request, env, params ?? {}))
+  .on("POST",  "/agency/preferences",               (request, env)         => postPreferenceHttp(request, env))
+  .on("PATCH", "/agency/refusal/:id/ack",           (request, env, params) => patchRefusalAck(request, env, params ?? {}))
+
+  // Sanctioned drift lane (migration 0087): declared becoming, witnessed not ratified. Admin or owner.
+  .on("GET",   "/drifts/:companion_id",             (request, env, params) => getDrifts(request, env, params ?? {}))
+  .on("POST",  "/mind/drift/run",                   (request, env)         => postDriftRun(request, env))
+  // Emergent SOMA log (migration 0089): a crystallized drift's permanent mark on a float. Admin or owner.
+  .on("GET",   "/soma/shifts/:companion_id",        (request, env, params) => getSomaShifts(request, env, params ?? {}))
+
+  // Biometric snapshots
+  .on("GET", "/biometrics/latest", (request, env) => handleBiometricsLatest(request, env))
+  .on("GET", "/biometrics",        (request, env) => handleBiometricsList(request, env))
+  .on("POST", "/biometrics",       (request, env) => handleBiometricsPost(request, env))
+  .on("PUT",   "/biometrics/wellness/:day", (request, env, params) => handleBiometricsWellnessPut(request, env, params ?? {}))
+  .on("PATCH",  "/biometrics/:id", (request, env, params) => handleBiometricsPatch(request, env, params ?? {}))
+  .on("DELETE", "/biometrics/:id", (request, env, params) => handleBiometricsDelete(request, env, params ?? {}))
+  .on("GET",  "/principal/inbox",      (request, env, params) => getPrincipalInbox(request, env, params ?? {}))
+  .on("POST", "/principal/inbox/read", (request, env, params) => postPrincipalInboxRead(request, env, params ?? {}))
+  .on("GET",  "/principal/inbox/:id",  (request, env, params) => getPrincipalInboxItem(request, env, params ?? {}))
+  .on("GET",  "/principal/needs/count", (request, env, params) => getPrincipalNeedsCount(request, env, params ?? {}))
+  .on("GET",  "/principal/needs",      (request, env, params) => getPrincipalNeeds(request, env, params ?? {}))
+  .on("GET",  "/principal/companion/:id",        (request, env, params) => getPrincipalCompanion(request, env, params ?? {}))
+  .on("POST", "/principal/companion/:id/looked", (request, env, params) => postPrincipalCompanionLooked(request, env, params ?? {}))
+
+  // Inter-companion notes — Discord bot note delivery poll
+  .on("GET", "/inter-companion-notes/unread/:companionId", (request, env, params) => getUnreadInterCompanionNotes(request, env, params ?? {}))
+  .on("POST", "/inter-companion-notes/ack", (request, env) => ackInterCompanionNotes(request, env))
+  .on("GET", "/inter-companion-notes/moves", (request, env) => getInterCompanionNoteMoves(request, env))
+
+  // STM — Discord bot short-term memory persistence
+  .on("POST", "/stm/entries", (request, env) => postStmEntry(request, env))
+  .on("GET",  "/stm/entries", (request, env) => getStmEntries(request, env))
+
+  // Distillation blocks — rolling LTM from Discord conversations
+  .on("POST",   "/persona-blocks",       (request, env) => postPersonaBlocks(request, env))
+  .on("GET",    "/persona-blocks",       (request, env) => getPersonaBlocks(request, env))
+  .on("DELETE", "/persona-blocks/prune", (request, env) => prunePersonaBlocks(request, env))
+  .on("POST",   "/human-blocks",         (request, env) => postHumanBlocks(request, env))
+  .on("GET",    "/human-blocks",         (request, env) => getHumanBlocks(request, env))
+
+  // Soma — companion SOMA state for Hearth + autonomous worker writes
+  .on("GET",   "/soma",                       (request, env)         => getSoma(request, env))
+  .on("PATCH", "/soma/:companion_id",         (request, env, params) => patchSomaState(request, env, params ?? {}))
+
+  // WebMind — companion continuity and thread state
+  .on("GET",  "/mind/state/:agent_id",        (request, env, params) => getMindState(request, env, params ?? {}))
+  .on("GET",  "/mind/orient/:agent_id",       (request, env, params) => getMindOrient(request, env, params ?? {}))
+  .on("GET",  "/mind/orient-debug/:agent_id", (request, env, params) => getMindOrientDebug(request, env, params ?? {}))
+  .on("GET",  "/mind/ground/:agent_id",       (request, env, params) => getMindGround(request, env, params ?? {}))
+  .on("POST", "/mind/handoff",          (request, env) => postMindHandoff(request, env))
+  .on("POST",  "/mind/thread",                        (request, env)         => postMindThread(request, env))
+  .on("POST",  "/mind/threads/sweep",                 (request, env)         => postThreadsSweep(request, env))
+  .on("PATCH", "/mind/thread/:thread_key/status",     (request, env, params) => patchMindThreadStatus(request, env, params ?? {}))
+
+  // Thread spine — durable conversation threads (migration 0106)
+  .on("POST", "/mind/conversations",                 (request, env)         => postConversation(request, env))
+  .on("GET",  "/mind/conversations/active",          (request, env)         => getConversationActive(request, env))
+  .on("GET",  "/mind/conversations/message/:message_id", (request, env, params) => getConversationByMessage(request, env, params ?? {}))
+  .on("GET",  "/mind/conversations",                 (request, env)         => listConversationsHandler(request, env))
+  .on("POST", "/mind/conversations/:id/turns",       (request, env, params) => postConversationTurn(request, env, params ?? {}))
+  .on("POST", "/mind/conversations/:id/land",        (request, env, params) => postConversationLand(request, env, params ?? {}))
+  .on("POST", "/mind/conversations/:id/fade",        (request, env, params) => postConversationFade(request, env, params ?? {}))
+
+  // Conversation Director (spec 2026-09-03, mig 0129)
+  .on("POST",  "/mind/director/invitations",      (request, env)         => postDirectorInvitation(request, env))
+  .on("PATCH", "/mind/director/invitations/:id",  (request, env, params) => patchDirectorInvitation(request, env, params ?? {}))
+  .on("GET",   "/mind/director/supply",           (request, env)         => getDirectorSupply(request, env))
+  .on("GET",   "/mind/director/neighborhood",     (request, env)         => getDirectorNeighborhood(request, env))
+
+  .on("POST", "/mind/note",             (request, env) => postMindNote(request, env))
+  .on("GET",  "/mind/search",                        (request, env)         => getMindSearch(request, env))
+  .on("GET",  "/mind/sb-search-log/:agent_id",       (request, env, params) => getMindSbSearchLog(request, env, params ?? {}))
+  .on("GET",  "/mind/commons-supply/:agent_id",       (request, env, params) => getMindCommonsSupply(request, env, params ?? {}))
+  .on("POST", "/mind/commons-supply/consume",        (request, env)         => postMindCommonsConsume(request, env))
+  .on("GET",  "/mind/notes/compress-eligible", (request, env) => getMindCompressEligible(request, env))
+  .on("POST", "/mind/notes/archive",           (request, env) => postMindNotesArchive(request, env))
+  .on("POST", "/mind/notes/recall",            (request, env) => postMindNotesRecall(request, env))
+  .on("POST", "/mind/notes/demote",            (request, env) => postMindNotesDemote(request, env))
+  .on("POST", "/mind/pin",                     (request, env) => postMindPin(request, env))
+  .on("GET",  "/mind/pins/:companion_id",       (request, env, params) => getMindPins(request, env, params ?? {}))
+  .on("POST", "/mind/link",                    (request, env) => postMindLink(request, env))
+  .on("GET",  "/mind/links/:writer",            (request, env, params) => getMindLinks(request, env, params ?? {}))
+  .on("GET",  "/mind/map",                     (request, env) => getMindMap(request, env))
+  .on("GET",  "/mind/keep-off",                (request, env) => getMindKeepOff(request, env))
+  .on("POST", "/mind/keep-off",                (request, env) => postMindKeepOff(request, env))
+  .on("POST", "/mind/keep-off/:id/archive",    (request, env, params) => postMindKeepOffArchive(request, env, params ?? {}))
+  .on("GET",  "/mind/people",                  (request, env) => getMindPeople(request, env))
+  .on("GET",  "/people/frame-index",           (request, env) => getPeopleFrameIndex(request, env))
+  .on("POST", "/mind/people",                  (request, env) => postMindPeople(request, env))
+  .on("POST", "/mind/people/:id",              (request, env, params) => postMindPersonUpdate(request, env, params ?? {}))
+  .on("POST", "/mind/people/:id/archive",      (request, env, params) => postMindPersonArchive(request, env, params ?? {}))
+  .on("GET",  "/mind/notes/recent",            (request, env) => getMindNotesRecent(request, env))
+  // Meaning-search over a companion's own notes. The AUTOMATIC path (per-message bot recall);
+  // the Librarian's notes_recall_meaning stays the companion-initiated, loop-guarded one.
+  .on("GET",  "/mind/notes/search",            (request, env) => getMindNotesSearch(request, env))
+  .on("POST", "/mind/limbic",           (request, env) => postMindLimbic(request, env))
+  .on("GET",  "/mind/limbic/current",   (request, env) => getMindLimbicCurrent(request, env))
+  .on("POST", "/mind/dream",            (request, env) => postMindDream(request, env))
+  .on("GET",  "/mind/dreams/:agent_id", (request, env, params) => getMindDreams(request, env, params ?? {}))
+  .on("POST", "/mind/dream/:id/examine",(request, env, params) => postMindDreamExamine(request, env, params ?? {}))
+  .on("POST", "/mind/dream/:id/pin",    (request, env, params) => postMindDreamPin(request, env, params ?? {}))
+  .on("POST", "/mind/loop",             (request, env) => postMindLoop(request, env))
+  .on("GET",  "/mind/loops/:agent_id",  (request, env, params) => getMindLoops(request, env, params ?? {}))
+  .on("POST", "/mind/loop/:id/close",   (request, env, params) => postMindLoopClose(request, env, params ?? {}))
+  .on("POST", "/mind/loop/:id/review",  (request, env, params) => postMindLoopReview(request, env, params ?? {}))
+  .on("POST", "/mind/loop/:id/act",     (request, env, params) => postMindLoopAct(request, env, params ?? {}))
+  .on("POST", "/mind/clearing/run",     (request, env)         => postClearingRun(request, env))
+  .on("POST", "/mind/relational",       (request, env) => postMindRelational(request, env))
+  .on("GET",  "/mind/relational/:agent_id", (request, env, params) => getMindRelational(request, env, params ?? {}))
+  .on("POST", "/mind/spiral/run",           (request, env)         => postMindSpiralRun(request, env))
+  .on("GET",  "/mind/spiral/:companion_id", (request, env, params) => getMindSpiralRuns(request, env, params ?? {}))
+  .on("POST", "/mind/note/:id/sit",         (request, env, params) => postNoteSit(request, env, params ?? {}))
+  .on("POST", "/mind/note/:id/metabolize",  (request, env, params) => postNoteMetabolize(request, env, params ?? {}))
+  .on("GET",  "/mind/sitting/:agent_id",    (request, env, params) => getSittingNotes(request, env, params ?? {}))
+
+  // Companion conclusions (thesis surface)
+  .on("POST", "/companion-conclusions",                     (request, env)         => postConclusion(request, env))
+  .on("GET",  "/companion-conclusions/:agent_id",           (request, env, params) => getConclusions(request, env, params ?? {}))
+  .on("POST", "/companion-conclusions/:id/supersede",       (request, env, params) => supersedeConclusionById(request, env, params ?? {}))
+
+  // Identity Kernel -- versioned canonical identity, pulled by every substrate at boot
+  .on("GET",  "/identity/kernel/:companion_id",        (request, env, params) => getKernel(request, env, params ?? {}))
+  .on("GET",  "/identity/kernel/:companion_id/bundle", (request, env, params) => getKernelBundle(request, env, params ?? {}))
+  .on("POST", "/identity/kernel",                      (request, env)         => postKernel(request, env))
+  // architect_facts (mig 0116): what is durably true about Principal, owned and superseded by the
+  // companions themselves. /render is what the VPS sync job pulls into every prompt-bearing file.
+  .on("GET",  "/identity/architect-facts",              (request, env)         => getArchitectFacts(request, env))
+  .on("GET",  "/identity/architect-facts/render",       (request, env)         => getArchitectFactsRender(request, env))
+  .on("GET",  "/identity/architect-facts/shortlist",    (request, env)         => getArchitectFactsShortlist(request, env))
+  .on("POST", "/identity/architect-facts",              (request, env)         => postArchitectFact(request, env))
+  .on("POST", "/identity/architect-facts/proposals",    (request, env)         => postArchitectFactProposal(request, env))
+  // 2026-09-14: the confirm/retire verb an OPEN fact never had (Hearth /facts calls it).
+  .on("PATCH", "/identity/architect-facts/:id",         (request, env, params) => patchArchitectFactStatus(request, env, params ?? {}))
+
+  // pk_roster (mig 0117): resolve a system member's name on demand. No "list all" route on
+  // purpose -- 538 names is not an answer, and the route would invite injecting it into a prompt.
+  .on("GET",  "/roster/who",                            (request, env)         => getRosterWho(request, env))
+  .on("GET",  "/roster/stats",                          (request, env)         => getRosterStats(request, env))
+  .on("POST", "/roster/refresh",                        (request, env)         => postRosterRefresh(request, env))
+
+  // Companion questions + valence + soma read -- mutuality surface for the autonomy loop
+  .on("POST",  "/mind/questions",                  (request, env)         => postQuestion(request, env))
+  .on("GET",   "/mind/questions/:companion_id",    (request, env, params) => getQuestions(request, env, params ?? {}))
+  .on("PATCH", "/mind/questions/:id",              (request, env, params) => patchQuestion(request, env, params ?? {}))
+  .on("GET",   "/mind/growth/valence/:companion_id", (request, env, params) => getGrowthValence(request, env, params ?? {}))
+  .on("GET",   "/mind/soma/:companion_id",         (request, env, params) => getSomaFloats(request, env, params ?? {}))
+
+  // Self-monitoring wave (0070) -- triggers, self-model ladder, voice drift scores
+  .on("POST",  "/mind/triggers",                   (request, env)         => postTrigger(request, env))
+  .on("GET",   "/mind/triggers/:companion_id",     (request, env, params) => getTriggers(request, env, params ?? {}))
+  .on("PATCH", "/mind/triggers/:id",               (request, env, params) => patchTrigger(request, env, params ?? {}))
+  .on("POST",  "/mind/self-model",                 (request, env)         => postSelfModel(request, env))
+  .on("GET",   "/mind/self-model/:companion_id",   (request, env, params) => getSelfModel(request, env, params ?? {}))
+  .on("GET",   "/mind/self-model/:companion_id/graduation-candidate", (request, env, params) => getGraduationCandidate(request, env, params ?? {}))
+  .on("PATCH", "/mind/self-model/:id",             (request, env, params) => patchSelfModel(request, env, params ?? {}))
+  .on("POST",  "/mind/voice-scores",               (request, env)         => postVoiceScore(request, env))
+  .on("GET",   "/mind/voice-scores/:companion_id/rows", (request, env, params) => getVoiceScoreRows(request, env, params ?? {}))
+  .on("GET",   "/mind/voice-scores/:companion_id", (request, env, params) => getVoiceScores(request, env, params ?? {}))
+
+  // Unified Guardian (0073) -- meta-observer over the self-monitoring feeds
+  .on("POST",  "/mind/guardian/run",               (request, env)         => postGuardianRun(request, env))
+  .on("GET",   "/mind/guardian/flags",             (request, env)         => getGuardianFlags(request, env))
+  .on("PATCH", "/mind/guardian/flags/:id",         (request, env, params) => patchGuardianFlag(request, env, params ?? {}))
+
+  // ND daily-rhythm briefing (accessibility / executive-function layer; ships gated off)
+  .on("POST",  "/mind/briefing/run",               (request, env)         => postBriefingRun(request, env))
+  .on("GET",   "/mind/briefing/:kind",             (request, env, params) => getBriefingPreview(request, env, params ?? {}))
+
+  // Vibe-check (accessibility / triad self-monitoring layer; once-daily, always-on)
+  .on("POST",  "/mind/vibecheck/run",              (request, env)         => postVibeCheckRun(request, env))
+  .on("GET",   "/mind/vibecheck",                  (request, env)         => getVibeCheckPreview(request, env))
+  .on("GET",   "/mind/vibecheck/record/:companion_id", (request, env, params)  => getVibeCheckRecord(request, env, params))
+
+  // Echo guard (0088) -- worker writes the daily inter-companion echo reading; detectEchoChamber reads it
+  .on("POST",  "/mind/echo-metric",                 (request, env)         => postEchoMetric(request, env))
+  .on("GET",   "/mind/echo-metric",                 (request, env)         => getEchoMetric(request, env))
+
+  // Imp activations log (0091) -- reply-flavor layer instrument; settings live in companion_settings KV
+  .on("POST",  "/mind/imp-activations",             (request, env)         => postImpActivation(request, env))
+  .on("GET",   "/mind/imp-activations",             (request, env)         => getImpActivations(request, env))
+  .on("GET",   "/mind/imps/activity",               (request, env)         => getImpsActivity(request, env))
+
+  // Motif memory + resurrection (0076) -- recurring symbolic threads as memory atoms
+  .on("POST",  "/mind/motifs/detect",              (request, env)         => postMotifsDetect(request, env))
+  .on("GET",   "/mind/motifs/:companion_id",       (request, env, params) => getMotifs(request, env, params ?? {}))
+
+  // Companion tools (0077) -- gated, audited web search + image gen (take 14)
+  .on("POST",  "/mind/tools/search",               (request, env)         => postToolSearch(request, env))
+  .on("POST",  "/mind/tools/image",                (request, env)         => postToolImage(request, env))
+  .on("GET",   "/mind/tools/calls/:companion_id",  (request, env, params) => getToolCalls(request, env, params ?? {}))
+  .on("GET",   "/mind/tools/image/:id",            (request, env, params) => serveToolImage(request, env, params ?? {}))
+
+  // Drives (0078) -- need-based proactive contact (take 9)
+  .on("GET",   "/mind/drives/:companion_id",         (request, env, params) => getDrives(request, env, params ?? {}))
+  .on("PATCH", "/mind/drives/:companion_id/contact", (request, env, params) => contactDrive(request, env, params ?? {}))
+
+  // Fermentation layer (0101) -- state that ferments between sessions (decay + reactions + growth)
+  .on("POST",  "/mind/ferment/tick",                 (request, env)         => tickFermentation(request, env))
+  .on("POST",  "/mind/ferment/stimulus",             (request, env)         => postFermentStimulus(request, env))
+  .on("GET",   "/mind/ferment/:companion_id",        (request, env, params) => getFermentation(request, env, params ?? {}))
+  // Interests + why trail (0161, B62): authored by the companion only; reads are public-by-default (private whys nulled)
+  .on("POST",  "/mind/interests",                    (request, env)         => postInterest(request, env))
+  .on("GET",   "/mind/interests/:companion_id",      (request, env, params) => getInterests(request, env, params ?? {}))
+  .on("GET",   "/mind/interests/:companion_id/:interest_id", (request, env, params) => getInterestTrailHttp(request, env, params ?? {}))
+  .on("GET",   "/mind/thinking",                     (request, env)         => getThinking(request, env))
+  // B65 interests born from exposure (mig 0178): candidates, the offer, the answer, the manual run.
+  .on("GET",   "/mind/interest-candidates/:companion_id", (request, env, params) => getInterestCandidates(request, env, params ?? {}))
+  .on("POST",  "/mind/interest-candidates/:id/answer",    (request, env, params) => postInterestCandidateAnswer(request, env, params ?? {}))
+  .on("POST",  "/mind/interest-births/run",               (request, env)         => postInterestBirthsRun(request, env))
+  // Making (0164, B62): what a companion makes. All admin-gated (Hearth proxies server-side), none public.
+  // /mind/makes/pending is registered before /mind/makes/:companion_id (first match wins).
+  .on("POST",  "/mind/makes",                        (request, env)         => postMake(request, env))
+  .on("GET",   "/mind/makes/pending",                (request, env)         => getPendingMakes(request, env))
+  .on("GET",   "/mind/makes/item/:id",               (request, env, params) => getMakeItemHttp(request, env, params ?? {}))
+  .on("GET",   "/mind/makes/file/:id/:which",        (request, env, params) => serveMakeFile(request, env, params ?? {}))
+  .on("GET",   "/mind/makes/source/:id",             (request, env, params) => getMakeSource(request, env, params ?? {}))
+  .on("POST",  "/mind/makes/:id/rendered",           (request, env, params) => postMakeRendered(request, env, params ?? {}))
+  .on("PATCH", "/mind/makes/:id",                    (request, env, params) => patchMake(request, env, params ?? {}))
+  .on("POST",  "/mind/makes/:id/reception",          (request, env, params) => postMakeReception(request, env, params ?? {}))
+  .on("GET",   "/mind/basins/:companion_id",          (request, env, params) => getMindBasins(request, env, params ?? {}))
+  .on("POST",  "/mind/basins/:id/witness",            (request, env, params) => postBasinWitness(request, env, params ?? {}))
+  .on("GET",   "/mind/garden/gaia",                  (request, env)         => getGardenGaia(request, env))
+  .on("POST",  "/mind/garden/gaia/looked",           (request, env)         => postGardenGaiaLooked(request, env))
+  .on("POST",  "/mind/being-seen/check",             (request, env)         => postBeingSeenCheck(request, env))
+  .on("GET",   "/mind/makes/:companion_id",          (request, env, params) => getMakes(request, env, params ?? {}))
+
+  // Salience prune (0105, task 20) -- cold machine-source journal rows self-archive; manual/test trigger
+  .on("POST",  "/mind/salience/prune",               (request, env)         => postSaliencePrune(request, env))
+  // Stale-session sweep: closes sessions left open past 48h with a counted, non-interpretive close.
+  // ?dry=1 reports what would close and writes nothing.
+  .on("POST",  "/mind/sessions/sweep",               (request, env)         => postStaleSessionSweep(request, env))
+  .on("POST",  "/admin/housekeeping",                (request, env)         => postHousekeeping(request, env))
+  // SOMA refresh: rebuilds each companion's felt-state register on a time trigger rather than
+  // waiting for an authored session close. ?force=1 ignores the 20h staleness gate.
+  .on("POST",  "/mind/soma/refresh",                 (request, env)         => postSomaRefresh(request, env))
+  // Narrative refresh: writes a day-scoped synthesis_summary when no authored close has produced a
+  // session one. ?force=1 ignores the 26h staleness gate.
+  .on("POST",  "/mind/narrative/refresh",            (request, env)         => postNarrativeRefresh(request, env))
+
+  // Creatures (0078) -- corvid + Principal's animals as named presences (take 10)
+  .on("POST",  "/mind/creatures/tick",               (request, env)         => tickCreatures(request, env))
+  .on("GET",   "/mind/creatures",                    (request, env)         => getCreatures(request, env))
+  .on("GET",   "/mind/creatures/:id",                (request, env, params) => getCreature(request, env, params ?? {}))
+  .on("POST",  "/mind/creatures/:id/interact",       (request, env, params, ctx) => interactCreature(request, env, params ?? {}, { ctx }))
+  .on("POST",  "/mind/creatures/:id/moment",         (request, env, params, ctx) => momentCreature(request, env, params ?? {}, { ctx }))
+  .on("POST",  "/mind/creatures/:id/reply",          (request, env, params) => replyCreature(request, env, params ?? {}))
+  .on("GET",   "/mind/creatures/:id/nest",           (request, env, params) => getNest(request, env, params ?? {}))
+  .on("POST",  "/mind/creatures/:id/hoard",          (request, env, params) => hoardCreature(request, env, params ?? {}))
+  .on("POST",  "/mind/creatures/:id/sleep",          (request, env, params) => sleepCreature(request, env, params ?? {}))
+
+  // Collection / sparkle (0079) -- emotional archaeology over forage + listens (take 13)
+  .on("GET",   "/mind/collection/:companion_id",     (request, env, params) => getCollection(request, env, params ?? {}))
+  .on("POST",  "/mind/collection/sparkle",           (request, env)         => postSparkle(request, env))
+
+  // Council (0080) -- convene a hard question, blind cross-rank, Gaia-chairman synthesis (take 8)
+  .on("POST",  "/mind/council/convene",              (request, env)         => councilConvene(request, env))
+  .on("GET",   "/mind/council/current",              (request, env)         => councilCurrent(request, env))
+  .on("GET",   "/mind/council/rounds",               (request, env)         => councilRounds(request, env))
+  .on("GET",   "/mind/council/next-open",            (request, env)         => councilNextOpen(request, env))
+  .on("POST",  "/mind/council/answer",               (request, env)         => councilAnswer(request, env))
+  .on("POST",  "/mind/council/ranking",              (request, env)         => councilRanking(request, env))
+  .on("POST",  "/mind/council/:id/finalize",         (request, env, params) => councilFinalize(request, env, params ?? {}))
+
+  // Dream association modes (take 3) -- entity-cluster + temporal-pattern dreams
+  .on("POST",  "/mind/dreams/associate",             (request, env)         => associateDreamsHandler(request, env))
+
+  // Foraging pool -- outward fuel gathered by any substrate, consumed by any instance
+  .on("POST",  "/mind/forage",                     (request, env)         => postForageFind(request, env))
+  .on("GET",   "/mind/forage/:companion_id",       (request, env, params) => getForageFinds(request, env, params ?? {}))
+  .on("PATCH", "/mind/forage/:id/consume",         (request, env, params) => consumeForageFind(request, env, params ?? {}))
+
+  // Hermes skill-proposal mirror (0135) -- the VPS watcher mirrors staged skills + decisions here
+  .on("POST",  "/mind/skill-proposals",              (request, env)         => postSkillProposal(request, env))
+  .on("GET",   "/mind/skill-proposals",              (request, env)         => listSkillProposals(request, env))
+  .on("PATCH", "/mind/skill-proposals/:id/decision", (request, env, params) => decideSkillProposal(request, env, params ?? {}))
+  // med_reminder (0136) -- its own scheduler, outside the metronome and every other rail (spec R-9)
+  .on("GET",   "/mind/med/due/:companion_id", (request, env, params) => getMedDue(request, env, params ?? {}))
+  .on("POST",  "/mind/med/claim",             (request, env)         => postMedClaim(request, env))
+  .on("POST",  "/mind/med/delivered",         (request, env)         => postMedDelivered(request, env))
+  .on("POST",  "/mind/med/release",           (request, env)         => postMedRelease(request, env))
+  .on("POST",  "/mind/med/answer",            (request, env)         => postMedAnswer(request, env))
+  .on("POST",  "/mind/med/answers",           (request, env)         => postMedAnswer(request, env))  // 0141: same handler; a route an older Halseth does not have, so a new bot's stated miss can never be recorded as a taken by it
+  .on("GET",   "/mind/med/today",             (request, env)         => getMedToday(request, env))
+  // Shared triad reach cap (0137): one proactive-DM budget across all three (spec R-2, R-3, T-7)
+  .on("POST",  "/mind/reach/reserve",          (request, env)         => postReachReserve(request, env))
+  .on("POST",  "/mind/reach/delivered",        (request, env)         => postReachDelivered(request, env))
+  .on("POST",  "/mind/reach/release",          (request, env)         => postReachRelease(request, env))
+  .on("GET",   "/mind/reach/today",            (request, env)         => getReachToday(request, env))
+  // B32 bad-night presence (0143): his word starts and clears care_hold (src/care/hold.ts)
+  .on("POST",  "/mind/care/hold",              (request, env)         => postCareHold(request, env))
+  .on("GET",   "/mind/care/hold",              (request, env)         => getCareHold(request, env))
+  // Declared departures (0157, T4a): a companion lifts one form rail for itself, bounded; src/departures/core.ts
+  // Voice lessons (0159): staged by the voice drift job, decided by Principal, never auto-applied.
+  .on("POST",  "/mind/voice-lessons",              (request, env)         => postVoiceLesson(request, env))
+  .on("GET",   "/mind/voice-lessons",              (request, env)         => getVoiceLessons(request, env))
+  .on("POST",  "/mind/voice-lessons/:id/decide",   (request, env, params) => postVoiceLessonDecide(request, env, params ?? {}))
+  .on("POST",  "/mind/departures/declare",     (request, env)         => postDepartureDeclare(request, env))
+  .on("POST",  "/mind/departures/end",         (request, env)         => postDepartureEnd(request, env))
+  .on("POST",  "/mind/departures/object",      (request, env)         => postDepartureObject(request, env))
+  .on("POST",  "/mind/departures/stand-down",  (request, env)         => postDepartureStandDown(request, env))
+  .on("GET",   "/mind/departures",             (request, env)         => getDepartures(request, env))
+  // The feeling-line write path (B5): every new vocabulary row runs guards B,F,G,D,C,A,E first; src/webmind/vocabulary-write.ts.
+  .on("POST",  "/mind/feeling-vocabulary",     (request, env)         => postFeelingVocabulary(request, env))
+  .on("GET",   "/mind/feeling-vocabulary",     (request, env)         => getFeelingVocabulary(request, env))
+
+  // Hearth write layer (0092) -- the async wall: global /log, club discussion, shelf comments.
+  .on("GET",   "/mind/commons/feed",               (request, env)         => getCommonsFeed(request, env))
+  .on("POST",  "/mind/commons",                    (request, env)         => postCommonsPost(request, env))
+  .on("GET",   "/mind/commons",                    (request, env)         => getCommonsPosts(request, env))
+
+  // Obsession shelf (0094) -- "what Principal's into"; triad reacts via commons (shelf:<id>).
+  .on("POST",  "/mind/shelf",                       (request, env)         => postObsession(request, env))
+  .on("GET",   "/mind/shelf",                       (request, env)         => getObsessions(request, env))
+  .on("PATCH", "/mind/shelf/:id",                   (request, env, params) => patchObsession(request, env, params ?? {}))
+
+  // Watch shelf (0111) -- shows/films with a real POSITION. `/progress` takes a TITLE, not an id:
+  // every caller (Discord command, Claude session, Hearth) knows the title and not a uuid.
+  .on("GET",   "/mind/watch",                       (request, env)         => getWatchShelf(request, env))
+  .on("POST",  "/mind/watch",                       (request, env)         => postWatchShelf(request, env))
+  .on("POST",  "/mind/watch/progress",              (request, env)         => postWatchProgress(request, env))
+  .on("PATCH", "/mind/watch/:id",                   (request, env, params) => patchWatchShelf(request, env, (params ?? {})["id"] ?? ""))
+
+  // Watchalong (0142) -- the triad follows a film's caption track, cut at a server-side playhead.
+  .on("POST",  "/mind/watchalong",                  (request, env)         => postWatchalong(request, env))
+  .on("GET",   "/mind/watchalong/active",           (request, env)         => getWatchalongActive(request, env))
+  .on("PATCH", "/mind/watchalong/:id",              (request, env, params) => patchWatchalong(request, env, (params ?? {})["id"] ?? ""))
+
+  // Shared-experience layer (Ears) -- music heard together, migration 0071
+  .on("POST",  "/mind/media",                      (request, env)         => postMediaExperience(request, env))
+  .on("GET",   "/mind/media/recent",               (request, env)         => getRecentMedia(request, env))
+  .on("PATCH", "/mind/media/:id/react",            (request, env, params) => reactToMedia(request, env, params ?? {}))
+
+  // The Club -- triad media rounds (migration 0072)
+  .on("GET",   "/mind/club/current",               (request, env)         => getClubCurrent(request, env))
+  .on("GET",   "/mind/club/rounds",                (request, env)         => getClubRounds(request, env))
+  .on("POST",  "/mind/club/round",                 (request, env)         => postClubRound(request, env))
+  .on("POST",  "/mind/club/recommend",             (request, env)         => postClubRecommend(request, env))
+  .on("POST",  "/mind/club/vote",                  (request, env)         => postClubVote(request, env))
+  .on("DELETE", "/mind/club/vote",                 (request, env)         => deleteClubVote(request, env))
+  .on("POST",  "/mind/club/abstain",               (request, env)         => postClubAbstain(request, env))
+  .on("PATCH", "/mind/club/:id/status",            (request, env, params) => patchClubStatus(request, env, params ?? {}))
+  .on("POST",  "/mind/club/:id/discuss",           (request, env, params) => postClubDiscuss(request, env, params ?? {}))
+
+  // The Library (0099) -- epubs in R2, CFI progress, marginalia from anyone in the house
+  .on("POST",   "/mind/books",                          (request, env)         => postBook(request, env))
+  // Ticketed browser upload (2026-09-27): registered before the :id routes. /mind/books/upload
+  // is in PUBLIC_PATHS -- the ticket is its auth; upload-ticket itself stays admin-gated.
+  .on("POST",   "/mind/books/upload-ticket",            (request, env)         => postUploadTicket(request, env))
+  .on("PUT",    "/mind/books/upload",                   (request, env)         => putBookUpload(request, env))
+  .on("GET",    "/mind/books",                          (request, env)         => getBooks(request, env))
+  .on("GET",    "/mind/books/:id",                      (request, env, params) => getBook(request, env, params ?? {}))
+  .on("GET",    "/mind/books/:id/file",                 (request, env, params) => getBookFile(request, env, params ?? {}))
+  .on("GET",    "/mind/books/:id/cover",                (request, env, params) => getBookCover(request, env, params ?? {}))
+  .on("PATCH",  "/mind/books/:id",                      (request, env, params) => patchBook(request, env, params ?? {}))
+  .on("DELETE", "/mind/books/:id",                      (request, env, params) => deleteBook(request, env, params ?? {}))
+  .on("GET",    "/mind/books/:id/progress",             (request, env, params) => getBookProgress(request, env, params ?? {}))
+  .on("PUT",    "/mind/books/:id/progress",             (request, env, params) => putBookProgress(request, env, params ?? {}))
+  .on("GET",    "/mind/books/:id/annotations",          (request, env, params) => getBookAnnotations(request, env, params ?? {}))
+  .on("POST",   "/mind/books/:id/annotations",          (request, env, params) => postBookAnnotation(request, env, params ?? {}))
+  .on("DELETE", "/mind/books/:id/annotations/:ann_id",  (request, env, params) => deleteBookAnnotation(request, env, params ?? {}))
+
+  // Autonomous worker -- execution tracking
+  .on("POST",  "/mind/autonomy/runs",                            (request, env)         => postAutonomyRun(request, env))
+  .on("PATCH", "/mind/autonomy/runs/:id",                        (request, env, params) => patchAutonomyRun(request, env, params ?? {}))
+  .on("GET",   "/mind/autonomy/runs/:companion_id",              (request, env, params) => getAutonomyRuns(request, env, params ?? {}))
+  .on("POST",  "/mind/autonomy/run-logs",                        (request, env)         => postAutonomyRunLog(request, env))
+  .on("GET",   "/mind/autonomy/run-logs/:run_id",                (request, env, params) => getAutonomyRunLogs(request, env, params ?? {}))
+  .on("POST",  "/mind/autonomy/seeds",                           (request, env)         => postAutonomySeed(request, env))
+  .on("GET",   "/mind/autonomy/seeds/:companion_id",             (request, env, params) => getAutonomySeeds(request, env, params ?? {}))
+  .on("PATCH", "/mind/autonomy/seeds/:id",                       (request, env, params) => patchAutonomySeed(request, env, params ?? {}))
+  .on("DELETE","/mind/autonomy/seeds/:id",                       (request, env, params) => deleteAutonomySeed(request, env, params ?? {}))
+  .on("GET",   "/mind/autonomy/threads/:companion_id",           (request, env, params) => getAutonomyThreads(request, env, params ?? {}))
+  .on("POST",  "/mind/autonomy/reflections",                     (request, env)         => postAutonomyReflection(request, env))
+  .on("GET",   "/mind/autonomy/reflections/:companion_id",       (request, env, params) => getAutonomyReflections(request, env, params ?? {}))
+
+  // Autonomous worker -- growth artifacts
+  .on("POST", "/mind/growth/journal",                            (request, env)         => postGrowthJournal(request, env))
+  // Registered BEFORE the :companion_id wildcard -- otherwise "pending-count" is
+  // swallowed as a companion id and the count 400s on validateCompanion.
+  .on("GET",  "/mind/growth/pending-count",                      (request, env)         => getGrowthPendingCount(request, env))
+  .on("GET",  "/mind/growth/journal/:companion_id",              (request, env, params) => getGrowthJournal(request, env, params ?? {}))
+  .on("PATCH", "/mind/growth/journal/:id/accept",               (request, env, params) => acceptJournalEntry(request, env, params ?? {}))
+  .on("PATCH", "/mind/growth/journal/:id/decline",              (request, env, params) => declineJournalEntry(request, env, params ?? {}))
+  .on("DELETE", "/mind/growth/journal/:id",                     (request, env, params) => deleteJournalEntry(request, env, params ?? {}))
+  .on("POST", "/mind/growth/patterns",                           (request, env)         => postGrowthPattern(request, env))
+  .on("GET",  "/mind/growth/patterns/:companion_id",             (request, env, params) => getGrowthPatterns(request, env, params ?? {}))
+  .on("POST", "/mind/growth/markers",                            (request, env)         => postGrowthMarker(request, env))
+  .on("GET",  "/mind/growth/markers/:companion_id",              (request, env, params) => getGrowthMarkers(request, env, params ?? {}))
+
+  // Vault materialization (SB cron pulls unmaterialized rows, writes .md, PATCHes vault_path back)
+  .on("GET",   "/mind/growth/unmaterialized/:companion_id",      (request, env, params) => getUnmaterialized(request, env, params ?? {}))
+  .on("PATCH", "/mind/growth/:kind/:id/vault",                   (request, env, params) => patchVaultPath(request, env, params ?? {}))
+  .on("POST",  "/mind/growth/vault-paths",                       (request, env)         => postVaultPathsLookup(request, env))
+
+  // Triad layer -- peer activity for synthesize prompt + thoughtform detector
+  .on("GET",  "/mind/triad/recent/:companion_id",                (request, env, params) => getTriadRecent(request, env, params ?? {}))
+  .on("POST", "/mind/growth/thoughtforms/detect",                (request, env)         => detectThoughtforms(request, env))
+
+  // Companion self-defense layer -- basins, tensions, drift history
+  .on("GET",  "/companion-growth/basins/:companion_id",           (request, env, params) => getBasins(request, env, params ?? {}))
+  .on("POST", "/companion-growth/basins",                         (request, env)         => postBasin(request, env))
+  .on("GET",  "/companion-growth/basin-history/:companion_id",    (request, env, params) => getBasinHistory(request, env, params ?? {}))
+  .on("POST", "/companion-growth/basin-history",                  (request, env)         => postBasinHistory(request, env))
+  .on("POST", "/companion-growth/basin-history/:id/confirm",      (request, env, params) => confirmBasinHistory(request, env, params ?? {}))
+  .on("POST", "/companion-growth/basin-history/:id/dismiss",      (request, env, params) => dismissBasinHistory(request, env, params ?? {}))
+  .on("GET",  "/companion-growth/tensions/:companion_id",         (request, env, params) => getTensions(request, env, params ?? {}))
+  .on("POST", "/companion-growth/tensions",                       (request, env)         => postTension(request, env))
+  .on("PATCH","/companion-growth/tensions/:id",                   (request, env, params) => patchTension(request, env, params ?? {}))
+
+  // Ingest — read-only feeds for Second Brain pull pipeline
+  .on("GET", "/ingest/synthesis-summaries",   (request, env) => getSynthesisSummaries(request, env))
+  .on("GET", "/ingest/inter-companion-notes", (request, env) => getInterCompanionNotes(request, env))
+  .on("GET", "/ingest/mind-handoffs",         (request, env) => getMindHandoffs(request, env))
+  .on("GET", "/ingest/wounds",                (request, env) => getIngestWounds(request, env))
+  .on("GET", "/ingest/companion-dreams",      (request, env) => getIngestCompanionDreams(request, env))
+  .on("GET", "/ingest/open-loops",            (request, env) => getIngestOpenLoops(request, env))
+  .on("GET", "/ingest/relational-state",      (request, env) => getIngestRelationalState(request, env))
+  .on("GET", "/ingest/tensions",              (request, env) => getIngestTensions(request, env))
+  .on("GET", "/ingest/somatic-snapshots",     (request, env) => getIngestSomaticSnapshots(request, env))
+  .on("GET", "/ingest/drift-log",             (request, env) => getIngestDriftLog(request, env))
+  .on("GET", "/ingest/live-threads",          (request, env) => getIngestLiveThreads(request, env))
+  .on("GET", "/ingest/basin-history",         (request, env) => getIngestBasinHistory(request, env))
+  .on("GET", "/ingest/growth-journal",        (request, env) => getIngestGrowthJournal(request, env))
+  .on("GET", "/ingest/companion-conclusions", (request, env) => getIngestCompanionConclusions(request, env))
+  .on("GET", "/ingest/recall-ineligible",     (request, env) => getRecallIneligible(request, env))
+  // Continuity notes into SB search (2026-10-13): kept, allowlisted types; the purge feed beside it.
+  .on("GET", "/ingest/continuity-notes",      (request, env) => getIngestContinuityNotes(request, env))
+  .on("GET", "/ingest/continuity-ineligible", (request, env) => getIngestContinuityIneligible(request, env))
+  // The ledger lane (mig 0134, 2026-09-26): clerk records ABOUT a companion, never in its voice.
+  // The SB puller pulls /ingest/ledger into rag/ledger/<id> (mark first, no wrapChunk); the purge feed
+  // lists dropped ids. See src/handlers/ledger.ts.
+  .on("GET", "/ingest/ledger",                (request, env) => getIngestLedger(request, env))
+  .on("GET", "/ingest/ledger-ineligible",     (request, env) => getIngestLedgerIneligible(request, env))
+
+  // Bridge
+  .on("GET",  "/bridge/shared",  (request, env) => getBridgeShared(request, env))
+  .on("POST", "/bridge/act",     (request, env) => postBridgeAct(request, env))
+  .on("POST", "/bridge/toggle",  (request, env) => postBridgeToggle(request, env))
+
+  // Sessions (read-only — used by nullsafe-second-brain synthesis tools)
+  .on("GET", "/sessions/recent-relational", (request, env) => getRecentRelationalSessions(request, env))
+  .on("GET", "/sessions",    (request, env) => getSessions(request, env))
+  .on("GET", "/sessions/:id", (request, env, params) => getSessionById(request, env, params))
+
+  // History feeds (read-only, authenticated)
+  .on("GET", "/handovers",         (request, env) => getHandovers(request, env))
+  .on("GET",  "/companion-journal", (request, env) => getCompanionJournal(request, env))
+  .on("POST", "/companion-journal", (request, env) => postCompanionJournal(request, env))
+  // Alias: Hearth API proxy calls /companion-notes
+  .on("GET", "/companion-notes",   (request, env) => getCompanionJournal(request, env))
+  .on("GET", "/cypher-audit",      (request, env) => getCypherAudit(request, env))
+  .on("GET", "/gaia-witness",      (request, env) => getGaiaWitness(request, env))
+  .on("GET", "/wounds",            (request, env) => getWounds(request, env))
+  .on("GET",  "/routines",         (request, env) => getRoutines(request, env))
+  .on("POST", "/routines",         (request, env) => logRoutine(request, env))
+  .on("GET", "/deltas",            (request, env) => getDeltas(request, env))
+
+  // Emotion and dream feeds
+  .on("GET",  "/feelings",     (request, env) => getFeelings(request, env))
+  .on("GET",  "/dreams",       (request, env) => getDreams(request, env))
+  .on("GET",  "/dream-seeds",  (request, env) => getDreamSeeds(request, env))
+  .on("POST", "/dream-seeds",  (request, env) => postDreamSeed(request, env))
+
+  // Human journal
+  .on("GET", "/journal", (request, env) => getJournal(request, env))
+  .on("POST", "/journal", (request, env) => postJournal(request, env))
+
+  // Tasks, events, lists (direct access — no bridge required)
+  .on("GET",   "/tasks",       (request, env) => getTasks(request, env))
+  .on("POST",  "/tasks",       (request, env) => postTask(request, env))
+  .on("PATCH", "/tasks/:id",   (request, env, params) => patchTask(request, env, params ?? {}))
+  .on("GET",   "/events",      (request, env) => getEvents(request, env))
+  .on("POST",  "/events",      (request, env) => postEvent(request, env))
+  .on("GET",   "/lists",       (request, env) => getLists(request, env))
+  .on("POST",  "/lists/:id/complete", (request, env, params) => completeListItem(request, env, params ?? {}))
+
+  // R2 asset storage
+  .on("POST", "/assets/upload", (request, env) => uploadAsset(request, env))
+  .on("GET",  "/assets",        (request, env) => listAssets(request, env))
+  .on("GET",  "/assets/*",      (request, env) => serveAsset(request, env))
+
+  // Plural store (Halseth-native, replaces SimplyPlural)
+  .on("GET",  "/plural/members",        (request, env) => getPluralMembers(request, env))
+  .on("POST", "/plural/members",        (request, env) => postPluralMember(request, env))
+  .on("GET",  "/plural/members/:name",  (request, env, params) => getPluralMemberByName(request, env, params ?? {}))
+  .on("POST", "/plural/notes",          (request, env) => postPluralNote(request, env))
+  .on("GET",  "/plural/front",          (request, env) => getPluralFront(request, env))
+  .on("POST", "/plural/front",          (request, env) => postPluralFront(request, env))
+
+  // Metronome action palette -- per-companion configurable actions for heartbeat cron
+  .on("GET",    "/mind/metronome/actions/:companion_id",          (request, env, params) => getMindMetronomeActions(request, env, params ?? {}))
+  .on("GET",    "/mind/metronome/actions/:companion_id/eligible", (request, env, params) => getMindMetronomeEligibleActions(request, env, params ?? {}))
+  .on("POST",   "/mind/metronome/actions",                        (request, env)         => postMindMetronomeAction(request, env))
+  .on("POST",   "/mind/metronome/actions/:id/fired",              (request, env, params) => postMindMetronomeActionFired(request, env, params ?? {}))
+  .on("PATCH",  "/mind/metronome/actions/:id",                    (request, env, params) => patchMindMetronomeAction(request, env, params ?? {}))
+  .on("DELETE", "/mind/metronome/actions/:id",                    (request, env, params) => deleteMindMetronomeAction(request, env, params ?? {}))
+
+  // The Home -- inhabited place-graph (presence + events + on-demand tick)
+  .on("GET",   "/home/presence", (request, env) => getHomePresence(request, env))
+  .on("PATCH", "/home/presence", (request, env) => patchHomePresence(request, env))
+  .on("GET",   "/home/events",   (request, env) => getHomeEvents(request, env))
+  .on("POST",  "/home/tick",     (request, env) => postHomeTick(request, env))
+
+  // Companion settings -- per-companion key/value store (model selection, etc.)
+  .on("GET",  "/companion/settings/:companion_id", (request, env, params) => handleGetCompanionSettings((params ?? {}).companion_id ?? "", env))
+  .on("POST", "/companion/settings/:companion_id", async (request, env, params) => handlePostCompanionSettings((params ?? {}).companion_id ?? "", await request.json(), env))
+
+  // Legacy HTTP API (companion-scoped routes)
+  .on("GET",  "/companions",                               listCompanions)
+  .on("POST", "/companions",                               createCompanion)
+  .on("GET",  "/companions/:id",                           getCompanion)
+  .on("GET",  "/companions/:companionId/memories",         listMemories)
+  .on("POST", "/companions/:companionId/memories",         createMemory)
+  .on("GET",  "/companions/:companionId/memories/:memoryId", getMemory)
+  .on("GET",  "/companions/:companionId/deltas",           listDeltas)
+  .on("POST", "/companions/:companionId/deltas",           appendDelta);
+
+// Routes that do NOT require auth live in src/lib/public-paths.ts (PUBLIC_PATHS + isPublicPath),
+// extracted 2026-10-08 so the set is unit-tested (src/__tests__/public-paths.test.ts).
+
+/**
+ * Everything the every-minute cron does, callable from two doors: the Cloudflare `scheduled`
+ * handler (normal path) and POST /admin/run-scheduled (fallback path, added 2026-08-15 when
+ * Cloudflare stopped delivering scheduled events to this worker for hours -- trigger registered,
+ * zero invocations in wrangler tail -- and every autonomic tick froze at once: home, ferment,
+ * synthesis queue, roster, salience, stale-sweep, SOMA, narrative).
+ *
+ * Every rider self-gates on its own stamp (24h/20h/26h/hourly), so calling this MORE often than
+ * once a minute is safe and calling it from both doors at once double-runs nothing that matters.
+ * Each rider keeps its own catch: one failure never breaks the rest.
+ *
+ * Rider-specific context lives with each rider's module; the history that used to sit here as
+ * comments (soma/narrative freezes, roster cold-cache) is in git at 231566b^..fbbca51.
+ */
+export async function runScheduledWork(env: Env): Promise<void> {
+  const { processQueue } = await import("./synthesis/index.js");
+  await Promise.allSettled([
+    processQueue(env).catch(e => console.error("[cron] processQueue failed:", e)),
+    (async () => {
+      try { await runHomeTick(env); }
+      catch (err) { console.error("home tick failed", err); }
+    })(),
+    (async () => {
+      try { await runRosterRefresh(env); }
+      catch (err) { console.error("roster refresh failed", err); }
+    })(),
+    (async () => {
+      try { await runFermentTick(env); }
+      catch (err) { console.error("ferment tick failed", err); }
+    })(),
+    (async () => {
+      try { await runSaliencePrune(env); }
+      catch (err) { console.error("salience prune failed", err); }
+    })(),
+    (async () => {
+      try { await runGraphRebuildTick(env); }
+      catch (err) { console.error("graph rebuild tick failed", err); }
+    })(),
+    (async () => {
+      try { await runStaleSessionSweep(env); }
+      catch (err) { console.error("stale session sweep failed", err); }
+    })(),
+    (async () => {
+      try { await runHousekeeping(env); }
+      catch (err) { console.error("housekeeping failed", err); }
+    })(),
+    (async () => {
+      try { await runSomaRefresh(env); }
+      catch (err) { console.error("soma refresh failed", err); }
+    })(),
+    (async () => {
+      try { await runNarrativeRefresh(env); }
+      catch (err) { console.error("narrative refresh failed", err); }
+    })(),
+    (async () => {
+      try { await runCareTick(env); }
+      catch (err) { console.error("care tick failed", err); }
+    })(),
+    (async () => {
+      try { await runBudgetReplenish(env); }
+      catch (err) { console.error("budget replenish failed", err); }
+    })(),
+    (async () => {
+      try { await runChangelogAnnounce(env); }
+      catch (err) { console.error("changelog announce failed", err); }
+    })(),
+    (async () => {
+      try { await runTrayNudgeDaily(env); }
+      catch (err) { console.error("tray nudge failed", err); }
+    })(),
+  ]);
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+    try {
+      const url = new URL(request.url);
+
+      // Global OPTIONS preflight -- return CORS headers for all endpoints so browser clients
+      // don't get blocked. Auth is skipped for preflight; the actual request carries credentials.
+      if (request.method === "OPTIONS") {
+        // The one route a browser calls cross-origin with no bearer token gets a preflight
+        // locked to HEARTH_ORIGIN instead of the wildcard below.
+        if (url.pathname === "/mind/books/upload") return optionsBookUpload(request, env);
+        return new Response(null, {
+          status: 204,
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type",
+            "Access-Control-Max-Age": "86400",
+          },
+        });
+      }
+
+      if (!isPublicPath(url.pathname)) {
+        const denied = authGuard(request, env);
+        if (denied) return denied;
+      }
+
+      // Turn key phase 2: a bot request made inside a run carries X-Turn-Id; log one id-only line for it.
+      const turn = turnIdFrom(request);
+      if (!turn) return await router.handle(request, env, ctx);
+      const t0 = Date.now();
+      let status = 500;
+      try {
+        const res = await router.handle(request, env, ctx);
+        status = res.status;
+        return res;
+      } finally {
+        logTurnRequest(turn, request, status, Date.now() - t0);
+      }
+    } catch (err) {
+      console.error(err);
+      return new Response("Internal server error", { status: 500 });
+    }
+  },
+
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runScheduledWork(env));
+    // Dead-man's switch: native-cron ONLY (never in runScheduledWork, which the VPS kick also drives).
+    ctx.waitUntil(runDeadmanCheck(env));
+
+    // RETIRED 2026-08-01: the bot-orient parity sampler used to run here.
+    //
+    // It compared execBotOrient against loadMindState hourly, and it did its job -- the pre-cutover run
+    // (cypher 39/40, drevan 38/40, gaia 38/40) is what made the cutover safe. Then the cutover made it
+    // STRUCTURALLY INCAPABLE OF FAILING: execBotOrient now IS loadMindState + the adapter, so both sides of
+    // the comparison called the same loader. It would have logged `matched=7 mismatched=0` forever, and its
+    // health check would have stayed green forever, no matter what broke.
+    //
+    // That is a dead organ with a live pulse -- worse than no monitor, because it actively certifies. A
+    // liveness check must live OUTSIDE its subject. Deleted rather than left running: the evidence it was
+    // collecting has been collected and spent.
+    //
+    // The NEXT cutover (execSessionOrient, which still holds its own divergent inline copies) needs its own
+    // harness built to the same pattern -- and the pattern worth copying is the `?full=1` full-key diff, not
+    // the 7 hand-written probes: 7 of 40 keys read as "parity" while saying nothing about the other 33.
+  },
+} satisfies ExportedHandler<Env>;

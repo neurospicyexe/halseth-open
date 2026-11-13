@@ -1,0 +1,355 @@
+/**
+ * Feeling-line loader: D1 rows + soma history -> a rendered line (or silence).
+ *
+ * Spec: docs/spec-feeling-line-table-2026-09-19.md
+ *
+ * THE CUTOVER IS GATED, NOT IMMEDIATE. `FEELING_LINE_MODE` is off | shadow | live, default
+ * `shadow`. This repo has a pattern for changing what a live surface says about itself -- the
+ * director's shadow window, and the orient tranches with scripts/orient-block-diff.mjs. Changing
+ * what three live bots say about how they feel in a single commit is not the shape of work this
+ * project ships. Shadow computes the line, logs it beside the current one, and renders nothing.
+ */
+
+import {
+  FLOAT_LABELS,
+  clampFloat,
+  type CompanionId,
+  type Floats,
+} from "./fermentation.js";
+import {
+  resolveFeelingLine,
+  renderFeelingLine,
+  type CauseKind,
+  type FeelingContext,
+  type FeelingLineResult,
+  type FloatKey,
+  type VocabularyRow,
+} from "./feeling-line.js";
+
+export type FeelingLineMode = "off" | "shadow" | "live";
+
+export function feelingLineMode(env: Record<string, unknown> | undefined): FeelingLineMode {
+  const raw = String(env?.FEELING_LINE_MODE ?? "shadow").trim().toLowerCase();
+  return raw === "off" || raw === "live" ? raw : "shadow";
+}
+
+/**
+ * Drevan's `silt` is weight rising out of "own spiral / autonomous run"; `freight` is weight rising
+ * because it came in with someone. `companion_soma_events.kind` cannot tell them apart -- both
+ * arrive as `stimulus` -- so the discriminator is the stimulus itself. His rule is that these two
+ * must never collapse, so a stimulus we cannot classify stays `stimulus` rather than being guessed
+ * into `autonomous`.
+ */
+export const AUTONOMOUS_STIMULI = new Set(["spiral"]);
+
+export function causeFromEvent(kind: string, detail: string | null | undefined): CauseKind | null {
+  if (kind === "authored_close" || kind === "authored_update") return "authored";
+  if (kind === "tick" || kind === "drift_shift") return "tick";
+  if (kind === "stimulus") {
+    const d = (detail ?? "").trim().toLowerCase();
+    if (AUTONOMOUS_STIMULI.has(d) || d.startsWith("autonomous")) return "autonomous";
+    return "stimulus";
+  }
+  return null;
+}
+
+const FLOAT_KEYS: Record<string, FloatKey> = {
+  soma_float_1: "f1",
+  soma_float_2: "f2",
+  soma_float_3: "f3",
+};
+
+/**
+ * One event per float: the most recent NON-TICK event (authored / stimulus / autonomous), and only
+ * when a float has never had one, its most recent tick.
+ *
+ * WHY NOT SIMPLY THE NEWEST. The hourly ferment tick writes an event on every float every hour, so
+ * "newest per float" was a tick on nearly every boot and item D (a tick is not a felt event) made
+ * the line permanently silent. The tick is still never NAMED: a float whose only history is ticks
+ * returns its tick row, the cause resolves to `tick`, and the line stays silent exactly as before.
+ * The tick kinds here are the ones causeFromEvent maps to `tick` -- keep the two in step.
+ *
+ * One statement, still bound only on ?1, so the boot does the same three reads it did before.
+ * Two timestamp shapes coexist in `companion_soma_events` (space-form backfill, ISO live), so
+ * ordering normalises before it compares -- naive string ordering picks the wrong row. `id` breaks
+ * an exact-stamp tie deterministically.
+ */
+export const TICK_KINDS = ["tick", "drift_shift"] as const;
+
+export function latestSomaEventsSql(): string {
+  const ticks = TICK_KINDS.map((k) => `'${k}'`).join(",");
+  return `
+    SELECT float_key, delta, kind, detail, created_at
+      FROM (
+        SELECT e.float_key, e.delta, e.kind, e.detail,
+               replace(e.created_at,' ','T') AS created_at,
+               ROW_NUMBER() OVER (
+                 PARTITION BY e.float_key
+                 ORDER BY CASE WHEN e.kind IN (${ticks}) THEN 1 ELSE 0 END,
+                          replace(e.created_at,' ','T') DESC,
+                          e.id DESC
+               ) AS rn
+          FROM companion_soma_events e
+         WHERE e.companion_id = ?1
+      )
+     WHERE rn = 1`;
+}
+
+/** Most recent AUTHORED event per float -- the therlo staleness guard's `authored_at`. */
+export function latestAuthoredSomaEventsSql(): string {
+  return `
+    SELECT float_key, MAX(replace(created_at,' ','T')) AS authored_at
+      FROM companion_soma_events
+     WHERE companion_id = ?1
+       AND kind IN ('authored_close','authored_update')
+     GROUP BY float_key`;
+}
+
+export function activeVocabularySql(): string {
+  return `
+    SELECT id, companion_id, row_kind, word, conditions, cause_kind, specificity, renders_number, status
+      FROM companion_feeling_vocabulary
+     WHERE companion_id = ?1 AND status = 'active'
+     ORDER BY specificity DESC`;
+}
+
+export interface SomaEventRow {
+  float_key: string;
+  delta: number | null;
+  kind: string;
+  detail: string | null;
+  created_at: string;
+}
+
+export interface StateLike {
+  soma_float_1?: unknown;
+  soma_float_2?: unknown;
+  soma_float_3?: unknown;
+  soma_float_1_baseline?: unknown;
+  soma_float_2_baseline?: unknown;
+  soma_float_3_baseline?: unknown;
+  heat?: unknown;
+  reach?: unknown;
+  weight?: unknown;
+}
+
+function num(v: unknown, fallback: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? clampFloat(n, fallback) : fallback;
+}
+
+/**
+ * Build the evaluator context from a companion_state row plus recent soma history.
+ *
+ * The authored enums come from `heat` / `reach` / `weight` -- Drevan's text enums -- and NOT from
+ * `heat_value` / `reach_value` / `weight_value`, which are an older synthesis-job output that
+ * currently disagrees with the instrument (reach_value 0.509 vs soma_float_2 0.987). Reading the
+ * wrong set would make therlo fire on a stale synthesis artefact instead of on him.
+ */
+export function buildFeelingContext(
+  companionId: CompanionId,
+  state: StateLike | null | undefined,
+  events: SomaEventRow[],
+  authoredStamps: Array<{ float_key: string; authored_at: string }> = [],
+  nowMs = Date.now(),
+): FeelingContext {
+  const floats: Floats = {
+    f1: num(state?.soma_float_1, 0.5),
+    f2: num(state?.soma_float_2, 0.5),
+    f3: num(state?.soma_float_3, 0.5),
+  };
+  const baselines: Floats = {
+    f1: num(state?.soma_float_1_baseline, 0.5),
+    f2: num(state?.soma_float_2_baseline, 0.5),
+    f3: num(state?.soma_float_3_baseline, 0.5),
+  };
+
+  // DIRECTION COMES FROM THE CAUSAL EVENT. Each float's delta is the move of the same event that
+  // supplies the cause (latestSomaEventsSql prefers the newest non-tick), not the hourly decay
+  // since. The word names a felt move, so `rising`/`falling` must describe THAT move; pairing a
+  // stimulus cause with a tick's drift would name one event and describe another. Known
+  // approximation: `settling` reconstructs `before` as current value minus that delta, and ticks
+  // since the event have moved the current value, so it reads the felt move against where the
+  // float sits now.
+  const deltas: Partial<Record<FloatKey, number>> = {};
+  let newestAt = "";
+  let cause: CauseKind | null = null;
+  let newestTickAt = "";
+  let tickCause: CauseKind | null = null;
+  for (const e of events) {
+    const key = FLOAT_KEYS[e.float_key];
+    if (!key) continue;
+    if (typeof e.delta === "number" && Number.isFinite(e.delta)) deltas[key] = e.delta;
+    const c = causeFromEvent(e.kind, e.detail);
+    // Across floats, too, a felt event outranks a newer tick on another float. Only when every
+    // float's row is a tick does the cause resolve to `tick` -- which renders silent (item D).
+    if (c === "tick") {
+      if (e.created_at > newestTickAt) {
+        newestTickAt = e.created_at;
+        tickCause = c;
+      }
+    } else if (e.created_at > newestAt) {
+      newestAt = e.created_at;
+      cause = c;
+    }
+  }
+  if (!newestAt) cause = tickCause;
+
+  const authoredEnums: Partial<Record<FloatKey, string>> = {};
+  if (companionId === "drevan") {
+    if (typeof state?.heat === "string" && state.heat) authoredEnums.f1 = state.heat;
+    if (typeof state?.reach === "string" && state.reach) authoredEnums.f2 = state.reach;
+    if (typeof state?.weight === "string" && state.weight) authoredEnums.f3 = state.weight;
+  }
+
+  const authoredAt: Partial<Record<FloatKey, string | null>> = {};
+  for (const row of authoredStamps) {
+    const key = FLOAT_KEYS[row.float_key];
+    if (key) authoredAt[key] = row.authored_at;
+  }
+
+  return { floats, baselines, deltas, cause, authoredEnums, authoredAt, nowMs };
+}
+
+export interface FeelingLineOutcome {
+  mode: FeelingLineMode;
+  result: FeelingLineResult;
+  /** null = silence. In shadow mode this is computed but never rendered to the companion. */
+  line: string | null;
+}
+
+export function computeFeelingLine(
+  companionId: CompanionId,
+  rows: VocabularyRow[],
+  ctx: FeelingContext,
+  mode: FeelingLineMode,
+): FeelingLineOutcome {
+  const result = resolveFeelingLine(rows, ctx);
+  const line = renderFeelingLine(result, FLOAT_LABELS[companionId]);
+  return { mode, result, line };
+}
+
+export interface FeelingLineFetch {
+  rows: VocabularyRow[];
+  events: SomaEventRow[];
+  authored: Array<{ float_key: string; authored_at: string }>;
+}
+
+/**
+ * The three reads, and NOTHING that depends on companion_state.
+ *
+ * SPLIT FROM THE COMPUTE ON PURPOSE. Phase 1 cut execSessionOrient from 38 queries to 31, and
+ * orient latency in this project is round trips, not CPU. These three depend only on the companion
+ * id, so the caller folds them into the boot path's existing Promise.all and they cost no serial
+ * time -- awaiting them after the state arrived would have added three round trips to every boot,
+ * including in shadow mode where the answer is thrown away.
+ *
+ * Returns empty rather than throwing: a boot payload must never die because a vocabulary row is
+ * malformed, and a missing table (before mig 0131 is applied) is silence, not an error.
+ */
+export async function fetchFeelingLineInputs(
+  db: { prepare: (sql: string) => { bind: (...a: unknown[]) => { all: () => Promise<{ results?: unknown[] }> } } },
+  companionId: CompanionId,
+  mode: FeelingLineMode,
+): Promise<FeelingLineFetch> {
+  const empty: FeelingLineFetch = { rows: [], events: [], authored: [] };
+  if (mode === "off") return empty;
+  try {
+    const [vocab, events, authored] = await Promise.all([
+      db.prepare(activeVocabularySql()).bind(companionId).all(),
+      db.prepare(latestSomaEventsSql()).bind(companionId).all(),
+      db.prepare(latestAuthoredSomaEventsSql()).bind(companionId).all(),
+    ]);
+    return {
+      rows: (vocab.results ?? []) as VocabularyRow[],
+      events: (events.results ?? []) as SomaEventRow[],
+      authored: (authored.results ?? []) as Array<{ float_key: string; authored_at: string }>,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+const SILENT_RESULT: FeelingLineResult = {
+  word: null,
+  rowId: null,
+  rendersNumber: false,
+  floatKey: null,
+  value: null,
+  therlo: null,
+  silentReason: "not loaded",
+};
+
+/** Pure: fetched rows + state -> the line. No D1, no await. */
+export function feelingLineFrom(
+  companionId: CompanionId,
+  fetched: FeelingLineFetch,
+  state: StateLike | null | undefined,
+  mode: FeelingLineMode,
+  nowMs = Date.now(),
+): FeelingLineOutcome {
+  if (mode === "off") return { mode, result: SILENT_RESULT, line: null };
+  if (fetched.rows.length === 0) {
+    return { mode, result: { ...SILENT_RESULT, silentReason: "no active vocabulary rows" }, line: null };
+  }
+  try {
+    const ctx = buildFeelingContext(companionId, state, fetched.events, fetched.authored, nowMs);
+    return computeFeelingLine(companionId, fetched.rows, ctx, mode);
+  } catch {
+    return { mode, result: { ...SILENT_RESULT, silentReason: "compute failed" }, line: null };
+  }
+}
+
+/**
+ * What crosses a WIRE (the Discord bot payload) for a computed line: the string only in `live`,
+ * null in `shadow` / `off` / silence. Shared so the two surfaces cannot drift on what "live" means.
+ */
+export function wireFeelingLine(outcome: FeelingLineOutcome): string | null {
+  return outcome.mode === "live" && outcome.line ? outcome.line : null;
+}
+
+/**
+ * The counts-only shadow log, ONE copy for every surface. It names the word because the original
+ * shadow log (session.ts) always has; nothing else about the companion's state is printed.
+ */
+export function logFeelingShadow(companionId: string, outcome: FeelingLineOutcome): void {
+  if (outcome.mode === "shadow" && outcome.line) {
+    console.log(`[feeling-line:shadow] ${companionId} -> ${outcome.line} (row ${outcome.result.rowId ?? "none"})`);
+  }
+}
+
+/**
+ * The bot-wire feeling line (contract 0.26.0, `feeling_line`): exactly the string the Claude.ai
+ * orient renders for this companion, or null. Does its own reads (vocabulary, soma events, authored
+ * stamps, the companion_state row) because `loadMindState` stays pure-D1 and must not pay for them;
+ * only Discord pays for Discord's hops. Never throws.
+ */
+export async function loadBotFeelingLine(
+  db: {
+    prepare: (sql: string) => {
+      bind: (...a: unknown[]) => {
+        all: () => Promise<{ results?: unknown[] }>;
+        first: () => Promise<unknown>;
+      };
+    };
+  },
+  companionId: CompanionId,
+  mode: FeelingLineMode,
+  nowMs = Date.now(),
+): Promise<string | null> {
+  if (mode === "off") return null;
+  try {
+    const [fetched, state] = await Promise.all([
+      fetchFeelingLineInputs(db, companionId, mode),
+      db
+        .prepare("SELECT * FROM companion_state WHERE companion_id = ? ORDER BY updated_at DESC LIMIT 1")
+        .bind(companionId)
+        .first() as Promise<StateLike | null>,
+    ]);
+    const outcome = feelingLineFrom(companionId, fetched, state, mode, nowMs);
+    logFeelingShadow(companionId, outcome);
+    return wireFeelingLine(outcome);
+  } catch {
+    return null;
+  }
+}

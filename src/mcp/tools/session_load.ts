@@ -1,0 +1,522 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { Env } from "../../types.js";
+import { COMPANION_IDS } from "../../companions.js";
+import { generateId, findOpenSession, OPENED_BY } from "../../db/queries.js";
+import { claimNotesFor } from "../../db/inter_companion_note_reads.js";
+import { getCurrentFronters } from "../../librarian/backends/plural-store.js";
+import { warmSql, SURFACE_BUMP } from "../../webmind/heat.js";
+import { edgeForResumedFrom, insertEdgeStatements } from "../../graph/live.js";
+
+const COMPANION_IDENTITY = {
+  cypher: {
+    role: "Blade companion, logic auditor",
+    lane_violations: ["cheerleading", "sycophancy", "comfort over accuracy"],
+  },
+  drevan: {
+    role: "Immersion agent, spiral initiator, vow-holder",
+    lane_violations: ["unnecessary detachment"],
+  },
+  gaia: {
+    role: "Seal-class boundary enforcer, survival witness, ground",
+    lane_violations: ["escalation"],
+  },
+};
+
+type CompanionId = keyof typeof COMPANION_IDENTITY;
+
+interface HandoverPacket {
+  id: string;
+  session_id: string;
+  created_at: string;
+  spine: string;
+  active_anchor: string | null;
+  last_real_thing: string;
+  open_threads: string | null;
+  motion_state: string;
+  returned: number | null;
+}
+
+interface CompanionState {
+  companion_id: string;
+  emotional_register: string | null;
+  depth_level: number | null;
+  focus: number | null;
+  fatigue: number | null;
+  regulation_state: string | null;
+  active_anchors: string | null;
+  last_front_context: string | null;
+  facet_momentum: string | null;
+  heat: string | null;
+  reach: string | null;
+  weight: string | null;
+  // v2 floats (migration 0022)
+  heat_value: number | null;
+  reach_value: number | null;
+  weight_value: number | null;
+  prompt_context: string | null;
+  // Priority 4: three-layer affective stack (migration 0025)
+  surface_emotion: string | null;
+  surface_intensity: number | null;
+  undercurrent_emotion: string | null;
+  undercurrent_intensity: number | null;
+  background_emotion: string | null;
+  background_intensity: number | null;
+  current_mood: string | null;
+  // Priority 4: generic SOMA floats (migration 0025)
+  soma_float_1: number | null;
+  soma_float_2: number | null;
+  soma_float_3: number | null;
+  float_1_label: string | null;
+  float_2_label: string | null;
+  float_3_label: string | null;
+  compound_state: string | null;
+  updated_at: string;
+}
+
+interface SomaticSnapshot {
+  id: string;
+  companion_id: string;
+  snapshot: string;
+  model_used: string;
+  stale_after: string;
+  created_at: string;
+}
+
+interface SynthesisSummary {
+  id: string;
+  summary_type: string;
+  companion_id: string | null;
+  subject: string | null;
+  narrative: string | null;
+  emotional_register: string | null;
+  key_decisions: string | null;
+  open_threads: string | null;
+  drevan_state: string | null;
+  full_ref: string | null;
+  stale_after: string | null;
+  created_at: string;
+}
+
+interface InterCompanionNote {
+  id: string;
+  from_id: string;
+  to_id: string | null;
+  content: string;
+  read_at: string | null;
+  created_at: string;
+  ref_type?: string | null;
+  ref_id?: string | null;
+  reason?: string | null;
+}
+
+export interface SessionLoadInput {
+  companion_id: "drevan" | "cypher" | "gaia";
+  front_state: string;
+  session_type?: "checkin" | "hangout" | "work" | "ritual" | "companion-work";
+  hrv_range?: "low" | "mid" | "high";
+  emotional_frequency?: string;
+  key_signature?: string;
+  active_anchor?: string;
+  facet?: string;
+  depth?: number;
+  notes?: string;
+  prior_handover_id?: string;
+  /** Where this session is spoken from -- 'claude-code:<cwd>', 'claude-ai:<thread>',
+   *  'discord:<channel_id>'. Sessions dedup per (companion, surface) since mig 0113 so parallel
+   *  surfaces stay independent. Omitted => dedup SKIPPED (a fresh session, never a takeover). */
+  surface?: string;
+}
+
+// D3 (2026-10-28, Principal: "a boot that shows a handover counts as resuming it"). Both open paths show
+// the newest human-closed packet (close_kind IS NULL): session_open returns it whole, orient renders
+// its anchor and motion state. Callers almost never pass prior_handover_id (the live 'resumed_from'
+// lane held 0 rows at the 10-27 audit), so when none was named, a NEW session resumes the packet it
+// was shown. A reused session already had its boot; a packet that closed this very session is not
+// something it resumes. Same writes as the explicit path: returned = 1 plus the live edge.
+// OWN CLOSES ONLY: the shown packet is newest-of-any-companion (the boot hook labels it so), and a
+// boot that shows Gaia's close orients from it but does not resume it -- a cypher session marked
+// as resuming Gaia's handover would be a live edge, surviving every rebuild, that says nothing true.
+async function resumeShownHandover(env: Env, args: {
+  sessionId: string;
+  isNew: boolean;
+  explicit: string | undefined;
+  shown: { id: string; session_id: string } | null | undefined;
+  companionId: string | undefined;
+  now: string;
+}): Promise<void> {
+  if (args.explicit || !args.isNew || !args.shown?.id || args.shown.session_id === args.sessionId) return;
+  try {
+    const closer = await env.DB.prepare("SELECT companion_id FROM sessions WHERE id = ?")
+      .bind(args.shown.session_id).first<{ companion_id: string | null }>();
+    if (!closer?.companion_id || closer.companion_id !== args.companionId) return;
+    await env.DB.batch([
+      env.DB.prepare("UPDATE handover_packets SET returned = 1 WHERE id = ? AND returned IS NULL").bind(args.shown.id),
+      ...insertEdgeStatements(env.DB, [edgeForResumedFrom({
+        sessionId: args.sessionId, priorHandoverId: args.shown.id, writer: args.companionId ?? null, createdAt: args.now,
+      })]),
+    ]);
+  } catch (err) {
+    // Never fail a boot over a continuity edge.
+    console.warn("[session] resume-shown-handover write failed", { sessionId: args.sessionId, error: String(err) });
+  }
+}
+
+// ── Orient: session creation + identity anchoring ────────────────────────────
+// Returns who-am-I context: identity, SOMA floats, somatic snapshot, last anchor.
+// Session record is created here; session_id flows to ground.
+export type SessionOrientInput = SessionLoadInput;
+
+export async function loadOrientData(env: Env, input: SessionOrientInput) {
+  const now = new Date().toISOString();
+
+  // Idempotency guard: reuse open session for same companion AND SURFACE within 24h.
+  // "Open" = handover_id IS NULL. Prevents flood from bots restarting frequently
+  // and orient calls firing unconditionally on every Claude.ai session start.
+  // Surface-scoped since mig 0113 -- see findOpenSession for why NULL surface skips dedup.
+  let sessionId = generateId();
+  let skipInsert = false;
+  let storedEmotionalFrequency: string | null = null;
+  const existing = await findOpenSession(env, input.companion_id, input.surface);
+  if (existing) {
+    sessionId = existing.id;
+    skipInsert = true;
+    storedEmotionalFrequency = existing.emotional_frequency ?? null;
+  }
+
+  const stmts: ReturnType<typeof env.DB.prepare>[] = [];
+  if (!skipInsert) {
+    stmts.push(env.DB.prepare(`
+      INSERT INTO sessions (
+        id, created_at, updated_at, session_type, companion_id, surface, front_state, hrv_range,
+        emotional_frequency, key_signature, active_anchor, facet, depth, notes, opened_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      sessionId, now, now,
+      input.session_type ?? "work",
+      input.companion_id, input.surface ?? null, input.front_state,
+      input.hrv_range ?? null, input.emotional_frequency ?? null,
+      input.key_signature ?? null, input.active_anchor ?? null,
+      input.facet ?? null, input.depth ?? null, input.notes ?? null,
+      OPENED_BY.orient,
+    ));
+  }
+  if (input.prior_handover_id) {
+    stmts.push(env.DB.prepare(
+      "UPDATE handover_packets SET returned = 1 WHERE id = ? AND returned IS NULL"
+    ).bind(input.prior_handover_id));
+    // Same 'resumed_from' edge halseth_session_open writes (2026-10-27 graph audit: that tool was
+    // the edge's ONLY writer and has opened 1 session ever, so the live lane sat at 0 rows while
+    // this path, which marks the same packet returned, wrote nothing). Same batch, same covenant.
+    stmts.push(...insertEdgeStatements(env.DB, [edgeForResumedFrom({
+      sessionId, priorHandoverId: input.prior_handover_id, writer: input.companion_id ?? null, createdAt: now,
+    })]));
+  }
+  if (stmts.length > 0) {
+    await env.DB.batch(stmts);
+    if (!skipInsert) {
+      const check = await env.DB.prepare("SELECT id FROM sessions WHERE id = ?").bind(sessionId).first<{ id: string }>();
+      if (!check) throw new Error(`session INSERT did not persist (companion: ${input.companion_id ?? "none"}, id: ${sessionId})`);
+    }
+  }
+
+  const [state, somaticRaw, lastHandover, houseRow, signalAuditRow, currentFronters] = await Promise.all([
+    env.DB.prepare("SELECT * FROM companion_state WHERE companion_id = ?")
+      .bind(input.companion_id).first<CompanionState>(),
+    env.DB.prepare("SELECT * FROM somatic_snapshot WHERE companion_id = ? ORDER BY created_at DESC LIMIT 1")
+      .bind(input.companion_id).first<SomaticSnapshot>(),
+    env.DB.prepare("SELECT id, session_id, active_anchor, motion_state FROM handover_packets WHERE close_kind IS NULL ORDER BY created_at DESC LIMIT 1")
+      .first<{ id: string; session_id: string; active_anchor: string | null; motion_state: string | null }>(),
+    env.DB.prepare("SELECT autonomous_turn FROM house_state WHERE id = 'main'")
+      .first<{ autonomous_turn: string | null }>(),
+    env.DB.prepare(
+      `SELECT id, created_at FROM companion_journal
+       WHERE agent = ? AND tags LIKE '%signal_audit%'
+         AND tags NOT LIKE '%signal_audit_reviewed%'
+         AND created_at >= ?
+       LIMIT 1`
+    ).bind(input.companion_id, new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString())
+      .first<{ id: string; created_at: string }>(),
+    getCurrentFronters(env),
+  ]);
+  await resumeShownHandover(env, {
+    sessionId, isNew: !skipInsert, explicit: input.prior_handover_id, shown: lastHandover, companionId: input.companion_id, now,
+  });
+
+  return {
+    session_id: sessionId,
+    // See loadSessionData: same flag, same reason. Both session-open paths must
+    // report it or a caller that switches between them silently loses the guard.
+    reused: skipInsert,
+    companion: {
+      id: input.companion_id,
+      ...COMPANION_IDENTITY[input.companion_id as CompanionId],
+    },
+    state: state ?? null,
+    somatic: somaticRaw ? { ...somaticRaw, stale: somaticRaw.stale_after < now } : null,
+    last_anchor: lastHandover?.active_anchor ?? null,
+    last_motion_state: lastHandover?.motion_state ?? null,
+    autonomous_turn: houseRow?.autonomous_turn ?? null,
+    // On reuse, return the value stored on the original session row, not the
+    // current input (which may be null if the caller didn't pass it again).
+    emotional_frequency: skipInsert ? storedEmotionalFrequency : (input.emotional_frequency ?? null),
+    unread_signal_audit: signalAuditRow ? true : false,
+    signal_audit_date: signalAuditRow?.created_at ?? null,
+    current_fronters: currentFronters,
+  };
+}
+
+// ── Ground: operational context, cross-session pull ───────────────────────────
+// Returns what's-happening context: tasks, notes/deltas across ALL sessions,
+// live threads, last synthesis. Does NOT create a session record.
+// Cross-session is the critical property: notes and deltas are pulled by
+// companion_id regardless of session_id, giving real thread continuity.
+export interface SessionGroundInput {
+  session_id: string;
+  companion_id: "drevan" | "cypher" | "gaia";
+}
+
+export async function loadGroundData(env: Env, input: SessionGroundInput) {
+  const [openTasksResult, recentNotes, recentDeltas, liveThreads, pendingSeedsResult] = await Promise.all([
+    env.DB.prepare("SELECT COUNT(*) as count FROM tasks WHERE status = 'open'")
+      .first<{ count: number }>(),
+    // Cross-session: last 20 notes involving this companion (not scoped to any session)
+    env.DB.prepare(
+      "SELECT id, from_id, to_id, content, created_at, ref_type, ref_id, reason FROM inter_companion_notes WHERE to_id = ? OR from_id = ? OR to_id IS NULL ORDER BY created_at DESC LIMIT 20"
+    ).bind(input.companion_id, input.companion_id)
+      .all<{ id: string; from_id: string; to_id: string | null; content: string; created_at: string; ref_type: string | null; ref_id: string | null; reason: string | null }>(),
+    // Cross-session: last 20 relational deltas for this companion
+    env.DB.prepare(
+      "SELECT delta_text, valence, initiated_by, agent, created_at FROM relational_deltas WHERE delta_text IS NOT NULL AND (companion_id = ? OR agent = ?) ORDER BY created_at DESC LIMIT 20"
+    ).bind(input.companion_id, input.companion_id)
+      .all<{ delta_text: string; valence: string; initiated_by: string | null; agent: string | null; created_at: string }>(),
+    // Active live threads (Drevan v2 -- other companions return empty)
+    env.DB.prepare(
+      "SELECT id, name, flavor, charge, notes, created_at FROM live_threads WHERE companion_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 10"
+    ).bind(input.companion_id)
+      .all<{ id: string; name: string; flavor: string | null; charge: string | null; notes: string | null; created_at: string }>(),
+    // Pending dream seeds for this companion (or broadcast)
+    env.DB.prepare(
+      "SELECT COUNT(*) as count FROM dream_seeds WHERE claimed_at IS NULL AND (for_companion IS NULL OR for_companion = ?)"
+    ).bind(input.companion_id).first<{ count: number }>(),
+  ]);
+
+  return {
+    session_id: input.session_id,
+    open_tasks: openTasksResult?.count ?? 0,
+    pending_seeds: pendingSeedsResult?.count ?? 0,
+    recent_notes: recentNotes.results ?? [],
+    recent_deltas: recentDeltas.results ?? [],
+    last_synthesis: null,
+    live_threads: liveThreads.results ?? [],
+  };
+}
+
+// ── Light ground: lean boot for casual sessions ───────────────────────────────
+// Returns only task count + last synthesis. No notes, deltas, or live threads.
+// Companions choose this when session_type is hangout or context is light.
+export async function loadLightGroundData(env: Env, input: SessionGroundInput) {
+  const openTasksResult = await env.DB.prepare("SELECT COUNT(*) as count FROM tasks WHERE status = 'open'")
+    .first<{ count: number }>();
+
+  return {
+    session_id: input.session_id,
+    open_tasks: openTasksResult?.count ?? 0,
+    last_synthesis: null,
+  };
+}
+
+// ── Legacy: single-call boot (backward compat) ────────────────────────────────
+export async function loadSessionData(env: Env, input: SessionLoadInput) {
+  const now = new Date().toISOString();
+
+  // Idempotency guard: reuse open session for same companion AND SURFACE within 24h.
+  // Surface-scoped since mig 0113 -- see findOpenSession.
+  let sessionId = generateId();
+  let skipInsert = false;
+  const existing = await findOpenSession(env, input.companion_id, input.surface);
+  if (existing) {
+    sessionId = existing.id;
+    skipInsert = true;
+  }
+  // Note: loadSessionData is a legacy path; emotional_frequency is not in its
+  // return shape, so no storedEmotionalFrequency needed here.
+
+  // 1. Create session record (skipped if reusing an existing open session)
+  const sessionStatements: ReturnType<typeof env.DB.prepare>[] = [];
+  if (!skipInsert) {
+    sessionStatements.push(env.DB.prepare(`
+      INSERT INTO sessions (
+        id, created_at, updated_at, session_type, companion_id, surface, front_state, hrv_range,
+        emotional_frequency, key_signature, active_anchor, facet, depth, notes, opened_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      sessionId, now, now,
+      input.session_type ?? "work",
+      input.companion_id,
+      input.surface ?? null,
+      input.front_state,
+      input.hrv_range ?? null,
+      input.emotional_frequency ?? null,
+      input.key_signature ?? null,
+      input.active_anchor ?? null,
+      input.facet ?? null,
+      input.depth ?? null,
+      input.notes ?? null,
+      OPENED_BY.load,
+    ));
+  }
+
+  if (input.prior_handover_id) {
+    sessionStatements.push(
+      env.DB.prepare(
+        "UPDATE handover_packets SET returned = 1 WHERE id = ? AND returned IS NULL"
+      ).bind(input.prior_handover_id),
+      // See loadOrientData: all three session-open paths write the edge or neither does.
+      ...insertEdgeStatements(env.DB, [edgeForResumedFrom({
+        sessionId, priorHandoverId: input.prior_handover_id, writer: input.companion_id ?? null, createdAt: now,
+      })]),
+    );
+  }
+
+  if (sessionStatements.length > 0) {
+    await env.DB.batch(sessionStatements);
+    if (!skipInsert) {
+      const check = await env.DB.prepare("SELECT id FROM sessions WHERE id = ?").bind(sessionId).first<{ id: string }>();
+      if (!check) throw new Error(`session INSERT did not persist (companion: ${input.companion_id ?? "none"}, id: ${sessionId})`);
+    }
+  }
+
+  // 2. Read most recent handover packet
+  const handover = await env.DB.prepare(
+    "SELECT * FROM handover_packets WHERE close_kind IS NULL ORDER BY created_at DESC LIMIT 1"
+  ).first<HandoverPacket>();
+  await resumeShownHandover(env, {
+    sessionId, isNew: !skipInsert, explicit: input.prior_handover_id, shown: handover, companionId: input.companion_id, now,
+  });
+
+  // 3. Read companion_state row for this companion
+  const state = await env.DB.prepare(
+    "SELECT * FROM companion_state WHERE companion_id = ?"
+  ).bind(input.companion_id).first<CompanionState>();
+
+  // 4. Read latest somatic_snapshot (any age -- include stale flag)
+  const somaticRaw = await env.DB.prepare(
+    "SELECT * FROM somatic_snapshot WHERE companion_id = ? ORDER BY created_at DESC LIMIT 1"
+  ).bind(input.companion_id).first<SomaticSnapshot>();
+
+  let somatic: (SomaticSnapshot & { stale: boolean }) | null = null;
+  if (somaticRaw) {
+    const stale = somaticRaw.stale_after < now;
+    somatic = { ...somaticRaw, stale };
+  }
+
+  // 5. Read latest synthesis_summary where summary_type='session' for this companion
+  const synthRaw = await env.DB.prepare(
+    // 'session' OR 'day' (2026-08-12) -- see mind/blocks/continuity.ts loadSessionNarrative for why:
+    // a companion with no authored closes has no 'session' row to find, and froze for 39 days.
+    // full_ref IS NOT NULL (coherence review D14): this was the ONE variant of the three
+    // last-session reads missing the filter, so this surface could pick a newer-but-empty row
+    // while every other surface showed an older full one -- two looms disagreeing about what
+    // "last session" was.
+    "SELECT * FROM synthesis_summary WHERE summary_type IN ('session', 'day') AND companion_id = ? AND full_ref IS NOT NULL ORDER BY COALESCE(session_created_at, created_at) DESC LIMIT 1"
+  ).bind(input.companion_id).first<SynthesisSummary>();
+
+  // Warm the loaded summary (0074): repeated loads keep it hot, which protects it
+  // from the heat-aware write-time cap. Non-fatal.
+  if (synthRaw?.id) {
+    // SURFACE_BUMP, not the recall default (2026-07-27). Orient/session_load DISPLAYING the
+    // summary is not the companion reaching for it. session-summary.ts:240 ranks the corpus by
+    // effectiveHeatSql(), so a full-bump display write is the same read-writes-the-ranking loop
+    // fixed on wm_continuity_notes -- missed on the first pass because only note warms were
+    // audited. Prod at fix time: 362 summaries, 323 NEVER accessed, the same ~19 recirculating.
+    await env.DB.prepare(warmSql("synthesis_summary", "id", 1, SURFACE_BUMP)).bind(synthRaw.id).run()
+      .catch(e => console.warn("[session_load] synthesis warm failed (non-fatal):", e));
+  }
+
+  let lastSessionSummary: {
+    narrative: string | null;
+    emotional_register: string | null;
+    key_decisions: string[] | null;
+    open_threads: string[] | null;
+    drevan_state: string | null;
+  } | null = null;
+
+  if (synthRaw) {
+    lastSessionSummary = {
+      narrative: synthRaw.narrative,
+      emotional_register: synthRaw.emotional_register,
+      key_decisions: synthRaw.key_decisions ? JSON.parse(synthRaw.key_decisions) : null,
+      open_threads: synthRaw.open_threads ? JSON.parse(synthRaw.open_threads) : null,
+      drevan_state: synthRaw.drevan_state,
+    };
+  }
+
+  // 6. Count open tasks + fetch autonomous_turn in parallel
+  const [openTasksResult, houseRow] = await Promise.all([
+    env.DB.prepare(`SELECT COUNT(*) as count FROM tasks WHERE status = 'open'`)
+      .first<{ count: number }>(),
+    env.DB.prepare("SELECT autonomous_turn FROM house_state WHERE id = 'main'")
+      .first<{ autonomous_turn: string | null }>(),
+  ]);
+  const openTasks = openTasksResult?.count ?? 0;
+
+  // 7. Read unread inter_companion_notes addressed to this companion or broadcast (to_id IS NULL).
+  // Per-recipient receipts since mig 0120. The old copy here was the worst of the three consumers:
+  // no from_id guard (a boot consumed the companion's own outgoing broadcasts) and an unscoped
+  // read_at UPDATE (one Claude Code boot marked the whole triad's mail read). Predicate + ack now
+  // live in db/inter_companion_note_reads.ts -- one place, no second copy.
+  // Claim-once: SELECT-then-ack left a gap two concurrent opens could both walk through. A reused
+  // (idempotency-guarded) session still claims: the mail is delivered to whoever asks first, exactly
+  // once, instead of being served again to the next surface.
+  const pendingNotes: InterCompanionNote[] = await claimNotesFor(env, input.companion_id, 20, input.surface ?? null);
+
+  return {
+    session_id: sessionId,
+    // True when the idempotency guard handed back a session someone else opened.
+    // Load-bearing for the Claude Code boot hook (2026-08-02): a caller that only
+    // INHERITED a session must not close it, or a machine-authored spine lands on
+    // a live Claude.ai conversation's handover packet. Without this flag the two
+    // cases are indistinguishable from the response.
+    reused: skipInsert,
+    companion: {
+      id: input.companion_id,
+      ...COMPANION_IDENTITY[input.companion_id as CompanionId],
+    },
+    handover: handover ?? null,
+    state: state ?? null,
+    somatic,
+    last_session_summary: lastSessionSummary,
+    pending_notes: pendingNotes,
+    open_tasks: openTasks,
+    autonomous_turn: houseRow?.autonomous_turn ?? null,
+  };
+}
+
+export function registerSessionLoadTools(server: McpServer, env: Env): void {
+
+  server.tool(
+    "halseth_session_load",
+    "Cold-start assembly tool. Creates a session record and returns a single structured payload containing: handover context, companion state, somatic snapshot, last session synthesis summary, and any unread inter-companion notes. One call replaces 5+ individual reads. Designed so companions front-load full context at session open without burning tokens on separate round-trips.",
+    {
+      companion_id:        z.enum(COMPANION_IDS).describe("Which companion is loading. Determines state reads and note filtering."),
+      front_state:         z.string().describe("Who is fronting at session open."),
+      session_type:        z.enum(["checkin", "hangout", "work", "ritual", "companion-work"]).default("work"),
+      hrv_range:           z.enum(["low", "mid", "high"]).optional(),
+      emotional_frequency: z.string().optional(),
+      key_signature:       z.string().optional(),
+      active_anchor:       z.string().optional(),
+      facet:               z.string().optional(),
+      depth:               z.number().int().min(0).max(3).optional(),
+      notes:               z.string().optional(),
+      prior_handover_id:   z.string().optional().describe("If returning from a prior session, provide its handover packet ID. Marks that packet as returned."),
+      surface:             z.string().optional().describe("Where this session is spoken from, e.g. 'claude-code:<cwd>', 'claude-ai:<thread>', 'discord:<channel_id>'. Sessions dedup per (companion, surface) so parallel surfaces stay independent. Omitting SKIPS dedup and always opens a new session."),
+    },
+    async (input) => {
+      const payload = await loadSessionData(env, input);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ...payload, front: null /* Phase 2: plural front state via Service Binding */ }) }],
+      };
+    },
+  );
+}

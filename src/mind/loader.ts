@@ -1,0 +1,306 @@
+// src/mind/loader.ts
+//
+// loadMindState(): the single loader every loom will boot from (Phase 1,
+// docs/mindstate-contract.md). Strangler slice 1: composes the existing mindOrient
+// (readOnly -- no ack, no warm, no home-event stamping) and mindGround queries into
+// the MindState contract shape. It adds NO new queries yet; parity with the legacy
+// aggregators is the point. Later slices fold in the session_orient-only blocks
+// (growth, guardian, forage, world) and the delivery ledger.
+//
+// Covenant: this function is a PURE READ. If you are about to add a write to it,
+// you are rebuilding the bug it exists to kill (loading-as-consuming, loom-bound
+// consume-once). Deliveries get recorded in the ledger by the route layer, and
+// consumption is an explicit verb.
+
+import type { Env } from "../types.js";
+import type { WmAgentId } from "../webmind/types.js";
+import { mindOrient } from "../webmind/orient.js";
+import { mindGround } from "../webmind/ground.js";
+import { MindState, MINDSTATE_CONTRACT_VERSION, NOT_YET_LOADED, Loom } from "./contract.js";
+import { loadIdentityBlocks } from "./blocks/identity.js";
+import { loadFeltFermentBlocks } from "./blocks/felt.js";
+import { loadGrowthBlocks } from "./blocks/growth.js";
+import { loadWorldBlocks } from "./blocks/world.js";
+import { loadOversightBlocks } from "./blocks/oversight.js";
+import { loadSessionNarrative } from "./blocks/continuity.js";
+import { loadRelationalBlocks } from "./blocks/relational.js";
+import { loadBeliefExtras } from "./blocks/beliefs.js";
+import { loadCareBlocks, derivePrincipalState, EMPTY_CARE } from "./blocks/care.js";
+import { loadGraphBlocks, EMPTY_GRAPH } from "./blocks/graph.js";
+import { loadLedgerOpen, countLedgerWaiting, countSaltWaiting } from "../ledger/store.js";
+import { loadInterestsBlock, EMPTY_INTERESTS } from "./blocks/interests.js";
+import { loadMakesBlock, EMPTY_MAKES } from "./blocks/makes.js";
+import { loadVerdictsBlock, EMPTY_VERDICTS } from "../webmind/verdicts.js";
+import type { GraphSeed } from "../graph/traverse.js";
+
+/**
+ * `opts.orient` lets a caller that ALREADY runs mindOrient hand its result in instead of making the loader
+ * run a second one (2026-08-02).
+ *
+ * execSessionOrient calls `wmOrient` for its continuity block AND loadMindState in the same `Promise.all`, so
+ * the heaviest aggregator in the system (~28 queries plus the home-events read) was executing TWICE per
+ * Claude.ai boot, concurrently -- on the very path the cutover was meant to slim down. Not a correctness bug
+ * (all writes are readOnly-gated and seedIdentityAnchor is ON CONFLICT DO NOTHING), purely double work.
+ *
+ * Takes a PROMISE, not a value, so the caller can start it and pass the same in-flight promise to both
+ * consumers: one execution, full parallelism, no serialization penalty.
+ */
+export async function loadMindState(
+  env: Env,
+  companionId: WmAgentId,
+  loom: Loom,
+  opts: { orient?: Promise<Awaited<ReturnType<typeof mindOrient>> | null> } = {},
+): Promise<MindState> {
+  /**
+   * NOTHING IN HERE MAY ABORT A BOOT.
+   *
+   * Found the hard way during the bot cutover (2026-08-01). execBotOrient's old fan-out was 33 sources under
+   * `Promise.allSettled`, with a comment saying so: any one query could fail and orient still returned. This
+   * loader used `Promise.all`, so the moment the bots started reading through it, a single throw from
+   * `mindOrient` -- which calls `seedIdentityAnchor`, which throws by design when its read-back comes back
+   * empty -- would take out the whole boot. The regression was invisible in prod and only fell out of the
+   * test fixtures, which is the good outcome: this is the boot path for EVERY loom now, so its failure
+   * profile is inherited by all of them at once. Fail-closed here means the whole house goes dark.
+   *
+   * DEGRADED, NOT SILENT. `allSettled` alone would have swapped a loud break for a quiet one, and a
+   * soft-failing loader that looks identical working or dead has now cost this project three separate
+   * debugging sessions (wave 4 shipped an entirely empty world block and read as a quiet house). So every
+   * failure is NAMED in `meta.degraded`, which a consumer can surface and a health check can alarm on. An
+   * empty block and an unavailable block are different facts and must not render the same.
+   */
+  const degraded: string[] = [];
+
+  /**
+   * Run a block loader so that NOTHING it does can reject `loadMindState`, and so that a failure is NAMED.
+   *
+   * Two review findings (2026-08-02) that were really one hole:
+   *  * `identity` and `felt` had no top-level try/catch, unlike the other six. Their per-statement
+   *    `.catch(() => null)` does not cover a SYNCHRONOUS throw from `env.DB.prepare(...)` (evaluated while
+   *    the `Promise.all` array is being built) or anything thrown after the await. Such a throw rejects this
+   *    function -- and `loadMindState` is unguarded inside both `execBotOrient`'s and `execSessionOrient`'s
+   *    own `Promise.all`, so BOTH orient paths 500. Exactly the fail-closed regression this file's header
+   *    claims to have fixed, and the degradation test only ever mocked the two aggregators throwing.
+   *  * `meta.degraded` only reported orient/ground. The eight blocks each swallowed their own failure into
+   *    an empty shape, so `loadWorldBlocks` could hit its catch and return EMPTY -- the wave-4 "read as a
+   *    quiet house" failure -- while `degraded` stayed `[]` and every consumer read healthy.
+   *
+   * Takes a THUNK, not a promise, so a synchronous throw is caught too.
+   */
+  const guard = async <T>(name: string, run: () => Promise<T>, fallback: T): Promise<T> => {
+    try {
+      return await run();
+    } catch (err) {
+      console.error(`[mind/loader] block '${name}' failed, degrading`, { companionId, error: String(err) });
+      degraded.push(name);
+      return fallback;
+    }
+  };
+  // Shared with the graph guard below: seeding the traversal off the SAME orient promise (not a second
+  // call to mindOrient) keeps this a single bounded call joining the existing fan-out, not a new
+  // retrieval. `.catch(() => null)` here is a SEPARATE handler from the one on the array entry below --
+  // both read the same promise; neither can double-reject it, and a synchronous throw inside
+  // `mindOrient` is already captured because `orientPromise` itself is a promise, never a thunk.
+  const orientPromise = opts.orient ?? mindOrient(env, companionId, { readOnly: true });
+
+  const [orientRes, groundRes, identity, felt, growth, world, oversight, narrative, relational, beliefExtras, care, graph, ledgerOpen, ledgerWaiting, saltWaiting, interests, makes, verdicts] = await Promise.all([
+    orientPromise.catch((err: unknown) => {
+      console.error("[mind/loader] mindOrient failed, degrading", { companionId, error: String(err) });
+      degraded.push("orient");
+      return null;
+    }),
+    mindGround(env, companionId).catch((err: unknown) => {
+      console.error("[mind/loader] mindGround failed, degrading", { companionId, error: String(err) });
+      degraded.push("ground");
+      return null;
+    }),
+    // Wave 1 of folding in the NOT_YET_LOADED blocks (2026-07-29): identity (6) + felt-ferment (3),
+    // taking the contract from 30 unfilled blocks to 21. Own modules under blocks/ rather than more
+    // inline queries here, because these are the CANONICAL implementations -- when execSessionOrient
+    // cuts over, its inline copies get deleted and it calls these.
+    guard("identity", () => loadIdentityBlocks(env, companionId), { shared_kernel: null, companion_kernel: null, self_model: [], self_model_graduated: [], architect_facts: [], preferences: [], refusals: [], agency_affordance: "" }),
+    guard("felt", () => loadFeltFermentBlocks(env, companionId), { soma_floats: [], drives: [], ferment_events: [], ferment_at: null, soma_provenance: [] }),
+    // Wave 3 (2026-08-01): growth (7), 21 unfilled -> 14. This is the wave that unblocks the bot cutover
+    // -- 13 of execBotOrient's 40 keys mapped to blocks the loader could not fill.
+    guard("growth", () => loadGrowthBlocks(env, companionId), { journal_recent: [], patterns: [], markers: [], reflection: null, seeds: [], clearing_count: 0, drifts_open: [], projects: [], budget: null }),
+    // Wave 4: the shared world (9). 14 unfilled -> 5.
+    guard("world", () => loadWorldBlocks(env, companionId), { club: null, commons: [], commons_life: [], change_notes: [], shelf: [], collection: { forage: [], media: [], top: [] }, forage: { pool: [], active: [] }, listens: [], motifs: { active: [], resurrection_candidates: [] }, sol: null, creatures: [], imps_active: [], watching: [], departures: [] }),
+    // Wave 5: oversight (3). With session_narrative and the worldview alias, NOT_YET_LOADED hits ZERO.
+    guard("oversight", () => loadOversightBlocks(env, companionId), { guardian_cards: [], tripwires: [], questions: [], answered_questions: [], growth_unconfirmed: [] }),
+    guard("narrative", () => loadSessionNarrative(env, companionId), null),
+    // Wave 6: the five blocks that existed ONLY on the Discord wire. NOT_YET_LOADED hitting zero measured
+    // design-doc coverage, not the bot's wire coverage -- seven of its fields had no contract home at all.
+    // Five were cheap D1 reads and belong here; the other two (rag_excerpts, history_excerpts) plus the
+    // sbRead that hydrates the session narrative stay in the bot adapter, because the loader stays pure-D1
+    // and must not make every loom's boot depend on the Second Brain tunnel.
+    guard("relational", () => loadRelationalBlocks(env, companionId), { siblings: [], recent_witness: [] }),
+    guard("beliefs", () => loadBeliefExtras(env, companionId), { supersede_candidates: [] }),
+    // 0.6.0 (consequence layer C1): the care register's D1 half -- front state + care-loop rows.
+    // The biometrics half rides orient's existing read; derivePrincipalState composes the two below.
+    guard("care", () => loadCareBlocks(env, companionId), EMPTY_CARE),
+    // 0.11.0 (graph memory Phase 1.5, Tranche 4): seeded from ids `orientPromise` ALREADY fetched for
+    // beliefs.conclusions and relational.journal_recent -- no new retrieval, one bounded traverse (hop
+    // 1, limit 30) joining the existing fan-out. Waits on the same orient promise everything else in
+    // this array waits on; a degraded orient (null) yields an empty seed set, not a throw.
+    guard("graph", async () => {
+      const o = await orientPromise.catch(() => null);
+      // 0.12.0 (Fargo first light, 2026-09-05): what Principal is CURRENTLY watching is a seed too. The
+      // `mentions` edges (rebuild source e) point journal rows at watch_shelf titles, so seeding the
+      // active shelf rows is what lets a companion on ANY surface read "Fargo -- 14 notes from drevan
+      // (newest 08-30)" at orient without the newest journal rows having to mention it this week.
+      // One extra cheap D1 read (ids only, watching/paused rows, capped at 10); a failure yields no
+      // shelf seeds, never a throw. Bounded by the traverse's per-hop cap (30) like every other seed.
+      const shelfIds = await env.DB.prepare(
+        "SELECT id FROM watch_shelf WHERE status IN ('watching','paused') ORDER BY last_watched_at DESC NULLS LAST LIMIT 10",
+      ).all<{ id: string }>().then((r) => (r.results ?? []).map((x) => x.id)).catch(() => [] as string[]);
+      const seeds: GraphSeed[] = [
+        ...((o?.active_conclusions ?? []).map((c) => ({ table: "companion_conclusions", id: c.id }))),
+        ...((o?.recent_journal ?? []).map((j) => ({ table: "companion_journal", id: j.id }))),
+        ...shelfIds.map((id) => ({ table: "watch_shelf", id })),
+      ];
+      return loadGraphBlocks(env, companionId, seeds);
+    }, EMPTY_GRAPH),
+    // 0.17.0 (ledger lane, mig 0134): one indexed D1 read, up to 5 open clerk records about this
+    // companion. Pure D1; a missing table (0134 not applied) degrades to [] like every other block.
+    guard("ledger", async () => (await loadLedgerOpen(env, companionId)).map((r) => ({
+      id: r.id, function: r.function, content: r.content, observed_on: r.observed_on, created_at: r.created_at,
+    })), []),
+    // 0.27.0 (mig 0168): how many open imp-errand lines wait on this companion. A count only; 0 pre-0168.
+    guard("ledger_waiting", () => countLedgerWaiting(env, companionId), 0),
+    // 0.28.0 (mig 0175): how many unopened, unfaded salts Hex left for THIS companion. A count, never content; 0 pre-0175.
+    guard("ledger_salt_waiting", () => countSaltWaiting(env, companionId), 0),
+    // 0.29.0: the companion's own interests, warmest active first. One D1 read; a missing table degrades to empty.
+    guard("interests", () => loadInterestsBlock(env, companionId), EMPTY_INTERESTS),
+    // 0.30.0: the companion's own last makes with age and reception (heard_back). One D1 read; pure D1.
+    guard("makes", () => loadMakesBlock(env, companionId), EMPTY_MAKES),
+    // 0.34.0: their own counted verdict lines (mode `on` only; shadow/off = empty with the word). One D1 read.
+    guard("verdicts", () => loadVerdictsBlock(env, companionId), EMPTY_VERDICTS),
+  ]);
+
+  // Non-null views. `orient`/`ground` are the only two sources that can be wholly absent (the blocks each
+  // degrade internally to their own empty shape), so the nullish-coalescing below is confined to their fields
+  // rather than smeared across the whole mapping.
+  const orient = orientRes;
+  const ground = groundRes;
+  const nowIso = new Date().toISOString();
+
+  return {
+    contract_version: MINDSTATE_CONTRACT_VERSION,
+    companion_id: companionId,
+    loom,
+    loaded_at: nowIso,
+
+    identity: {
+      anchor: orient?.identity_anchor ?? null,
+      ...identity,
+    },
+
+    felt: {
+      limbic: orient?.limbic_state ?? null,
+      ...felt,
+      soma_arc: orient?.soma_arc ?? [],
+      biometrics_latest: orient?.latest_biometrics ?? null,
+      house: orient?.house_state ?? null,
+    },
+
+    continuity: {
+      latest_handoff: orient?.latest_handoff ?? null,
+      recent_handoffs: orient?.recent_handoffs ?? [],
+      open_thread_count: orient?.open_thread_count ?? 0,
+      top_threads: orient?.top_threads ?? [],
+      surfaced_notes: orient?.recent_notes ?? [],
+      recent_notes: ground?.recent_notes ?? [],
+      archived_digests: ground?.archived_digests ?? [],
+      spiral_turn: orient?.recent_spiral_turn ?? null,
+      // Wave 5. The value that had been FROZEN since 2026-07-21 (the close ritual never called
+      // session_close, so nothing wrote synthesis_summary). Loading it does not unfreeze it -- it means
+      // every loom now reads the SAME one instead of three surfaces disagreeing about "recently".
+      session_narrative: narrative?.full_ref ?? null,
+      // 0.5.0 (coherence review D5): the conversation ledger finally has a contract home.
+      conversations: orient?.active_conversations ?? [],
+      // 0.15.0: the endings. Pure read -- a closed thread must not become more closed by
+      // being surfaced (same constraint pinned on conclusions this week).
+      closed_conversations: orient?.closed_conversations ?? [],
+      // 0.16.0: what he said to them somewhere else. Pure read.
+      recent_captures: orient?.recent_captures ?? [],
+    },
+
+    carried: {
+      dreams_unexamined: orient?.unexamined_dreams ?? [],
+      // orient exposes the projected WmOrientOpenLoop rows (id/loop_text/weight/opened_at,
+      // post-merge with the thinking-quality wave); rehydrate the WmOpenLoop contract shape.
+      // companion_id is the loaded companion and closed_at is null by the query's filter.
+      open_loops: (orient?.open_loops ?? ground?.open_loops ?? []).map((l) => ({
+        id: l.id,
+        companion_id: companionId,
+        loop_text: l.loop_text,
+        weight: l.weight,
+        opened_at: l.opened_at,
+        closed_at: null,
+      })),
+      tensions: orient?.active_tensions ?? [],
+      sits: ground?.sitting_notes ?? [],
+      feelings_recent: orient?.recent_feelings ?? [],
+    },
+
+    beliefs: {
+      conclusions: orient?.active_conclusions ?? [],
+      flagged: orient?.flagged_beliefs ?? [],
+      resurfaced: orient?.resurfaced_conclusion ?? null,
+      ...beliefExtras,
+    },
+
+    relational: {
+      snapshot: orient?.relational_snapshot ?? [],
+      deltas_recent: orient?.recent_deltas ?? [],
+      witness_principal: orient?.principal_witness_entries ?? [],
+      triad_incoming: orient?.incoming_companion_notes ?? [],
+      triad_outgoing: orient?.recent_companion_notes ?? [],
+      letters: orient?.recent_letters ?? [],
+      journal_recent: orient?.recent_journal ?? [],
+      ...relational,
+    },
+
+    // Wave 3: what this companion has been becoming on its own time. Canonical implementation --
+    // execSessionOrient and execBotOrient still hold divergent inline copies until they cut over.
+    growth,
+
+    oversight: {
+      pressure_flags: orient?.pressure_flags ?? [],
+      growth_confirmed: orient?.growth_confirmed ?? [],
+      ...oversight,
+    },
+
+    world: {
+      home_recent: orient?.home_recent ?? [],
+      ...world,
+      // 0.6.0: the care register. Derived here rather than in a block loader so it composes
+      // orient's biometrics read instead of duplicating it (D13: one loader, zero sibling reads).
+      principal_state: derivePrincipalState(orient?.latest_biometrics ?? null, care),
+    },
+
+    // 0.11.0: the local structural neighborhood around what this boot already surfaced.
+    graph,
+
+    // 0.17.0: clerk records about this companion -- its own block, never merged into a first-person one.
+    ledger: { open: ledgerOpen, waiting: ledgerWaiting, salt_waiting: saltWaiting },
+
+    // 0.29.0: what is theirs to bring (Principal 11-09). Never the night's candidate.
+    interests,
+
+    // 0.30.0: what they made and whether it landed.
+    makes,
+    verdicts,
+
+    meta: {
+      // Time is the one field with no acceptable empty: a companion that does not know when it is will
+      // reason about "recently" from whatever it last saw. If orient is degraded, compute it here rather
+      // than hand back "" -- temporal grounding is not optional context.
+      datetime_iso: orient?.current_datetime_iso ?? nowIso,
+      datetime_local: orient?.current_datetime_cst ?? nowIso,
+      not_yet_loaded: NOT_YET_LOADED,
+      /** Sources that failed this load. EMPTY is the healthy case; a non-empty list means some blocks are
+       *  absent rather than genuinely empty, and a renderer must not present the two the same way. */
+      degraded,
+    },
+  };
+}

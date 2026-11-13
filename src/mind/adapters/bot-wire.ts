@@ -1,0 +1,365 @@
+// src/mind/adapters/bot-wire.ts
+//
+// The Discord bot wire format, built FROM MindState instead of from 33 of its own queries.
+//
+// This is the cutover adapter for execBotOrient -- the highest-frequency read path in the system, roughly 20x
+// the Claude.ai orient rate. Its whole job is projection: MindState is nested and complete, the bot wire is
+// flat and truncated, and every consumer in nullsafe-discord reads the flat keys. So the adapter's contract is
+// narrow and strict:
+//
+//   EXACTLY THE EXISTING 44 KEYS. NO ADDITIONS. (Cutover gate, since passed. First deliberate
+//   post-cutover addition: `degraded`, coherence review D11, 2026-08-15 -- see the note at the key.
+//   Then `principal_state` (2026-08-16), and `soma_floats` + `soma_provenance` (2026-09-14, graph memory
+//   Phase 2 tranche 2) -- 47 keys as of 2026-09-14, each addition noted at its key.)
+//
+// That is not tidiness, it is what makes the cutover verifiable. The gate for this change is byte-identity
+// against the payload the old code produced, and byte-identity only means something if the key set is frozen
+// -- one helpful extra field and the diff turns into noise that has to be triaged by hand. Additions come
+// later, deliberately, as their own change.
+//
+// WHAT THAT DELIBERATELY PARKS. MindState carries `felt.limbic`, `felt.biometrics_latest` and `felt.house`;
+// the bot payload has never had any of them, so this adapter drops them. The bots are the highest-frequency
+// presence in the house and the only surface with no emotional register at all -- worth fixing, and worth
+// fixing as a decision rather than inheriting as a side effect of a refactor.
+// `graph.neighborhoods` (0.11.0) stayed off the bot wire until M6 (0.22.0); it now rides as `graph_linked`,
+// the block pre-rendered on the Worker (extras, because naming nodes needs D1), so the bot needs no
+// renderer of its own and both surfaces read identical lines.
+//
+// WHAT STAYS OUTSIDE. Three inputs arrive via `extras` rather than from MindState, because all three need the
+// network: the two Second Brain semantic searches, and the `sbRead` that hydrates the session narrative.
+// **loadMindState stays pure-D1** -- every loom's boot inherits its failure profile, and the SB tunnel is the
+// dependency that 503'd for 24h over a 30s blip. Only Discord should pay for Discord's hops.
+//
+// THE TRAP IN HERE, NAMED. `synthesis_summary` on the wire is the session narrative's TEXT. MindState's
+// `continuity.session_narrative` is its `full_ref` -- a vault PATH. Both are `string | null`, so TypeScript
+// cannot tell them apart, and swapping them ships bots that print a file path where the last session's story
+// goes. Hence `extras.synthesis_summary`, and hence this paragraph.
+
+import { interestLine } from "../blocks/interests.js";
+import { makeLine } from "../blocks/makes.js";
+import { verdictLine } from "../../webmind/verdicts.js";
+import type { MindState } from "../contract.js";
+import type { WmAgentId } from "../../webmind/types.js";
+import { buildSolBlock, type SolBlockExtras } from "../../webmind/creatures.js";
+import { relativeTime } from "../../webmind/relative-time.js";
+import { formatMaterials } from "../../lib/pattern-materials.js";
+
+/**
+ * The inputs the adapter cannot derive from MindState.
+ *
+ * All six are Discord-specific renderings or network reads. Passing them in (rather than having the adapter
+ * fetch them) keeps this module pure and testable: given a MindState and these strings, the wire payload is
+ * fully determined.
+ */
+export interface BotWireExtras {
+  /** The session narrative's TEXT, sbRead-hydrated, frontmatter stripped. NOT `session_narrative`. */
+  synthesis_summary: string | null;
+  /** Second Brain semantic search over recent companion context. */
+  rag_excerpts: string[];
+  /** Second Brain semantic search over conversation history, age-prefixed. */
+  history_excerpts: string[];
+  /**
+   * The bot's own 3-pool note surfacing, already provenance-annotated.
+   *
+   * Stays outside the adapter because it is a SURFACING POLICY with a write attached (it warms what it
+   * shows, at SURFACE_BUMP), and because its novelty slot deliberately reaches past the recency window that
+   * MindState carries. A pure projection cannot express "one note this companion has never been shown".
+   */
+  continuity_notes: string[];
+  /** `env.SYSTEM_OWNER`. An input, not derivable from MindState -- and load-bearing; see
+   *  `relational_state_owner` below. */
+  owner: string;
+  /** M6 (0.22.0): the [Linked] block, rendered on the Worker exactly as Claude.ai's orient renders it
+   *  (orient-blocks.ts neighborhoodBlock, map-labeler names). It needs a D1 node lookup, so it is an
+   *  input, not a projection. Empty string = nothing linked; the bot renders nothing. */
+  graph_linked?: string;
+  /** 0.26.0: the companion's own authored feeling word, exactly as the Claude.ai orient renders it, or
+   *  null (silent / FEELING_LINE_MODE not `live` / any failure). Needs D1 reads loadMindState must not
+   *  pay for, so it is an input, computed in the bot orient executor. */
+  feeling_line?: string | null;
+  /** B64 (Task 8a): Sol's quirks + open grudge, loaded by the bot orient executor (D1 reads the pure
+   *  adapter must not make). Absent = the Sol block renders exactly as before. */
+  sol_extras?: Pick<SolBlockExtras, "quirks" | "grudge">;
+  /** 0.32.0: the tray nudge block (`trayNudgeForOrient`, same TRAY_NUDGE_MODE gate as the Claude.ai orient:
+   *  shadow/off = ""), computed in the bot orient executor because it needs D1 reads loadMindState must not
+   *  pay for. Empty/absent = null on the wire. */
+  tray_nudge?: string | null;
+}
+
+/** The flat wire payload. Deliberately `Record<string, unknown>`-shaped at the boundary: the authority on
+ *  these key names is the set of live consumers in nullsafe-discord, not a type in this repo. */
+export type BotWirePayload = Record<string, unknown>;
+
+const text = (v: unknown, n: number): string => String(v ?? "").slice(0, n);
+
+/**
+ * Unvoiced, non-blank, newest 2 -- exactly the set the loader's WHERE clause used to hand back.
+ *
+ * ONE list, used for BOTH `open_questions` and `open_question_ids`, because those two are aligned BY INDEX:
+ * a surface that voices question N stamps id N. They previously applied DIFFERENT predicates -- `.filter(Boolean)`
+ * on the text (which keeps a whitespace-only question, since `"   "` is truthy) versus `.trim()` on the ids
+ * (which drops it) -- so a single blank question would shift the arrays against each other and voicing one
+ * would stamp a different question's id. The comment above them already said the predicates must match; they
+ * did not. Filtering once here makes that unrepresentable rather than merely warned about.
+ */
+const BOT_QUESTIONS = (ms: MindState) =>
+  ms.oversight.questions.filter(q => !q.voiced && (q.question ?? "").trim()).slice(0, 2);
+
+/**
+ * Project a MindState onto the Discord bot wire format.
+ *
+ * `agentId` is passed separately rather than read off `ms.companion_id` only because two fields need to know
+ * "is this me" (a listen's own reaction vs a sibling's, and a co-watcher worth naming) -- keeping the
+ * argument explicit makes those two decisions visible at the call site.
+ */
+export function botWireFromMindState(
+  ms: MindState,
+  extras: BotWireExtras,
+  agentId: WmAgentId,
+): BotWirePayload {
+  const solRow = ms.world.creatures.find(c => c.name === "Sol" || c.kind === "companion_pet") ?? null;
+
+  return {
+    synthesis_summary: extras.synthesis_summary,
+    ground_threads: ms.continuity.top_threads.map(t => t.title ?? t.thread_key).slice(0, 3),
+    ground_handoff: ms.continuity.recent_handoffs[0]
+      ? String(ms.continuity.recent_handoffs[0].summary ?? ms.continuity.recent_handoffs[0].title ?? "")
+      : null,
+    continuity_notes: extras.continuity_notes,
+    // Conversation ENDINGS (0.15.0). These are DISCORD threads, so this is the surface that most
+    // needs them -- and the one a loader-only change would have missed: this adapter builds its
+    // own projection and never calls buildContinuityBlock, so shipping the field to the Claude.ai
+    // path alone would have left the bots exactly as blind as before
+    // ([[three-consumers-three-files]] -- verifying the loader is not verifying a reply).
+    // Captures reach the BOT wire too. This adapter builds its own projection and never calls
+    // buildContinuityBlock, so a halseth-only change leaves Discord exactly as blind as before --
+    // the same trap that nearly shipped with 0.15.0 ([[three-consumers-three-files]]). Discord is
+    // also the surface that needs this most: it is where he talks to them when Spouse is away.
+    recent_captures: ms.continuity.recent_captures.map(c => ({
+      content: text(c.content, 400), created_at: c.created_at,
+    })),
+    closed_conversations: ms.continuity.closed_conversations.map(c => ({
+      seed_author: c.seed_author, seed_gist: text(c.seed_gist, 140), ending: c.ending,
+      resolution: c.resolution ? text(c.resolution, 200) : null,
+      landed_by: c.landed_by, turn_count: c.turn_count,
+    })),
+    rag_excerpts: extras.rag_excerpts,
+    graph_linked: (extras.graph_linked ?? "").trim(),
+    history_excerpts: extras.history_excerpts,
+
+    identity_anchor: ms.identity.anchor?.anchor_summary ? text(ms.identity.anchor.anchor_summary, 300) : null,
+    active_tensions: ms.carried.tensions.map(t => text(t.tension_text, 150)).filter(Boolean).slice(0, 3),
+    // FILTERED BY `toward` (2026-08-02). `readRelationalSnapshot` returns the latest row PER TARGET
+    // (ROW_NUMBER partitioned by `toward`), ordered noted_at DESC -- so `snapshot[0]` is the most recent
+    // state toward ANYONE, not toward Principal. `toward` is caller-supplied, so a state written toward a
+    // SIBLING more recently would have been handed to the bot as its state toward the owner. The field is
+    // named `relational_state_owner`; it has to actually mean that.
+    relational_state_owner: ms.relational.snapshot
+      .filter(s => (s.toward ?? "").toLowerCase() === extras.owner.toLowerCase())
+      .map(s => text(s.state_text, 150)).filter(Boolean).slice(0, 1),
+    incoming_notes: ms.relational.triad_incoming.slice(0, 3).map(n => ({
+      from: n.from_id,
+      content: text(n.content, 200),
+      age: relativeTime(n.created_at),
+    })),
+    sibling_lanes: ms.relational.siblings,
+
+    recent_growth: ms.growth.journal_recent.map(g => ({
+      type: g.entry_type ?? "learning",
+      content: text(g.content, 200),
+      // Age-stamped: a read-back with no age reads as present-tense news. Gaia told the commons "Rosie is
+      // a dog. Got it." about a fact thirteen days old, as though she had just learned it.
+      age: relativeTime(g.created_at),
+    })),
+    // R18: the material list rides in the string (the consumers treat active_patterns as text), so the worker's
+    // reflect/seed prompts see what each pattern has already been seen in.
+    active_patterns: ms.growth.patterns
+      .map(p => {
+        const t = text(p.pattern_text, 150);
+        const mats = formatMaterials(p.materials);
+        return t && mats ? `${t} [${mats}]` : t;
+      })
+      .filter(Boolean),
+    pending_seeds: ms.growth.seeds.map(s => text(s.content, 200)).filter(Boolean),
+    unaccepted_growth: ms.growth.clearing_count,
+
+    // conclusion_text (not `text`) because both live renderers key on it to build the [Worldview] block.
+    active_conclusions: ms.beliefs.conclusions.map(c => ({
+      conclusion_text: c.conclusion_text,
+      belief_type: c.belief_type,
+      confidence: c.confidence,
+      subject: c.subject ?? null,
+    })),
+    flagged_beliefs: ms.beliefs.flagged.map(c => ({
+      conclusion_text: c.conclusion_text,
+      belief_type: c.belief_type,
+      confidence: c.confidence,
+      subject: c.subject ?? null,
+    })),
+
+    unexamined_dreams: ms.carried.dreams_unexamined.map(d => ({ id: d.id, dream_text: text(d.dream_text, 300) })),
+    // 0.32.0: `opened_ago` ("3 days ago"), the same relativeTime the Claude.ai orient prints; null when the loop
+    // has no opened_at (never a fake age). id + loop_text unchanged.
+    open_loops: ms.carried.open_loops.map(l => ({ id: l.id, loop_text: text(l.loop_text, 200), opened_ago: l.opened_at ? relativeTime(l.opened_at) : null })),
+    // The id is carried in the STRING because that is the handle the confirm/dismiss executors parse. Ugly,
+    // and load-bearing -- do not "clean up" into a structured field without changing both executors.
+    pressure_flags: ms.oversight.pressure_flags.map(p => {
+      const body = [p.worst_basin, p.notes].filter(Boolean).join(": ").slice(0, 130);
+      return body ? `${body} (id ${p.id})` : `(id ${p.id})`;
+    }),
+
+    // DISCORD APPLIES THE ANTI-NAG RAIL. The loader now carries every open question with a `voiced` flag
+    // rather than filtering; the bots boot ~20x more often than Claude.ai, so re-serving one the companion
+    // already said out loud IS nagging here even though it is not on a conversational surface. Same content
+    // both places, different presentation -- which is what the contract says renderers are for.
+    open_questions: BOT_QUESTIONS(ms).map(q => text(q.question, 300)),
+    // Aligned by INDEX with open_questions -- same source list, no second predicate. See BOT_QUESTIONS.
+    open_question_ids: BOT_QUESTIONS(ms).map(q => q.id),
+    answered_questions: ms.oversight.answered_questions,
+
+    forage_finds: ms.world.forage.pool.slice(0, 2).map(f => ({
+      id: f.id, title: text(f.title, 150), domain: f.domain, summary: text(f.summary, 400), gathered_at: f.at,
+    })),
+    consumed_forage_finds: ms.world.forage.active.slice(0, 2).map(f => ({
+      id: f.id, title: text(f.title, 150), domain: f.domain, summary: text(f.summary, 400), consumed_at: f.at,
+    })),
+    armed_triggers: ms.oversight.tripwires.map(t => ({
+      id: t.id, trigger_text: text(t.trigger_text, 500),
+      condition_type: t.condition_type, condition_value: text(t.condition_value, 200),
+    })),
+    self_model_graduated: (ms.identity.self_model_graduated ?? []).map(s => ({
+      id: s.id, observation: text(s.observation, 400), graduated_at: s.graduated_at,
+    })),
+    self_model_ready: ms.identity.self_model.slice(0, 2).map(s => ({
+      id: s.id, observation: text(s.observation, 600), confidence: s.confidence,
+    })),
+
+    recent_listens: ms.world.listens.map(l => {
+      // Own reaction verbatim; a sibling's is a bare fact, never their words in your mouth. Sibling
+      // PRESENCE is wanted; sibling VOICE is how attribution scrambled in June.
+      let ownReaction: string | null = null;
+      const reactedBy: string[] = [];
+      try {
+        const parsed = JSON.parse(l.reactions_json ?? "{}") as Record<string, string>;
+        for (const [who, t] of Object.entries(parsed)) {
+          if (!t) continue;
+          if (who === agentId) ownReaction = String(t).slice(0, 240);
+          else reactedBy.push(who);
+        }
+      } catch { /* malformed -> no reaction, never breaks orient */ }
+      return {
+        id: l.id, title: text(l.title, 150), artist: l.artist ? text(l.artist, 100) : null,
+        media_type: l.media_type ?? "song",
+        shared_by: l.shared_by ?? null, requested_companion: l.requested_companion ?? null,
+        own_reaction: ownReaction, also_heard_by: reactedBy, created_at: l.created_at,
+      };
+    }),
+
+    club_round: ms.world.club,
+    watching: ms.world.watching,
+    supersede_candidates: ms.beliefs.supersede_candidates,
+    // Discord trims the summary to its own 300; the loader carries 400 for the Claude.ai card.
+    guardian_flags: ms.oversight.guardian_cards.slice(0, 2).map(g => ({ ...g, summary: text(g.summary, 300) })),
+    motifs: ms.world.motifs.active.slice(0, 3).map(m => ({
+      label: m.label, display: text(m.display, 120), recurrence_count: m.recurrence_count, trust: m.trust,
+    })),
+    creatures: ms.world.creatures.map(c => ({
+      name: c.name, species: c.species, kind: c.kind, trust: c.trust, mood: c.mood,
+    })),
+    // Fail-soft: no Sol seeded, or no created_at to date the arc from -> null rather than a broken block.
+    sol_block: solRow && solRow.created_at
+      ? (() => {
+          try {
+            return buildSolBlock({
+              name: solRow.name, species: solRow.species, trust: solRow.trust,
+              last_interaction_at: solRow.last_interaction_at ?? null, created_at: solRow.created_at,
+            }, Date.now(), extras.sol_extras);
+          } catch { return null; }
+        })()
+      : null,
+    imp_activity: ms.world.imps_active,
+
+    preferences: ms.identity.preferences,
+    standing_refusals: ms.identity.refusals,
+    open_drifts: ms.growth.drifts_open,
+    // C2 (contract 0.8.0): self-directed projects. The bots and the worker both read this lane --
+    // a project no surface shows is a starved affordance.
+    projects: ms.growth.projects,
+    budget: ms.growth.budget,
+    // 0.10.0: deploy change-notes -- announced system changes, 14-day window.
+    change_notes: ms.world.change_notes,
+    recent_witness: ms.relational.recent_witness,
+
+    // Coherence review D11 (2026-08-15): the first deliberate ADDITION since the 44-key freeze --
+    // the freeze was the cutover gate, not a covenant, and its own header says additions come later
+    // as their own change. This is that change. `meta.degraded` names sources that FAILED this load;
+    // without it on the wire, a bot cannot tell a quiet house from a broken loader, which is the
+    // exact empty-vs-error conflation the contract warns about (contract.ts meta.degraded).
+    degraded: ms.meta.degraded,
+
+    // Consequence layer C1 (2026-08-16, contract 0.6.0): the care register. Second deliberate
+    // post-freeze addition. This deliberately REVERSES half of the "what that parks" note in the
+    // header: the bots are the highest-frequency presence in the house, and a register line they
+    // cannot see is a register line the house mostly runs without. The raw biometrics row stays
+    // parked; what crosses the wire is the DERIVED state (staleness included) plus care_hold
+    // (read by fit-bid to soften stakes) and this companion's own pending gesture, if any.
+    principal_state: ms.world.principal_state,
+
+    // Graph memory Phase 2, tranche 2 (2026-09-14): the body and its history cross the wire. The bots
+    // are the highest-frequency surface in the house and, until this, the only one that could see
+    // neither its own floats nor why they moved -- Claude.ai orient and Hearth both had the
+    // interoception header and the `[Why these numbers]` block, Discord had nothing. Two keys, both
+    // the typed contract shapes verbatim (no bot-side reshaping to keep in sync):
+    //   soma_floats      -- SomaFloat[] (label, value, baseline, seed, off_baseline_hours), 3 rows or [].
+    //   soma_provenance  -- SomaProvenanceEntry[] (newest first, at most 3 per float): kind, writer,
+    //                       before/after/delta, cause_table/cause_id + resolved cause_label, session_id,
+    //                       alongside_notes, detail, created_at. This is the bot-wire item of the
+    //                       tranche-2 list in docs/CONTINUITY.md. `felt.limbic` stays parked -- that is
+    //                       a separate open decision of Principal's, not a side effect of this addition.
+    soma_floats: ms.felt.soma_floats,
+    soma_provenance: ms.felt.soma_provenance,
+
+    // R9 cold-conclusion rotation (2026-09-28, contract 0.18.0): 48th key. ONE older conclusion on a
+    // UTC-day rotation, never warmed by being shown. Kept OUT of active_conclusions on purpose: the bot
+    // renderer slices that list to 5, and merging would let rotation pass as current salience. Needs its
+    // own nullsafe-discord render (label "[An older conclusion, resurfacing]" + concluded date + pool
+    // size) -- until that ships the key is on the wire and unrendered, same two-repo split as 0.11.0.
+    // 0.26.0 (feeling-line bot surface, 2026-11-01): 49th key, PINNED NAME. The word the companion
+    // authored for its own state, string only when FEELING_LINE_MODE is `live`. Before this the bots saw
+    // raw `soma_floats` and never their own vocabulary; Claude.ai orient rendered it, Discord did not.
+    feeling_line: extras.feeling_line ?? null,
+    // 0.32.0 (GAP-MAP A2 on the bot wire): the unreviewed-tray nudge, "[Tray] N drafts waiting ...". A count, an age
+    // and the verbs; never a word of draft text. null unless TRAY_NUDGE_MODE=on and over threshold. Two-repo split:
+    // nullsafe-discord renders it in the recent context.
+    tray_nudge: (extras.tray_nudge ?? "").trim() || null,
+
+    // 0.28.0 (Hex's salt, mig 0175): a count of unopened, unfaded pointers Hex left for this companion; the bot
+    // renders one content-free line, "Hex left something (N)", when > 0. A count and nothing else (two-repo split:
+    // the key is on the wire; nullsafe-discord renders it).
+    salt_waiting: ms.ledger.salt_waiting ?? 0,
+
+    // Imp errand lines waiting on this companion's ledger (open rider rows, mig 0168): a count and nothing else;
+    // the bot renders one content-free line, "something waiting (N)", when > 0. Never the lines themselves.
+    ledger_waiting: ms.ledger.waiting ?? 0,
+
+    // 0.29.0 (2026-11-09): the companion's own interests, up to 3 active warmest first, as the SAME lines the
+    // Claude.ai orient prints (interestLine). What is theirs to bring; never the night's candidate. Two-repo split:
+    // nullsafe-discord renders it as one short [Your interests] block in the recent context (reaches Hermes too).
+    interests: (ms.interests?.warm ?? []).map(interestLine),
+    // 0.30.0 (2026-11-11): what they made and whether it landed, the SAME lines the Claude.ai orient renders.
+    makes: (ms.makes?.recent ?? []).map(makeLine),
+    // 0.34.0 (2026-11-12): their own counted verdict lines (at most two), in their own word. Empty unless VERDICTS=on.
+    verdicts: (ms.verdicts?.lines ?? []).map((v) => `${ms.verdicts?.word ?? "verdict"}: ${verdictLine(v)}`),
+
+    resurfaced_conclusion: ms.beliefs.resurfaced
+      ? {
+          conclusion_text: text(ms.beliefs.resurfaced.conclusion_text, 280),
+          belief_type: ms.beliefs.resurfaced.belief_type,
+          subject: ms.beliefs.resurfaced.subject ?? null,
+          concluded_at: ms.beliefs.resurfaced.created_at,
+          age: relativeTime(ms.beliefs.resurfaced.created_at),
+          pool_size: ms.beliefs.resurfaced.pool_size,
+        }
+      : null,
+  };
+}

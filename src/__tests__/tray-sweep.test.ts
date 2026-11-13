@@ -1,0 +1,267 @@
+// THE TRAY SWEEP (imp tray pass 2, 2026-09-26). A static test over src/: every SQL literal that reads
+// companion_journal or wm_continuity_notes must carry the review_state gate, or sit on the allowlist
+// below with a written reason. Every INSERT into either table must go through webmind/tray-insert.ts.
+//
+// Why static: the first pass (mig 0132) gated the recall and orient reads it knew about. Two reviews
+// then found a dozen it did not -- synthesis jobs, motifs, the creature nest, pattern recall, journal
+// search, sit reads, note compaction -- each one a door a draft walked through into "memory". A list
+// of known sites rots the day a new query is written; this fails on the new query instead.
+//
+// How: the TypeScript compiler API walks every string and template literal (regex over source text
+// trips on multi-line templates, SQL `--` comments and JS comments naming the tables). A literal is
+// GATED when its own text contains `review_state` or interpolates KEPT_SQL / KEPT_LIVE_SQL. A literal
+// that interpolates a built WHERE (`${where}`, `${conditions.join(...)}`) is gated when its enclosing
+// function's code (comments stripped) names the gate.
+//
+// Blind spot, stated: SQL whose TABLE NAME is interpolated (`FROM ${w.table}` in tray.ts,
+// warmSql(...), tray-insert.ts's `INSERT INTO ${table}`) is invisible here. Those sites are few and
+// each has its own behavioural test.
+
+import { describe, it, expect } from "vitest";
+import ts from "typescript";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const SRC = fileURLToPath(new URL("../", import.meta.url).href);
+
+interface Allow { file: string; match: string; reason: string }
+
+// file is relative to src/, forward slashes; match is a substring of the literal's source text.
+const ALLOW: Allow[] = [
+  { file: "mind/room-label.ts", match: "SELECT tags FROM companion_journal", reason: "channel -> room lookup reads TAGS only, never content: a draft speech row still records which room a channel id names (2026-10-05)" },
+  { file: "handlers/principal-inbox.ts", match: "FROM companion_journal AS j \"", reason: "Principal's own inbox (2026-10-30): letters addressed to HIM, shown to him not into a companion prompt; excludes dropped, and a draft letter must still reach him" },
+  { file: "handlers/principal-inbox.ts", match: "SELECT COUNT(*) AS n FROM companion_journal j", reason: "unread count for Principal's inbox: same letter set as the list above (dropped excluded), counts only, no text" },
+  { file: "handlers/principal-companion.ts", match: "companion_journal j WHERE j.agent = ?1 AND j.archived = 0", reason: "Principal's companion page (Hearth P3, 2026-10-30): journal count since he last looked, dropped and letters excluded, counts only, no text, never into a companion prompt" },
+  { file: "handlers/principal-companion.ts", match: "${LETTER_WHERE} AND ${AFTER_C", reason: "Principal's companion page: letters-to-him count since he last looked (same letter set as his inbox, dropped excluded), counts only, no text" },
+  { file: "handlers/principal-companion.ts", match: "${LETTER_WHERE} `", reason: "Principal's companion page: unread letters-to-him count, same unread rule as /principal/inbox, counts only, no text" },
+  { file: "handlers/soma.ts", match: "SELECT MAX(j.created_at) FROM companion_journal j WHERE j.agent = cs.companion_id", reason: "/soma seen_at (2026-10-30): the TIME of the companion's own last journal entry, never its text, for Hearth's 'seen Nh' age; a draft is still the companion showing up" },
+  { file: "webmind/makes-capture.ts", match: "FROM companion_journal WHERE agent = ? AND id LIKE ?", reason: "`keep as made` (2026-11-05): the companion points at ONE of its OWN rows by id; a draft (its channel poem) is exactly what it keeps. Own agent only, reads ids and dates, no text, goes to the Made shelf for Principal, never into a prompt" },
+  { file: "webmind/makes-capture.ts", match: "FROM companion_journal WHERE agent = ? AND created_at >= ?", reason: "`keep as made \"opening words\"`: matches the companion's OWN rows (drafts included, a poem in channel is born draft) by prefix to find ONE id; text is compared in memory and never returned, only table + id prefix + date as candidates" },
+  { file: "webmind/makes-capture.ts", match: "SELECT note_text, tags, review_state FROM companion_journal WHERE id = ? AND agent = ?", reason: "`keep as made`: reads the ONE own row the companion named, to copy into its Made shelf (R2), a dropped row included only because the companion pointed at it by id; the shelf is read by Principal, not seated in a prompt" },
+  { file: "handlers/principal-inbox.ts", match: "SELECT DISTINCT agent FROM companion_journal WHERE id IN", reason: "being_seen LIGHT (B63): reads only the AUTHOR (agent) of the letters Principal just opened, to know whose being_seen_read to fire; no text read, nothing seated in a prompt" },
+  { file: "handlers/being-seen.ts", match: "SELECT note_text FROM companion_journal WHERE agent = ? AND source = 'discord_speech'", reason: "being_seen FULL (B63): compares Principal's own (unquoted) words with the companion's OWN last 7 days of Discord speech, in memory, to decide a fire; a draft still counts as what they said; the text is never returned, logged or seated in a prompt, only {fired, why} leaves" },
+  { file: "webmind/garden.ts", match: "SELECT id, created_at, tags FROM companion_journal WHERE agent = ? AND id LIKE ?", reason: "Gaia's garden (mig 0171): she points at ONE of her OWN letters (tag letter_to_principal) to plant it; the garden is read by Principal on Hearth, never seated in a prompt; own agent only, ids and dates, no text returned" },
+  { file: "webmind/garden.ts", match: "FROM companion_journal WHERE agent = ? AND created_at >= ?", reason: "Gaia's garden (mig 0171): she points at ONE of her OWN letters (tag letter_to_principal) to plant it; the garden is read by Principal on Hearth, never seated in a prompt; opening words are compared in memory, only kind + id prefix + date come back as candidates" },
+  { file: "webmind/garden.ts", match: "SELECT tags FROM companion_journal WHERE agent = ? AND id LIKE ?", reason: "Gaia's garden (mig 0171): she points at ONE of her OWN letters (tag letter_to_principal) to plant it; the garden is read by Principal on Hearth, never seated in a prompt; reads tags only, to say why a row is not a letter" },
+  { file: "webmind/garden.ts", match: "SELECT note_text, tags, created_at FROM companion_journal WHERE id = ? AND agent = ?", reason: "Gaia's garden (mig 0171): she points at ONE of her OWN letters (tag letter_to_principal) to plant it; the garden is read by Principal on Hearth, never seated in a prompt; the planted letter is rendered to Principal through the floor (care/wound/hold), never into a prompt" },
+  { file: "webmind/losses.ts", match: "SELECT id, note_text FROM companion_journal WHERE agent = ? AND created_at >= ? AND archived = 0", reason: "B63 loss close (mig 0174): the nightly pass reads the companion's OWN journal rows (judge observations excluded) only to test whether a line of theirs names an open loss; text is compared in memory and never returned, quoted or seated in any prompt; a draft the companion wrote still counts as them authoring on it" },
+  // ── Idempotency / write gates: a draft must still dedupe, or it is re-written every run ──
+  { file: "webmind/notes.ts", match: "SELECT note_id, content, created_at FROM wm_continuity_notes\n       WHERE agent_id = ? AND archived = 0 AND thread_key = ?", reason: "addNote's 10-minute thread write gate: drafts must dedupe too, or a pulse floods the thread" },
+  { file: "librarian/executors/writes.ts", match: "WHERE agent_id = ? AND note_type = 'soma_arc' AND archived = 0", reason: "soma_arc 15-minute inflection gate (soma_arc is companion-authored, born kept)" },
+  { file: "webmind/vibecheck.ts", match: "WHERE agent = ? AND source = 'vibecheck' AND tags LIKE ?", reason: "vibecheck v2 once-a-day-per-agent idempotency lookup: the block is a draft, so gating it re-sends the block every run; returns an id only, no text" },
+  { file: "webmind/vibecheck.ts", match: "SELECT COUNT(*) AS n FROM companion_journal WHERE agent = ? AND source = 'discord_speech'", reason: "day ledger: how many times each companion SPOKE today -- a count of speech (which is drafts by design), no text read" },
+  { file: "webmind/vibecheck.ts", match: "SELECT COUNT(*) AS n FROM companion_journal WHERE agent = ? AND tags LIKE", reason: "day facts (B63): how many letters to Principal this companion wrote today, a count only, the digest's own rows excluded; no text read" },
+  { file: "webmind/vibecheck.ts", match: "SELECT tags FROM companion_journal WHERE agent = ? AND source = 'vibecheck'", reason: "gauge line (B63): reads the TAGS of this companion's previous digest block (g:basin / g:soma / g:tens) so tonight's block can say what moved; the digest is a clerk note, no text read" },
+  { file: "webmind/reflection-record.ts", match: "SELECT note_text, created_at FROM companion_journal WHERE agent = ? AND tags LIKE", reason: "B63 step 4: the companion's OWN letters to Principal from the last day, seated only in THAT companion's own nightly reflection prompt (their own record of their own day, the explicit ask); own agent only, digest rows excluded, never a sibling's, never a recall pool" },
+  { file: "webmind/reflection-record.ts", match: "SELECT id, agent, note_text, tags, created_at FROM companion_journal WHERE source = 'discord_speech'", reason: "B63 step 4 spoke_without_load clerk: compares Gaia's recent speech to earlier lines in the same channel by 8-word shingles IN MEMORY; the only text that leaves is the first 160 chars of GAIA'S OWN line, shown to her alone as a flag she confirms or dismisses; a sibling's text is compared, never returned" },
+  { file: "webmind/briefing.ts", match: "WHERE agent = 'steward' AND created_at >= date('now') AND tags LIKE ?", reason: "briefing once-a-day idempotency lookup (steward letters, born kept)" },
+
+  { file: "handlers/tray.ts", match: "SELECT note_id FROM wm_continuity_notes WHERE agent_id = ? AND correlation_id = ?", reason: "POST /admin/tray/draft idempotency lookup: must see a draft in ANY state (a dropped import is not re-created); reads the id only, no text" },
+  // ── Liveness / health / counts: a draft is still a WRITE ──
+  { file: "guardian/writer-liveness.ts", match: "SELECT MAX(created_at) AS ts FROM companion_journal", reason: "writer liveness: is the speech journaler writing at all -- drafts are exactly its output" },
+  { file: "guardian/writer-liveness.ts", match: "SELECT MAX(created_at) AS ts FROM wm_continuity_notes", reason: "writer liveness for the notes store" },
+  { file: "handlers/health.ts", match: "SELECT MAX(created_at) AS t FROM companion_journal WHERE agent = ?", reason: "health: minutes since each companion last journaled (any state)" },
+  { file: "librarian/executors/self-monitoring.ts", match: "SELECT created_at FROM companion_journal WHERE agent = 'guardian'", reason: "guardian's last letter timestamp; no text enters a prompt" },
+  { file: "handlers/edges.ts", match: "SELECT COUNT(*) FROM wm_continuity_notes WHERE archived = 0", reason: "edge-provenance instrument: counts addressable notes, no text read" },
+  { file: "handlers/sessions.ts", match: "SELECT session_id, COUNT(*) AS note_count", reason: "Hearth sessions list: per-session note counts" },
+  { file: "soma/events.ts", match: "SELECT session_id, COUNT(*) AS n FROM companion_journal", reason: "soma attribution: counts rows per session, no text read" },
+  { file: "webmind/stale-session-sweep.ts", match: "SELECT count(*) AS n FROM companion_journal", reason: "stale-session evidence: counts session-sourced rows in a window, reads no text" },
+  { file: "webmind/stale-session-sweep.ts", match: "SELECT count(*) AS n FROM wm_continuity_notes", reason: "stale-session evidence: counts rows in a window, reads no text" },
+
+  // ── Companion-authored lanes (born kept by the rule; the writer is the companion itself) ──
+  { file: "webmind/orient.ts", match: "note_type = 'soma_arc' AND archived = 0", reason: "soma_arc: the companion's own state write echoed as a note -- companion-authored, born kept" },
+  { file: "webmind/orient.ts", match: "note_type = 'conversation_capture' AND archived = 0", reason: "conversation_capture: what Principal said, taken down by the companion in a human session (HUMAN_SOURCES) -- born kept" },
+
+  // ── Ops that must reach EVERY state ──
+  { file: "webmind/tray.ts", match: "FROM companion_journal WHERE id = ? AND agent = ?", reason: "the tray itself: read draft <id> shows any state (draft/kept/dropped) so a decision can be made or re-checked" },
+  { file: "webmind/tray.ts", match: "FROM wm_continuity_notes WHERE note_id = ? AND agent_id = ?", reason: "the tray itself: read draft <id> for a note, any state" },
+  { file: "webmind/notes.ts", match: "DELETE FROM wm_continuity_notes WHERE note_id IN", reason: "cap eviction deletes exactly the ids the KEPT-gated overflow SELECT above chose" },
+  { file: "webmind/vocabulary-guards.ts", match: "'companion_journal' AS source", reason: "contamination detector: counts who SAID a token -- drafts are the speech; yields a verdict, never recall" },
+  { file: "webmind/vocabulary-write.ts", match: "SELECT note_id FROM wm_continuity_notes WHERE note_id", reason: "capture_id existence check: returns only the note_id key, never content; a draft is still a real capture" },
+  { file: "handlers/retract.ts", match: "SELECT id, archived FROM companion_journal WHERE agent = ? AND external_id IN", reason: "retract must find drafts (the usual case) and already-archived rows" },
+  { file: "handlers/retract.ts", match: "SELECT note_id, archived FROM wm_continuity_notes WHERE agent_id = ? AND correlation_id IN", reason: "retract must find drafts and already-archived rows" },
+  { file: "handlers/admin.ts", match: "SELECT id, note_text, agent FROM companion_journal", reason: "rebuild-embeddings: the index mirrors D1 (drafts are embedded; the READ hydration gates them)" },
+  { file: "handlers/admin.ts", match: "SELECT note_id AS id, content, agent_id FROM wm_continuity_notes", reason: "rebuild-embeddings (notes)" },
+  { file: "handlers/admin.ts", match: "SELECT note_id AS id FROM wm_continuity_notes", reason: "vector coverage audit: id sets only" },
+  { file: "handlers/admin.ts", match: "SELECT id FROM companion_journal", reason: "vector coverage audit: id sets only" },
+  { file: "handlers/admin.ts", match: "SELECT note_id AS id, content AS text, agent_id AS companion FROM wm_continuity_notes", reason: "vector coverage fill: embeds missing rows, index mirrors D1" },
+  { file: "handlers/admin.ts", match: "SELECT id, note_text AS text, agent AS companion FROM companion_journal", reason: "vector coverage fill (journal)" },
+  { file: "handlers/history.ts", match: "WHERE NOT (${NOTE_ELIGIBLE_SQL}) AND ${keyset}", reason: "continuity purge feed (2026-10-13): lists the ids of notes that must NOT have a search mirror (drafts, drops, archives, non-allowlisted types) so Second Brain can delete them; ids + state only, no text" },
+  { file: "handlers/history.ts", match: "WHERE (review_state <> 'kept' OR archived = 1) AND ${keyset}", reason: "recall reconcile: lists the ids of rows that are NOT memory (drafts, drops, archives) so Second Brain can delete their stale rag/ mirrors; ids + state only, no text" },
+  { file: "mind/note-provenance.ts", match: "SELECT note_id, thread_key, created_at FROM wm_continuity_notes WHERE note_id IN", reason: "provenance of note ids ALREADY selected by a gated read; reads no text" },
+
+  // ── Human (Principal) display / signal plumbing ──
+  { file: "handlers/presence.ts", match: "FROM companion_journal WHERE COALESCE(review_state,'') <> 'merged' ORDER BY created_at DESC LIMIT 6", reason: "Hearth /halseth + /house display only (see comment at the call site); no companion prompt reads /presence. Drafts show (review, not recall); B34 merged duplicates do not" },
+  { file: "librarian/backends/halseth.ts", match: "WHERE agent = ? AND tags LIKE '%signal_audit%'", reason: "signal-audit rows are Cypher's own authored audits (source NULL, born kept); tag-scoped" },
+  { file: "mcp/tools/session_load.ts", match: "WHERE agent = ? AND tags LIKE '%signal_audit%'", reason: "signal-audit presence flag (id + date only)" },
+];
+
+// ── the scan ──────────────────────────────────────────────────────────────────────────────────────
+
+const READ_RE = /\b(?:FROM|JOIN)\s+(?:companion_journal|wm_continuity_notes)\b/i;
+const INSERT_RE = /\b(?:INSERT|REPLACE)\s+(?:OR\s+\w+\s+)?INTO\s+(?:companion_journal|wm_continuity_notes)\b/i;
+// A PREDICATE on review_state -- a SELECT that merely lists the column is not a gate.
+const GATE_RE = /review_state\s*(?:=|IN\b)|\$\{\s*KEPT_(?:LIVE_)?SQL\s*\}/i;
+// archived = 0 (literal, a KEPT_LIVE_SQL interpolation, or an aliased cj.archived = 0).
+const LIVE_RE = /\barchived\s*=\s*0|\$\{\s*KEPT_LIVE_SQL\s*\}/i;
+const DYNAMIC_WHERE_RE = /\$\{\s*(?:where|conditions\.join\([^)]*\))\s*\}/;
+
+interface Hit { file: string; line: number; text: string; gated: boolean; live?: boolean }
+
+function walk(dir: string, out: string[]): void {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) { if (e.name !== "__tests__") walk(p, out); continue; }
+    if (e.name.endsWith(".ts") && !e.name.endsWith(".d.ts") && !e.name.endsWith(".test.ts")) out.push(p);
+  }
+}
+
+function stripComments(code: string): string {
+  return code.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
+}
+
+function scan(): { reads: Hit[]; inserts: Hit[] } {
+  const files: string[] = [];
+  walk(SRC, files);
+  const reads: Hit[] = [];
+  const inserts: Hit[] = [];
+  for (const abs of files) {
+    const rel = path.relative(SRC, abs).split(path.sep).join("/");
+    const src = fs.readFileSync(abs, "utf8");
+    if (!/companion_journal|wm_continuity_notes/.test(src)) continue;
+    const sf = ts.createSourceFile(abs, src, ts.ScriptTarget.ES2022, true);
+    const visit = (node: ts.Node, insideTemplate: boolean): void => {
+      const isLit = ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateExpression(node);
+      if (isLit && !insideTemplate) {
+        const text = node.getText(sf);
+        const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
+        if (INSERT_RE.test(text)) inserts.push({ file: rel, line, text, gated: false });
+        if (READ_RE.test(text)) {
+          let gated = GATE_RE.test(text);
+          let live = LIVE_RE.test(text);
+          if (DYNAMIC_WHERE_RE.test(text)) {
+            let fn: ts.Node | undefined = node.parent;
+            while (fn && !ts.isFunctionLike(fn)) fn = fn.parent;
+            const code = fn ? stripComments(fn.getText(sf)) : "";
+            if (!gated) gated = /\bKEPT_(?:LIVE_)?SQL\b|["'`]review_state\s*(?:=|IN\b)/i.test(code);
+            if (!live) live = /\bKEPT_LIVE_SQL\b|["'`][^"'`]*\barchived\s*=\s*0/i.test(code);
+          }
+          reads.push({ file: rel, line, text, gated, live });
+        }
+      }
+      ts.forEachChild(node, (c) => visit(c, insideTemplate || ts.isTemplateExpression(node)));
+    };
+    visit(sf, false);
+  }
+  return { reads, inserts };
+}
+
+const normalize = (s: string) => s.replace(/\r\n/g, "\n");
+
+describe("tray sweep: every read of the two first-person stores is gated or allowlisted with a reason", () => {
+  const { reads, inserts } = scan();
+
+  it("finds the reads at all (the scanner is not silently blind)", () => {
+    expect(reads.length).toBeGreaterThan(40);
+    expect(reads.filter(r => r.gated).length).toBeGreaterThan(25);
+  });
+
+  it("no ungated read outside the allowlist", () => {
+    const ungated = reads.filter(r => !r.gated);
+    const unexplained = ungated.filter(r => !ALLOW.some(a => a.file === r.file && normalize(r.text).includes(a.match)));
+    const report = unexplained.map(r => `${r.file}:${r.line}  ${normalize(r.text).replace(/\s+/g, " ").slice(0, 160)}`);
+    expect(report, "ungated reads of companion_journal / wm_continuity_notes -- add the review_state gate, or an ALLOW entry with a reason").toEqual([]);
+  });
+
+  it("every allowlist entry matches exactly one ungated read (no stale, no file-wide exemptions)", () => {
+    const ungated = reads.filter(r => !r.gated);
+    const counts = ALLOW.map(a => ({ a, n: ungated.filter(r => r.file === a.file && normalize(r.text).includes(a.match)).length }));
+    expect(counts.filter(c => c.n !== 1).map(c => `${c.a.file} (${c.n} matches): ${c.a.match.slice(0, 80)}`)).toEqual([]);
+    for (const a of ALLOW) expect(a.reason.length, a.match).toBeGreaterThan(15);
+  });
+
+  it("every gated read also excludes archived rows (kept AND live) -- a retracted kept row is not memory either", () => {
+    // The tray's own lookups read any archived state on purpose (readDraft says so; locate refuses
+    // archived rows itself).
+    const missing = reads.filter(r => r.gated && !r.live && r.file !== "webmind/tray.ts");
+    expect(missing.map(r => `${r.file}:${r.line}  ${normalize(r.text).replace(/\s+/g, " ").slice(0, 160)}`)).toEqual([]);
+  });
+
+  it("no INSERT INTO either store outside webmind/tray-insert.ts (the birth rule is the only door in)", () => {
+    expect(inserts.map(i => `${i.file}:${i.line}`)).toEqual([]);
+    const helper = fs.readFileSync(path.join(SRC, "webmind/tray-insert.ts"), "utf8");
+    expect(helper).toMatch(/reviewStateFor\(/);
+  });
+});
+
+// ── The ledger lane (mig 0134, 2026-09-26) ────────────────────────────────────────────────────────────
+// One door: src/ledger/door.ts holds the only INSERT into ledger_entries, so the grammar cannot be walked
+// around. No other file writes a ledger line's text, and nothing ledger-side reaches the first-person stores
+// except the promotion path (store.ts promoteLedger -> tray-insert.ts journalInsert, with the COMPANION's
+// words). door.ts must not import the first-person insert helpers at all.
+
+const LEDGER_INSERT_RE = /\b(?:INSERT|REPLACE)\s+(?:OR\s+\w+\s+)?INTO\s+ledger_entries\b/i;
+const LEDGER_CONTENT_UPDATE_RE = /\bUPDATE\s+ledger_entries\s+SET\b[^;]*\b(?:content|body)\s*=/i;
+
+const LEDGER_ANY_UPDATE_RE = /\bUPDATE\s+ledger_entries\b/i;
+
+function ledgerScan(): { inserts: string[]; contentUpdates: string[]; updates: string[] } {
+  const files: string[] = [];
+  walk(SRC, files);
+  const inserts: string[] = [];
+  const contentUpdates: string[] = [];
+  const updates: string[] = [];
+  for (const abs of files) {
+    const rel = path.relative(SRC, abs).split(path.sep).join("/");
+    const src = fs.readFileSync(abs, "utf8");
+    if (!/ledger_entries/.test(src)) continue;
+    const sf = ts.createSourceFile(abs, src, ts.ScriptTarget.ES2022, true);
+    const visit = (node: ts.Node): void => {
+      if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateExpression(node)) {
+        const text = node.getText(sf);
+        const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
+        if (LEDGER_INSERT_RE.test(text)) inserts.push(`${rel}:${line}`);
+        if (LEDGER_CONTENT_UPDATE_RE.test(text)) contentUpdates.push(`${rel}:${line}`);
+        if (LEDGER_ANY_UPDATE_RE.test(text)) updates.push(`${rel}:${line}`);
+        return;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+  }
+  return { inserts, contentUpdates, updates };
+}
+
+describe("ledger sweep: one door into ledger_entries", () => {
+  const { inserts, contentUpdates, updates } = ledgerScan();
+
+  it("the only INSERT INTO ledger_entries is in ledger/door.ts (and it exists)", () => {
+    expect(inserts.length).toBe(1);
+    expect(inserts.every((i) => i.startsWith("ledger/door.ts:"))).toBe(true);
+  });
+
+  it("no code rewrites a ledger line's content or body after the door", () => {
+    expect(contentUpdates).toEqual([]);
+  });
+
+  it("every ledger state move lives in ledger/store.ts (the owner's keep/drop/promote and the admin retract drop)", () => {
+    // /admin/retract drops ledger rows sourced to a retracted message, but through
+    // store.ts retractDropLedgerStatement: handlers never carry their own ledger UPDATE.
+    expect(updates.length).toBeGreaterThan(0);
+    expect(updates.filter((u) => !u.startsWith("ledger/store.ts:"))).toEqual([]);
+  });
+
+  it("the door never touches the first-person stores; only the promotion path reaches the journal", () => {
+    const door = stripComments(fs.readFileSync(path.join(SRC, "ledger/door.ts"), "utf8"));
+    expect(door).not.toMatch(/tray-insert|journalInsert|noteInsert/);
+    expect(door).not.toMatch(/INTO\s+(?:companion_journal|wm_continuity_notes)/i);
+    const ledgerFiles = fs.readdirSync(path.join(SRC, "ledger")).filter((f) => f.endsWith(".ts"));
+    const importers = ledgerFiles.filter((f) => /tray-insert/.test(fs.readFileSync(path.join(SRC, "ledger", f), "utf8")));
+    expect(importers).toEqual(["store.ts"]);
+    const store = stripComments(fs.readFileSync(path.join(SRC, "ledger/store.ts"), "utf8"));
+    expect(store.match(/journalInsert\(/g)?.length).toBe(1);
+    expect(store).not.toMatch(/noteInsert/);
+  });
+});
+

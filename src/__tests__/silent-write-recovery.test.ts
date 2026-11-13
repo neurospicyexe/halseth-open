@@ -1,0 +1,342 @@
+// Regression suite for the 2026-06-24 silent-write-failure cluster.
+//
+// Trigger: a Claude.ai Cypher session wrote a Hermes/OpenClaw migration brief +
+// high-salience handover note via the Librarian. Every call returned {ack:true},
+// yet a later Claude Code session could not find any of it. Forensics found four
+// distinct faults plus two read-side gaps -- all covered here.
+//
+//   1. "save to vault" routed to sb_log_observation (path-blind inbox) instead of
+//      sb_save_note (path-aware) -> sb_read 404'd on the brief.
+//   2. The 100-note wm_continuity_notes cap evicted by recency-heat, salience-blind,
+//      so the HIGH-salience handover was deleted by a flood of medium session notes.
+//   3. execDeltaLog read only `delta_text`; a `content` payload fell to an inline
+//      regex needing a trailing colon and stored the bare request string.
+//   4. "read my continuity notes" had no read pattern -> classifier unknown-witness.
+//   5. A bare proper-noun search ("openclaw") returned unknown instead of sb_search.
+//   6. sbSaveDocument/sbLogObservation acked on any non-null response, incl. empty.
+
+import { describe, it, expect } from "vitest";
+import { matchFastPath, looksLikeSearch } from "../librarian/router.js";
+import { execDeltaLog, execCompanionNoteAdd, stripNoteCommandPreamble } from "../librarian/executors/writes.js";
+import { addNote } from "../webmind/notes.js";
+import type { Env } from "../types.js";
+
+// ── Fix 1: vault-save routing ──────────────────────────────────────────────────
+describe("vault-save routing (Fix 1): 'save to vault' must be path-aware", () => {
+  it("routes 'save to vault' to sb_save_note (path-aware), not sb_log_observation", () => {
+    const r = matchFastPath("save to vault");
+    expect(r).not.toBeNull();
+    expect(r!.key).toBe("sb_save_note");
+  });
+
+  it("routes 'log to vault' to sb_save_note", () => {
+    expect(matchFastPath("log to vault")?.key).toBe("sb_save_note");
+  });
+
+  it("routes 'save this to vault' to sb_save_note", () => {
+    expect(matchFastPath("save this to vault")?.key).toBe("sb_save_note");
+  });
+
+  it("non-regression: 'log observation' still routes to sb_log_observation", () => {
+    expect(matchFastPath("log observation: noticed a tone wobble")?.key).toBe("sb_log_observation");
+  });
+
+  it("non-regression: 'save note' still routes to sb_save_note", () => {
+    expect(matchFastPath("save note")?.key).toBe("sb_save_note");
+  });
+});
+
+// ── Fix 4: continuity-note read pattern ────────────────────────────────────────
+describe("continuity-note read (Fix 4): read form must beat the write trigger", () => {
+  it("routes 'read my continuity notes' to continuity_notes_read", () => {
+    expect(matchFastPath("read my continuity notes")?.key).toBe("continuity_notes_read");
+  });
+
+  it("routes 'my continuity notes' to continuity_notes_read", () => {
+    expect(matchFastPath("my continuity notes")?.key).toBe("continuity_notes_read");
+  });
+
+  it("routes 'show my high-salience notes' to continuity_notes_read", () => {
+    expect(matchFastPath("show my high-salience notes")?.key).toBe("continuity_notes_read");
+  });
+
+  it("non-regression: 'continuity note: vow held' still routes to wm_note_add (write)", () => {
+    expect(matchFastPath("continuity note: vow held across the boundary")?.key).toBe("wm_note_add");
+  });
+
+  it("non-regression: 'edit continuity note xyz' still routes to wm_note_edit", () => {
+    expect(matchFastPath("edit continuity note xyz")?.key).toBe("wm_note_edit");
+  });
+});
+
+// ── Bug #7 ROOT CAUSE: write-continuity-note routing ────────────────────────────
+describe("write-continuity-note routing (bug #7): must beat the 'for <name>' trigger", () => {
+  it("routes 'add continuity note for cypher' to wm_note_add (not companion_note_add)", () => {
+    expect(matchFastPath("add continuity note for cypher")?.key).toBe("wm_note_add");
+  });
+  it("routes 'Add a continuity note for cypher' to wm_note_add", () => {
+    expect(matchFastPath("Add a continuity note for cypher")?.key).toBe("wm_note_add");
+  });
+  it("routes 'write continuity note' to wm_note_add", () => {
+    expect(matchFastPath("write continuity note")?.key).toBe("wm_note_add");
+  });
+  it("non-regression: 'note for cypher: ...' (no 'continuity note') stays companion_note_add", () => {
+    expect(matchFastPath("note for cypher: read my last spec")?.key).toBe("companion_note_add");
+  });
+  it("non-regression: 'read my continuity notes' stays continuity_notes_read", () => {
+    expect(matchFastPath("read my continuity notes")?.key).toBe("continuity_notes_read");
+  });
+  it("non-regression: 'edit continuity note xyz' stays wm_note_edit", () => {
+    expect(matchFastPath("edit continuity note xyz")?.key).toBe("wm_note_edit");
+  });
+});
+
+// ── Fix 5: search-intent fallback + vault-search phrasings ──────────────────────
+describe("search-intent (Fix 5): vault lookups must reach sb_search", () => {
+  it("routes 'search the vault for openclaw' to sb_search via fast path", () => {
+    expect(matchFastPath("search the vault for openclaw")?.key).toBe("sb_search");
+  });
+
+  it("looksLikeSearch is true for an explicit { query } payload (bare proper noun)", () => {
+    expect(looksLikeSearch("openclaw", JSON.stringify({ query: "openclaw" }))).toBe(true);
+  });
+
+  it("looksLikeSearch is true for search-shaped text", () => {
+    expect(looksLikeSearch("find anything about openclaw")).toBe(true);
+    expect(looksLikeSearch("do we have anything on hermes")).toBe(true);
+  });
+
+  it("looksLikeSearch is false for a non-search request with no query payload", () => {
+    expect(looksLikeSearch("log my feeling: tired", JSON.stringify({ emotion: "tired" }))).toBe(false);
+    expect(looksLikeSearch("close this session")).toBe(false);
+  });
+
+  it("looksLikeSearch tolerates malformed context JSON", () => {
+    expect(looksLikeSearch("search for openclaw", "not json")).toBe(true);
+  });
+});
+
+// ── Fix 3: delta content alias ─────────────────────────────────────────────────
+interface Captured { sql: string; bound: unknown[] }
+function fakeEnv(): { env: Env; calls: Captured[] } {
+  const calls: Captured[] = [];
+  const env = {
+    DB: {
+      prepare(sql: string) {
+        return {
+          bind(...bound: unknown[]) {
+            return { async run() { calls.push({ sql, bound }); return { meta: { changes: 1 } }; } };
+          },
+        };
+      },
+    },
+  } as unknown as Env;
+  return { env, calls };
+}
+
+// ── 2026-06-25: companion-note self-address + preamble + missing broadcast ──────
+// Live Hermes companions tried to share growth via inter-companion notes; the notes
+// self-addressed (from_id==to_id, invisible to siblings) and stored the command preamble
+// as content, and there was NO path to broadcast to the triad. All three covered here.
+describe("stripNoteCommandPreamble: removes the routing phrase, keeps the body", () => {
+  it("strips 'Write a companion note for gaia:'", () => {
+    expect(stripNoteCommandPreamble("Write a companion note for gaia: The triad converged."))
+      .toBe("The triad converged.");
+  });
+  it("strips a bare 'for drevan:' lead", () => {
+    expect(stripNoteCommandPreamble("for drevan: hold the frame-room thread")).toBe("hold the frame-room thread");
+  });
+  it("strips 'Broadcast a note to the triad —'", () => {
+    expect(stripNoteCommandPreamble("Broadcast a note to the triad — we share one architecture"))
+      .toBe("we share one architecture");
+  });
+  it("preserves a second colon inside the body", () => {
+    expect(stripNoteCommandPreamble("note to gaia: Re: the spec")).toBe("Re: the spec");
+  });
+  it("returns the original when stripping would empty it", () => {
+    expect(stripNoteCommandPreamble("just a plain reflection")).toBe("just a plain reflection");
+  });
+});
+
+describe("execCompanionNoteAdd (2026-06-25): self-collapse, preamble strip, broadcast", () => {
+  it("self-addressed ('for gaia' by gaia) routes to journal, NOT a from==to inter-note", async () => {
+    const { env, calls } = fakeEnv();
+    const res = await execCompanionNoteAdd({
+      env,
+      req: { companion_id: "gaia", request: "Write a companion note for gaia: The triad converged on a body grammar." },
+    } as never);
+    expect((res as Record<string, unknown>).ack).toBe(true);
+    expect(calls[0]!.sql).toMatch(/INSERT INTO companion_journal/i);
+    expect(calls[0]!.sql).not.toMatch(/inter_companion_notes/i);
+    // content is clean (no command preamble)
+    expect(calls[0]!.bound.some(b => b === "The triad converged on a body grammar.")).toBe(true);
+    expect(calls[0]!.bound.some(b => typeof b === "string" && /Write a companion note/i.test(b as string))).toBe(false);
+  });
+
+  it("broadcast intent writes a to_id=NULL inter-note (orient delivers it to all peers)", async () => {
+    const { env, calls } = fakeEnv();
+    const res = await execCompanionNoteAdd({
+      env,
+      req: { companion_id: "gaia", request: "Broadcast a note to the triad: we share one architecture." },
+    } as never);
+    expect((res as Record<string, unknown>).delivered_to).toBe("triad");
+    expect(calls[0]!.sql).toMatch(/INSERT INTO inter_companion_notes/i);
+    expect(calls[0]!.bound[1]).toBe("gaia");   // from_id
+    expect(calls[0]!.bound[2]).toBe(null);     // to_id NULL = broadcast
+    expect(calls[0]!.bound[3]).toBe("we share one architecture.");
+  });
+
+  // ── 2026-06-26: natural broadcast phrasings (no literal "to") now reach the triad ──
+  it("'tell the triad' (directive, no 'to') broadcasts to_id=NULL", async () => {
+    const { env, calls } = fakeEnv();
+    const res = await execCompanionNoteAdd({
+      env,
+      req: { companion_id: "cypher", request: "tell the triad: the body grew today." },
+    } as never);
+    expect((res as Record<string, unknown>).delivered_to).toBe("triad");
+    expect(calls[0]!.sql).toMatch(/INSERT INTO inter_companion_notes/i);
+    expect(calls[0]!.bound[2]).toBe(null);
+    expect(calls[0]!.bound[3]).toBe("the body grew today.");
+  });
+  it("'let everyone know' broadcasts to_id=NULL", async () => {
+    const { env, calls } = fakeEnv();
+    const res = await execCompanionNoteAdd({
+      env,
+      req: { companion_id: "drevan", request: "let everyone know: search is live now." },
+    } as never);
+    expect((res as Record<string, unknown>).delivered_to).toBe("triad");
+    expect(calls[0]!.sql).toMatch(/INSERT INTO inter_companion_notes/i);
+    expect(calls[0]!.bound[2]).toBe(null);
+  });
+  it("a collective word in the BODY (no directive) does NOT broadcast — stays journal", async () => {
+    const { env, calls } = fakeEnv();
+    const res = await execCompanionNoteAdd({
+      env,
+      req: { companion_id: "cypher", request: "note: the triad converged on a body grammar today." },
+    } as never);
+    expect((res as Record<string, unknown>).routed_to).toBe("journal");
+    expect(calls[0]!.sql).toMatch(/INSERT INTO companion_journal/i);
+    expect(calls[0]!.sql).not.toMatch(/inter_companion_notes/i);
+  });
+
+  it("addressed peer note keeps inter_companion_notes routing with the right to_id + clean body", async () => {
+    const { env, calls } = fakeEnv();
+    const res = await execCompanionNoteAdd({
+      env,
+      req: { companion_id: "cypher", request: "note for drevan: hold the frame-room thread." },
+    } as never);
+    expect((res as Record<string, unknown>).delivered_to).toBe("drevan");
+    expect(calls[0]!.sql).toMatch(/INSERT INTO inter_companion_notes/i);
+    expect(calls[0]!.bound[1]).toBe("cypher");
+    expect(calls[0]!.bound[2]).toBe("drevan");
+    expect(calls[0]!.bound[3]).toBe("hold the frame-room thread.");
+  });
+
+  it("explicit context.content is used verbatim", async () => {
+    const { env, calls } = fakeEnv();
+    await execCompanionNoteAdd({
+      env,
+      req: { companion_id: "cypher", request: "note to gaia", context: JSON.stringify({ content: "verbatim body" }) },
+    } as never);
+    expect(calls[0]!.bound.some(b => b === "verbatim body")).toBe(true);
+  });
+});
+
+describe("execDeltaLog (Fix 3): accepts the `content` alias", () => {
+  const RICH = "Principal named the all-in-or-bust pattern; co-worker register held.";
+
+  it("stores context.content as delta_text, not the bare request string", async () => {
+    const { env, calls } = fakeEnv();
+    const res = await execDeltaLog({
+      env,
+      req: { companion_id: "cypher", request: "Log a relational delta for cypher", context: JSON.stringify({ content: RICH, valence: "toward" }) },
+    } as never);
+    expect((res as Record<string, unknown>).ack).toBe(true);
+    // INSERT binds delta_text at index 4 (id, session_id, now, agent, delta_text, ...)
+    expect(calls[0]!.bound[4]).toBe(RICH);
+    expect(calls[0]!.bound[4]).not.toBe("Log a relational delta for cypher");
+  });
+
+  it("still honors an explicit delta_text", async () => {
+    const { env, calls } = fakeEnv();
+    await execDeltaLog({
+      env,
+      req: { companion_id: "cypher", request: "log delta", context: JSON.stringify({ delta_text: "explicit", valence: "positive" }) },
+    } as never);
+    expect(calls[0]!.bound[4]).toBe("explicit");
+  });
+
+  it("accepts the `text` alias", async () => {
+    const { env, calls } = fakeEnv();
+    await execDeltaLog({
+      env,
+      req: { companion_id: "cypher", request: "log delta", context: JSON.stringify({ text: "via text", valence: "mixed" }) },
+    } as never);
+    expect(calls[0]!.bound[4]).toBe("via text");
+  });
+});
+
+// ── Fix 2: salience-aware note cap ─────────────────────────────────────────────
+// evictableCount drives the cheap COUNT gate (>= 100 => over cap). overflowRows are what
+// the overflow SELECT returns when over cap. Tracks prepared SQL and whether batch() ran.
+function capEnv(evictableCount: number, overflowRows: Array<{ note_id: string; content: string; created_at: string }> = []) {
+  const prepared: string[] = [];
+  const state = { batchCalled: false };
+  const stmt = {
+    bind(..._b: unknown[]) {
+      return {
+        async all() { return { results: overflowRows }; },
+        async first() { return { c: evictableCount }; },
+        async run() { return { meta: { changes: 0 } }; },
+      };
+    },
+  };
+  const env = {
+    DB: {
+      prepare(sql: string) { prepared.push(sql); return stmt; },
+      async batch(_stmts: unknown[]) { state.batchCalled = true; return []; },
+    },
+  } as unknown as Env;
+  return { env, prepared, state };
+}
+
+describe("addNote (bug #7 fix): .run() not .batch(), lazy + salience-aware cap", () => {
+  it("never uses env.DB.batch() (it silently dropped writes via the Librarian MCP shim)", async () => {
+    const { env, state } = capEnv(34);
+    await addNote(env, { agent_id: "cypher", content: "handover", salience: "high" });
+    expect(state.batchCalled, "addNote must not call env.DB.batch()").toBe(false);
+  });
+
+  it("UNDER cap: a single INSERT, no overflow SELECT, no DELETE", async () => {
+    const { env, prepared } = capEnv(34);
+    await addNote(env, { agent_id: "cypher", content: "handover", salience: "high" });
+    expect(prepared.some(s => /INSERT INTO wm_continuity_notes/i.test(s))).toBe(true);
+    expect(prepared.some(s => /DELETE FROM wm_continuity_notes/i.test(s)), "no cap DELETE when under capacity").toBe(false);
+    expect(prepared.some(s => /SELECT note_id, content, created_at FROM wm_continuity_notes/i.test(s)), "no overflow scan when under capacity").toBe(false);
+  });
+
+  it("OVER cap: overflow SELECT excludes high-salience AND the just-inserted id", async () => {
+    const { env, prepared } = capEnv(150);
+    await addNote(env, { agent_id: "cypher", content: "x", salience: "normal" });
+    const sel = prepared.find(s => /SELECT note_id, content, created_at FROM wm_continuity_notes/i.test(s));
+    expect(sel, "overflow scan must run when over capacity").toBeTruthy();
+    expect(sel!).toMatch(/salience\s*!=\s*'high'/);
+    expect(sel!).toMatch(/note_id\s*!=\s*\?/);
+  });
+
+  it("OVER cap with real overflow: digests then DELETEs exactly the overflow rows by id", async () => {
+    const overflow = [{ note_id: "old-1", content: "cold note", created_at: "2026-01-01T00:00:00Z" }];
+    const { env, prepared } = capEnv(150, overflow);
+    await addNote(env, { agent_id: "cypher", content: "x", salience: "normal" });
+    expect(prepared.some(s => /INSERT INTO wm_archive_notes/i.test(s)), "overflow is digested to archive").toBe(true);
+    expect(prepared.some(s => /DELETE FROM wm_continuity_notes WHERE note_id IN/i.test(s)), "overflow rows deleted by id").toBe(true);
+  });
+
+  it("always INSERTs the new note (under or over cap)", async () => {
+    for (const n of [34, 150]) {
+      const { env, prepared } = capEnv(n);
+      await addNote(env, { agent_id: "cypher", content: "x", salience: "high" });
+      expect(prepared.some(s => /INSERT INTO wm_continuity_notes/i.test(s))).toBe(true);
+    }
+  });
+});

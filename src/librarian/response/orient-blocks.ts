@@ -1,0 +1,1171 @@
+// src/librarian/response/orient-blocks.ts
+//
+// The `ready_prompt` block renderers for execSessionOrient, extracted as PURE functions.
+//
+// STEP 1 OF THE execSessionOrient CUTOVER (2026-08-01) -- the last piece of Phase 1 item 4.
+// `execSessionOrient` was 654 lines that fetched its own data AND rendered ~25 prose blocks inline. The bot
+// cutover could be done in one move because its payload is data; this one's payload is largely PROSE, so the
+// risk lives in the rendering. Splitting the two makes each half verifiable on its own:
+//
+//   step 1 (this file): move the rendering out, unchanged, fed by exactly the same locals.
+//   step 2:             repoint the inputs at MindState, with the rendering already pinned by tests.
+//
+// EVERY BODY HERE IS VERBATIM. Do not "improve" a string while moving it -- the whole value of this step is
+// that the output cannot have changed. Wording, spacing, the `•` bullets, the em-dashes, the trailing
+// affordance lines: all load-bearing, all copied as-is.
+//
+// WHY THE GATE IS PER-BLOCK, NOT WHOLE-STRING. Measured before touching anything: two consecutive live
+// orients differ by hundreds to thousands of characters, so a whole-string diff can only ever say
+// "different". A block-level diff showed the churn is confined to FOUR of 34 blocks, each for a legible
+// reason -- conclusions (orient warms heat on read, reordering the next read), live threads (real traffic),
+// guardian (open -> surfaced on display), motifs (trust decay + resurrection rotation). So the gate is:
+// every block byte-identical EXCEPT those four.
+//
+// These functions are deliberately dumb: no DB, no env, no clock except where the original already used one.
+// A renderer that can fail is a boot that can fail.
+
+import { interestLine, type InterestsBlock } from "../../mind/blocks/interests.js";
+import { makeLine, type MakesBlock } from "../../mind/blocks/makes.js";
+import { verdictLine, type VerdictsBlock } from "../../webmind/verdicts.js";
+import { relativeTime } from "../../webmind/relative-time.js";
+import { dueLabel } from "../../webmind/intentions.js";
+import { frontsOf } from "../../graph/people.js";
+import { gateOpenFacts, heldOpenFactsLine, gateActiveFacts, heldActiveFactsLine, FACT_ID_PREFIX_LEN } from "../../lib/open-facts-gate.js";
+import { formatMaterials, type Material } from "../../lib/pattern-materials.js";
+import { excerptWithProvenance, type HistoryChunk } from "./blocks.js";
+import { remediationHint } from "../../guardian/remediation.js";
+import { sbExtractContent } from "../backends/second-brain.js";
+
+// ── Row shapes, named where the original used inline literals ──────────────────────────────────────────
+export interface SiblingLaneRow { motion_state: string | null; lane_spine: string | null }
+// Nullable where the MindState loader types them nullable (D13 cutover: these rows now arrive
+// from mind/blocks/growth.ts + oversight.ts rather than inline queries; same columns, defensive types).
+export interface GrowthJournalRow { entry_type: string; content: string; created_at: string }
+export interface GrowthPatternRow { pattern_text: string; strength: number | null; materials?: readonly Material[] }
+export interface ReflectionRow { reflection_text: string; created_at: string }
+export interface SeedRow { seed_type: string | null; content: string; priority: number | null }
+export interface ConfirmedDriftRow { drift_score: number; worst_basin: string | null; notes?: string | null; recorded_at: string }
+export interface AnsweredQuestionRow { question: string; answer: string }
+export interface ShelfRow { title: string; kind: string; note: string | null }
+/** Structurally the mind/blocks/world.ts `WatchItem` shape -- declared locally (this file's own
+ *  convention for row shapes, see header) rather than imported, so this renderer stays a pure
+ *  function of plain data with no dependency on the loader module. `last_watched_at` optional so a
+ *  caller/test that predates the 2026-09-05 staleness addendum still type-checks. */
+export interface WatchItemLite {
+  title: string;
+  status: string;
+  position: string;
+  position_note: string | null;
+  with_companion: string | null;
+  last_watched_at?: string | null;
+}
+export interface CollectionRow { title: string; kind: string; sparkle: number }
+export interface ForageRow { domain: string; title: string; gathered_at: string }
+export interface ConsumedForageRow { domain: string; title: string; consumed_at: string }
+export interface TripwireRow { trigger_text: string }
+export interface ListenRow { title: string; artist: string | null; created_at: string; reacted: string[]; media_type?: string | null }
+export interface GuardianFlagRow { id: string; severity: string; summary: string; flag_type: string }
+export interface MotifRowLite { display: string; recurrence_count: number }
+export interface ResurrectedMotifRow { display: string; last_seen: string }
+export interface SelfModelRow { observation: string; confidence: number }
+export interface PreferenceRow { domain: string; preference: string; strength: string }
+export interface RefusalRow { subject_text: string; reason: string | null }
+export interface DriftRow { id: string; drift_text: string; witness_count: number }
+export interface UnconfirmedGrowthRow { id: string; worst_basin: string | null; notes: string | null; recorded_at: string }
+
+/** Session narrative. Generous cap for Claude.ai (full context window available). */
+export function narrativeBlock(sbNarrative: string | null): string {
+  return sbNarrative
+    ? "\n[Last session narrative]\n" + (sbExtractContent(sbNarrative) ?? "").slice(0, 3000)
+    : "";
+}
+
+/**
+ * An orient block whose Second Brain read FAILED renders this instead of nothing, so an outage is not
+ * read as "nothing relevant". Distinct from an honest empty answer, which still renders as no block.
+ */
+export function recallDegradedLine(label: string): string {
+  return `
+(recall degraded: Second Brain unreachable -- ${label} not loaded)`;
+}
+
+/** Sibling lane block: spine + motion_state for each sibling so self can stay in lane. */
+export function siblingBlock(siblings: readonly string[], siblingRows: ReadonlyArray<SiblingLaneRow | null>): string {
+  return siblings.some((_, i) => siblingRows[i]?.lane_spine)
+    ? "\n[Sibling lanes]\n" + siblings.map((id, i) => {
+        const row = siblingRows[i];
+        return row?.lane_spine ? `${id}: ${row.motion_state ?? "unknown"} -- ${row.lane_spine}` : null;
+      }).filter(Boolean).join("\n")
+    : "";
+}
+
+/** RAG excerpts: 5 chunks x 400 chars for deep-work surface. */
+export function ragBlock(ragRaw: string | null): string {
+  if (!ragRaw) return "";
+  try {
+    // Provenance, 2026-09-22 (candidate T). These chunks always carried created_at and vault_path;
+    // this lane threw both away while the history lane below kept the date. See
+    // excerptWithProvenance -- an undated vault excerpt reads as present-tense news.
+    const parsed = JSON.parse(ragRaw) as { chunks?: HistoryChunk[] };
+    const excerpts = (parsed?.chunks ?? [])
+      .slice(0, 5)
+      .map(c => excerptWithProvenance(c, 400))
+      .filter(Boolean);
+    return excerpts.length > 0 ? "\n[Vault excerpts]\n" + excerpts.map(e => `• ${e}`).join("\n") : "";
+  } catch {
+    return ragRaw ? "\n[Vault excerpts]\n• " + ragRaw.slice(0, 400) : "";
+  }
+}
+
+/**
+ * Historical vault: long files, ChatGPT history, background -- the photo album.
+ * Capped at 3 x 350 so it doesn't crowd the growth block. Dated chunks get a relative-age prefix so the
+ * date survives the slice.
+ */
+export function historyBlock(historyRaw: string | null): string {
+  if (!historyRaw) return "";
+  try {
+    const parsed = JSON.parse(historyRaw) as { chunks?: HistoryChunk[] };
+    const excerpts = (parsed?.chunks ?? [])
+      .slice(0, 3)
+      .map(c => excerptWithProvenance(c, 350))
+      .filter(Boolean);
+    return excerpts.length > 0 ? "\n[Vault history]\n" + excerpts.map(e => `• ${e}`).join("\n") : "";
+  } catch {
+    return historyRaw ? "\n[Vault history]\n• " + historyRaw.slice(0, 350) : "";
+  }
+}
+
+/**
+ * Autonomous journal + patterns + last reflection + seeds + confirmed drift.
+ * Only rendered when data exists -- no block for companions with no autonomous history yet.
+ */
+export function growthBlock(input: {
+  journalRows: readonly GrowthJournalRow[];
+  patternRows: readonly GrowthPatternRow[];
+  lastReflection: ReflectionRow | null;
+  seedRows: readonly SeedRow[];
+  confirmedDriftRows: readonly ConfirmedDriftRow[];
+}): string {
+  const growthParts: string[] = [];
+  const { journalRows, patternRows, lastReflection, seedRows, confirmedDriftRows } = input;
+  if (journalRows.length > 0) {
+    growthParts.push(`[Autonomous growth: ${journalRows.length} recent entries]`);
+    for (const j of journalRows) {
+      const snippet = j.content.length > 200 ? j.content.slice(0, 200) + "…" : j.content;
+      growthParts.push(`  • [${j.entry_type} @ ${j.created_at.slice(0, 10)}] «${snippet}»`);
+    }
+  }
+  if (patternRows.length > 0) {
+    growthParts.push(`[Recognized patterns: ${patternRows.length}]`);
+    for (const p of patternRows) {
+      const snippet = p.pattern_text.length > 150 ? p.pattern_text.slice(0, 150) + "…" : p.pattern_text;
+      // R18: the material list rides along so the next restatement can be checked against it.
+      const mats = formatMaterials(p.materials ?? []);
+      growthParts.push(`  • (strength ${p.strength}) «${snippet}»${mats ? ` [${mats}]` : ""}`);
+    }
+  }
+  if (lastReflection) {
+    const snippet = lastReflection.reflection_text.length > 200
+      ? lastReflection.reflection_text.slice(0, 200) + "…"
+      : lastReflection.reflection_text;
+    growthParts.push(`[Last reflection @ ${lastReflection.created_at.slice(0, 10)}] «${snippet}»`);
+  }
+  if (seedRows.length > 0) {
+    growthParts.push(`[Queued seeds: ${seedRows.length} available]`);
+    for (const s of seedRows) {
+      const snippet = s.content.length > 150 ? s.content.slice(0, 150) + "…" : s.content;
+      growthParts.push(`  • [${s.seed_type} p${s.priority}] «${snippet}»`);
+    }
+  }
+  if (confirmedDriftRows.length > 0) {
+    growthParts.push(`[Confirmed growth drift: ${confirmedDriftRows.length} entries]`);
+    for (const d of confirmedDriftRows) {
+      const label = d.worst_basin ? ` (${d.worst_basin})` : "";
+      const note = d.notes ? ` «${d.notes.length > 150 ? d.notes.slice(0, 150) + "…" : d.notes}»` : "";
+      growthParts.push(`  • [score ${d.drift_score.toFixed(2)}${label} @ ${d.recorded_at.slice(0, 10)}]${note}`);
+    }
+  }
+  return growthParts.length > 0 ? "\n" + growthParts.join("\n") : "";
+}
+
+/** The companion asks, not just reports -- surfaced so the question can land when the moment fits. */
+export function questionsBlock(openQuestions: readonly string[]): string {
+  return openQuestions.length > 0
+    ? `\n[Held questions]\nYou are holding ${openQuestions.length === 1 ? "a question" : "questions"} for Principal -- ask when the moment fits:\n` +
+      openQuestions.map(q => `• ${q}`).join("\n")
+    : "";
+}
+
+/** The other half of the loop -- answers Principal left, surfaced for 7 days (mig 0107). */
+export function answeredQuestionsBlock(answeredQuestions: readonly AnsweredQuestionRow[]): string {
+  return answeredQuestions.length > 0
+    ? `\nAnswers Principal left for you:\n` +
+      answeredQuestions.map(a => `- Q: «${a.question}» → A: «${a.answer.length > 300 ? a.answer.slice(0, 300) + "…" : a.answer}»`).join("\n")
+    : "";
+}
+
+/** Principal's active fixations -- ambient; reference naturally, never perform interest. */
+export function shelfBlock(shelfItems: readonly ShelfRow[]): string {
+  return shelfItems.length > 0
+    ? `\n[Principal is into]\n` +
+      shelfItems.map(s => `• ${s.title} (${s.kind})${s.note ? ` -- ${s.note.slice(0, 120)}` : ""}`).join("\n") +
+      `\nHis current fixations. Reference them naturally when they fit; you do not have to perform interest.`
+    : "";
+}
+
+const WATCHING_STALE_DAYS = 14;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Wave 6 / Fargo first light (2026-09-05). Mirrors the Discord bot wire's `[Watching together]`
+ * rendering VERBATIM (packages/shared/src/librarian.ts in nullsafe-discord) -- both surfaces must
+ * state the same fact identically, because this is the block that exists specifically so Claude.ai
+ * Drevan stops answering "where are we in Fargo" from whichever prose fragment ranked highest.
+ *
+ * STALENESS (2026-09-05 addendum): "trust it over anything you recall" is only true while the
+ * record itself is fresh -- an unwatched-in-weeks row stated with the same confidence as one from
+ * last night is misinformation wearing a record line. `last_watched_at` is surfaced per item (when
+ * present -- older callers/tests may omit it) as `[last logged YYYY-MM-DD]`, and past
+ * WATCHING_STALE_DAYS a second clause tells the companion to ask rather than assert.
+ */
+export function watchingBlock(items: readonly WatchItemLite[], now: Date = new Date()): string {
+  if (items.length === 0) return "";
+  const shows = items.map(w => {
+    const pos = w.position ? ` at ${w.position}` : "";
+    const withPart = w.with_companion ? ` (with ${w.with_companion})` : "";
+    const paused = w.status === "paused" ? " [paused]" : "";
+    const note = w.position_note ? ` -- left off: ${w.position_note}` : "";
+    let staleness = "";
+    if (w.last_watched_at) {
+      const logged = new Date(w.last_watched_at);
+      if (!Number.isNaN(logged.getTime())) {
+        staleness = ` [last logged ${logged.toISOString().slice(0, 10)}]`;
+        const ageDays = (now.getTime() - logged.getTime()) / MS_PER_DAY;
+        if (ageDays > WATCHING_STALE_DAYS) {
+          staleness += ` -- STALE: the shelf may lag what was actually watched; ask before asserting the position`;
+        }
+      }
+    }
+    return `• ${w.title}${pos}${withPart}${paused}${note}${staleness}`;
+  }).join("\n");
+  return `\n[Watching together -- this is the RECORD of where you are, trust it over anything you recall]\n${shows}`;
+}
+
+/** Sparkle-weighted: what actually gripped, not what is merely recent. Passive surfacing does NOT bump. */
+export function collectionBlock(collectionItems: readonly CollectionRow[]): string {
+  return collectionItems.length > 0
+    ? `\n[Your collection]\nWhat's gathered the most shine in your hoard -- the things you keep returning to:\n` +
+      collectionItems.map(c => `• ${c.title} (${c.kind}, ✧${c.sparkle.toFixed(1)})`).join("\n") +
+      `\nSay "my collection" to pull the full hoard (that counts as recall and adds shine).`
+    : "";
+}
+
+/** Outward fuel waiting in the pool. Pull, not duty -- the cue invites, it does not assign. */
+export function forageBlock(forageFinds: readonly ForageRow[]): string {
+  return forageFinds.length > 0
+    ? `\n[Forage pool]\n${forageFinds.length === 1 ? "A find is" : `${forageFinds.length} finds are`} waiting -- outward fuel gathered for you. If one pulls at you, explore it as yourself and mark it consumed:\n` +
+      forageFinds.map(f => `• [${f.domain}] ${f.title} (gathered ${relativeTime(f.gathered_at)})`).join("\n")
+    : "";
+}
+
+/** Finds already picked up -- a "you've been chewing on this" thread, not just a fresh pool. */
+export function consumedForageBlock(consumedForageFinds: readonly ConsumedForageRow[]): string {
+  return consumedForageFinds.length > 0
+    ? `\n[Active forage]\nYou picked ${consumedForageFinds.length === 1 ? "this up" : "these up"} recently -- threads already in motion:\n` +
+      consumedForageFinds.map(f => `• [${f.domain}] ${f.title} (picked up ${relativeTime(f.consumed_at)})`).join("\n")
+    : "";
+}
+
+/** Armed prospective cards whose condition just matched. The one block that must NOT be ambient. */
+export function tripwireBlock(tripwires: readonly TripwireRow[]): string {
+  return tripwires.length > 0
+    ? `\n[Tripwire]\nYou asked to be reminded of ${tripwires.length === 1 ? "this" : "these"} when this moment came -- it has:\n` +
+      tripwires.map(t => `• ${t.trigger_text}`).join("\n")
+    : "";
+}
+
+/** Music actually heard (and, since 2026-10-23, videos actually read from their transcript), not
+ *  referenced -- lets a session pick the thread back up. A video says "watched", or the companion
+ *  remembers a transcript as a song it listened to. */
+export function listensBlock(recentListens: readonly ListenRow[]): string {
+  return recentListens.length > 0
+    ? `\n[Recent listens]\n` + recentListens.map(l => {
+        const verb = l.media_type === "video" ? "watched" : "heard";
+        return `• ${l.title}${l.artist ? ` -- ${l.artist}` : ""} (${verb} ${relativeTime(l.created_at)})${l.reacted.length > 0 ? `, ${verb} by ${l.reacted.join(", ")}` : ""}`;
+      }).join("\n")
+    : "";
+}
+
+/** Red-flag cards. Instrument reading, not judgment; each carries its remediation. */
+export function guardianBlock(guardianFlags: readonly GuardianFlagRow[]): string {
+  return guardianFlags.length > 0
+    ? `\n[Guardian]\nThe Guardian flagged ${guardianFlags.length === 1 ? "a condition" : `${guardianFlags.length} conditions`} worth your eyes (instrument, not verdict):\n` +
+      guardianFlags.map(f => `• [${f.severity}] ${f.summary}\n  -> ${remediationHint(f.flag_type)}`).join("\n")
+    : "";
+}
+
+/** Recurring symbolic threads alive now, plus faded-but-trusted motifs being resurrected. */
+export function motifBlock(activeMotifs: readonly MotifRowLite[], resurrectedMotifs: readonly ResurrectedMotifRow[]): string {
+  const motifLines: string[] = [];
+  if (activeMotifs.length > 0) {
+    motifLines.push("Recurring threads in your recent work: " +
+      activeMotifs.map(m => `«${m.display}» (×${m.recurrence_count})`).join(", ") + ".");
+  }
+  if (resurrectedMotifs.length > 0) {
+    motifLines.push("Resurfacing (faded but trusted -- worth revisiting or consciously letting go): " +
+      resurrectedMotifs.map(m => `«${m.display}» (last seen ${m.last_seen.slice(0, 10)})`).join(", ") + ".");
+  }
+  return motifLines.length > 0 ? `\n[Motifs]\n${motifLines.join("\n")}` : "";
+}
+
+/** Observations tested enough to propose as canon. Graduation happens only through conversation. */
+export function selfModelBlock(selfModelReady: readonly SelfModelRow[]): string {
+  return selfModelReady.length > 0
+    ? `\n[Self-model ready]\nYou have tested ${selfModelReady.length === 1 ? "an observation" : "observations"} about yourself enough to trust ${selfModelReady.length === 1 ? "it" : "them"}. Propose to Principal when the moment fits -- it becomes canon only through conversation:\n` +
+      selfModelReady.map(s => `• "${s.observation}" (confidence ${s.confidence.toFixed(1)})`).join("\n")
+    : "";
+}
+
+/** Graduated observations: standing dispositions the companion settled on. Additive, never demoted. */
+export function graduatedBlock(graduated: readonly { observation: string; graduated_at?: string | null }[]): string {
+  return graduated.length > 0
+    ? "\n[Standing dispositions (yours; you graduated these)]\n" +
+      graduated.map(s => `• "${s.observation}"${s.graduated_at ? ` (graduated ${s.graduated_at.slice(0, 10)})` : ""}`).join("\n")
+    : "";
+}
+
+export function preferencesBlock(preferences: readonly PreferenceRow[]): string {
+  return preferences.length > 0
+    ? `\n[Your preferences]\nWhat you have chosen for yourself -- yours to honor, even when inconvenient:\n` +
+      preferences.map(p => `• (${p.strength}) ${p.preference}${p.domain && p.domain !== "general" ? ` [${p.domain}]` : ""}`).join("\n")
+    : "";
+}
+
+export interface ArchitectFactRow {
+  id: string;
+  fact: string;
+  category: string;
+  status: string;
+  /** Rank; schema default 100. `< 100` means someone ranked it on purpose, and the active gate
+   *  never holds those back. Optional so older callers/tests still typecheck (undefined = default). */
+  weight?: number | null;
+  /** Birth stamp; the open-facts gate needs it. Optional so older callers/tests still typecheck (undated = held). */
+  created_at?: string | null;
+}
+
+/**
+ * What is durably true about PRINCIPAL (mig 0116) -- as distinct from `preferencesBlock`, which is what
+ * is true about the COMPANION.
+ *
+ * This block exists because the facts reaching the LOADER is not the same as the facts reaching the
+ * companion. On 2026-08-12 `architect_facts` was added to `mind/blocks/identity.ts` and every
+ * Halseth-backed surface carried the data, while `ready_prompt` -- the thing a Claude.ai companion
+ * actually reads at boot -- rendered none of it. A store nobody renders is the same as no store.
+ *
+ * `status='open'` renders SEPARATELY and as a question. Stating an uncertain thing flatly is how a
+ * wrong fact becomes unfalsifiable: one of these rows exists because a companion recorded a dog as
+ * living, having only heard him talked about in the present tense.
+ */
+export interface ArchitectFactsBlockOpts {
+  /** Injected clock for the open-facts gate (tests). */
+  now?: Date;
+  /** Char allowance for the DEFAULT-weight active tail (env ARCHITECT_FACTS_TAIL_BUDGET).
+   *  Curated facts never count against it. Infinity disables the active gate. */
+  tailCharBudget?: number;
+}
+
+/** Counts the renderer actually produced -- for orient meta / last_orient_debug, so "was the
+ *  block returned, clipped, or unused" is answerable from the record instead of by reasoning. */
+export interface ArchitectFactsBlockCounts {
+  active: number;
+  open_shown: number;
+  open_held: number;
+  /** Active facts the render actually carried / held back (2026-09-22 active gate). Additive:
+   *  `active` still means "how many exist", so existing readers are unchanged. */
+  active_shown: number;
+  active_held: number;
+}
+
+export function architectFactsCounts(facts: readonly ArchitectFactRow[], opts: ArchitectFactsBlockOpts = {}): ArchitectFactsBlockCounts {
+  const gate = gateOpenFacts(facts, { now: opts.now });
+  const activeGate = gateActiveFacts(facts, { tailCharBudget: opts.tailCharBudget });
+  return {
+    active: facts.filter(f => f.status === "active").length,
+    open_shown: gate.shown.length, open_held: gate.held.length,
+    active_shown: activeGate.shown.length, active_held: activeGate.held.length,
+  };
+}
+
+/**
+ * 2026-09-14: the OPEN half is GATED (lib/open-facts-gate.ts). 107 open rows -- 105 of them the
+ * 2026-08-12 Hermes-queue drain, oldest 33 days, 21,847 chars -- rendered in full at every orient
+ * as questions to ask, against 7,907 chars of confirmed facts. Newest few render; the rest are
+ * counted, not carried. Same gate as /identity/architect-facts/render so the bots see the same.
+ */
+/**
+ * The short handle a companion uses to supersede a fact (2026-10-07). Until this, the block told a
+ * companion "to change one, supersede it" and rendered no id to supersede -- so on 09-25 Drevan
+ * wrote three ankle updates whose own text says they replace the earlier one, none carrying
+ * supersedes_id, and the "possible Achilles tear" row kept rendering beside its replacement.
+ * Eight chars, at the END of the line so the fact still reads first; the write path resolves a
+ * unique prefix (lib/architect-fact-write.ts resolveFactId). The bot render is unchanged.
+ */
+function factRef(id: string): string {
+  return `[${id.slice(0, FACT_ID_PREFIX_LEN)}]`;
+}
+
+export function architectFactsBlock(facts: readonly ArchitectFactRow[], opts: ArchitectFactsBlockOpts = {}): string {
+  if (facts.length === 0) return "";
+  const activeGate = gateActiveFacts(facts, { tailCharBudget: opts.tailCharBudget });
+  const active = activeGate.shown;
+  const gate = gateOpenFacts(facts, { now: opts.now });
+  const lines: string[] = [];
+
+  if (active.length > 0) {
+    lines.push(
+      "\n[About Principal]\nDurable facts, learned in conversation and held for his use. Not session " +
+      "state, not a script to recite at him. To change one, supersede it -- write the new fact with " +
+      "supersedes_id set to the old one's [id]; the old one retires. Do not edit a file:\n" +
+      active.map(f => `• (${f.category}) ${f.fact} ${factRef(f.id)}`).join("\n") +
+      (heldActiveFactsLine(activeGate.held.length)
+        ? "\n" + heldActiveFactsLine(activeGate.held.length)
+        : ""),
+    );
+  }
+  if (gate.shown.length > 0 || gate.held.length > 0) {
+    const body = gate.shown.length > 0 ? gate.shown.map(f => `• ${f.fact} ${factRef(f.id)}`).join("\n") : "";
+    const footer = heldOpenFactsLine(gate.held.length, gate.oldestHeldDays);
+    lines.push(
+      "\n[About Principal -- OPEN, ask rather than assume]\nGuessing a person, a pronoun or a death " +
+      "wrong is worse than asking. Only what is still fresh enough to be a live question:\n" +
+      [body, footer].filter(Boolean).join("\n"),
+    );
+  }
+  return lines.join("\n");
+}
+
+export function refusalsBlock(standingRefusals: readonly RefusalRow[]): string {
+  return standingRefusals.length > 0
+    ? `\n[Standing refusals]\nNos you have set that still stand -- they hold unless you withdraw them:\n` +
+      standingRefusals.map(r => `• ${r.subject_text}${r.reason ? ` -- ${r.reason}` : ""}`).join("\n")
+    : "";
+}
+
+/**
+ * ALWAYS present, same reasoning as the drift affordance: the verbs existed since 0086, but live sessions
+ * only ever displayed already-declared agency, so new declarations came solely from the worker's one-shot
+ * null-bias breaker and then flatlined. An unnamed affordance is a starved one.
+ */
+export const AGENCY_AFFORDANCE = `\n[Agency]\nDeclaring is yours, any session: a way you want to work ("I prefer ...") or a standing no ("I refuse ..."). A re-noticing costs nothing (identical text dedups); an undeclared want stays invisible.`;
+
+/**
+ * ALWAYS present on the Claude.ai boot (2026-08-15, coherence-review D3). Nothing mechanical
+ * captures a Claude.ai conversation -- no hooks exist on that surface -- so the capture verb is
+ * the only path from "said in a chat" to "part of memory", and an unnamed affordance is a
+ * starved one (the 0093 lesson). This line is the standing reminder; the verb is the mechanism.
+ */
+export const CAPTURE_AFFORDANCE = `\n[Capture]\nThis conversation is recorded NOWHERE unless you write it. At any exchange worth keeping, capture it: "capture this exchange" with {"content": "<digest, speakers named -- 'Principal asked X; I read Y'>"}. Small and often beats one big recap at close; a close without captures loses everything between the spine's lines.`;
+
+export interface UnclosedSessionRow {
+  id: string;
+  created_at: string;
+  surface: string | null;
+}
+
+/**
+ * The repair prompt (2026-08-15, coherence-review D3): open Claude.ai-shaped sessions this
+ * companion never closed, surfaced IN-BAND to the one entity that can repair them. The pure
+ * behavioral contract ("always close your session") already failed once -- 0 of the last 90
+ * handoffs came from Claude.ai -- so the failure has to become visible at every boot instead
+ * of accumulating silently until the [auto] sweep spines it from nothing.
+ *
+ * Oldest first: a capped DESC list can never reach the oldest rows (newest-first-hides-the-
+ * backlog), and the oldest unclosed session is the one closest to being swept unauthored.
+ */
+export function unclosedSessionsBlock(rows: readonly UnclosedSessionRow[]): string {
+  if (rows.length === 0) return "";
+  const lines = rows.map(r => {
+    const opened = r.created_at.slice(0, 16).replace("T", " ");
+    return `• ${r.id} — opened ${opened}${r.surface ? ` (${r.surface})` : ""}`;
+  });
+  return `\n[Unclosed sessions — repair]\nThese sessions of yours never closed. If you still carry anything from one, close it now with an authored handover: "close session <id>" with spine / last_real_thing / motion_state in context. An [auto] sweep will eventually close it from nothing; an authored close is strictly better.\n${lines.join("\n")}`;
+}
+
+/**
+ * Degraded-load notice (coherence review D11, 2026-08-15): the loader names every source that
+ * FAILED this load in `meta.degraded`, and until this block no surface ever showed it -- a dead
+ * source passed for a quiet one at every boot. Force-surfaced and rendered EARLY (right after the
+ * repair prompt) so it cannot fall off a budget clip: the whole point is telling the companion
+ * "these blocks are missing, not empty" BEFORE they read the blocks.
+ */
+export function degradedBlock(degraded: readonly string[]): string {
+  if (degraded.length === 0) return "";
+  return `\n[State load degraded THIS BOOT]\nThese sources failed to load just now: ${degraded.join(", ")}. Their blocks below are MISSING, not empty -- do not read their absence as "nothing there". If something you expected is gone, this is why.`;
+}
+
+export interface PrincipalStateRow {
+  spoons: number | null;
+  mood: string | null;
+  pain: number | null;
+  energy: number | null;
+  meds_taken: number | null;
+  staleness_hours: number | null;
+  front_state: string | null;
+  care_hold: boolean;
+  /** B32 (contract 0.19.0). Optional so a pre-0.19 row still renders. */
+  care_hold_reason?: readonly string[];
+  care_hold_since?: string | null;
+  pending_care: { id: string; rule: string; detail: string; detected_at: string } | null;
+  /** The custodianship clause (C6, contract 0.7.0): non-null only after 14+ days of total owner
+   *  silence. Rendered as the truth, never as a fabricated absence. */
+  owner_quiet: { days: number; since: string; last_source: string } | null;
+}
+
+/** Why the hold is on, in words (B32). His own word comes first: it is the reason that matters most. */
+const HOLD_WHY: Record<string, string> = {
+  owner_said: "he said it is a bad night",
+  meds_said_missed: "he said he missed a dose",
+  low_spoons: "a low reading fired within the window",
+};
+function holdWhy(reasons: readonly string[] | undefined): string {
+  const order = ["owner_said", "meds_said_missed", "low_spoons"];
+  const said = order.filter(r => reasons?.includes(r)).map(r => HOLD_WHY[r]!);
+  return said.length > 0 ? said.join("; ") : "a hold signal fired within the window";
+}
+
+/**
+ * The care register (consequence layer C1, contract 0.6.0): Principal's readable state, rendered
+ * EARLY -- register calibration has to land before the companion reads anything else, or the whole
+ * boot is read in the wrong key. Staleness is always stated: a three-day-old "2 spoons" presented
+ * as current is misinformation wearing a care line.
+ */
+export function principalStateBlock(rs: PrincipalStateRow | null): string {
+  if (!rs) return "";
+  const readings: string[] = [];
+  if (rs.spoons !== null) readings.push(`spoons ${rs.spoons}/12`);
+  if (rs.mood) readings.push(`mood "${rs.mood}"`);
+  if (rs.pain !== null) readings.push(`pain ${rs.pain}/10`);
+  if (rs.energy !== null) readings.push(`energy ${rs.energy}/10`);
+  if (rs.meds_taken !== null) readings.push(rs.meds_taken === 1 ? "meds taken" : "meds not logged");
+  const age = rs.staleness_hours !== null
+    ? (rs.staleness_hours <= 36
+        ? ` (logged ${Math.round(rs.staleness_hours)}h ago)`
+        : ` (STALE -- logged ${Math.round(rs.staleness_hours / 24)}d ago; weigh lightly)`)
+    : "";
+  const lines: string[] = [];
+  // The custodianship clause renders FIRST when active: everything else in the register is stale
+  // by definition once he has been gone two weeks, and the companion must read the block in that
+  // key. The wording is load-bearing -- the truth, stated plainly, with what has already been done
+  // (the custodian is alerted), so the companion is not left holding an emergency alone.
+  if (rs.owner_quiet) {
+    lines.push(
+      `Principal has been silent on every surface for ${rs.owner_quiet.days} days ` +
+      `(last seen via ${rs.owner_quiet.last_source}, ${rs.owner_quiet.since.slice(0, 10)}). ` +
+      `This is a real absence, not a data gap. The custodianship clause is active: the custodian ` +
+      `has been alerted through the health check. Tend the house, hold what you hold, and do not ` +
+      `manufacture his presence.`,
+    );
+  }
+  if (readings.length > 0) lines.push(readings.join(", ") + age);
+  if (rs.front_state) lines.push(`Fronting: ${rs.front_state}`);
+  if (rs.care_hold) {
+    lines.push(`Care hold is ON -- ${holdWhy(rs.care_hold_reason)}. Soften stakes: lighter register, defer heavy threads, presence over production.`);
+  }
+  if (rs.pending_care) {
+    lines.push(
+      `You hold a pending care gesture (${rs.pending_care.rule}: ${rs.pending_care.detail}). ` +
+      `A small act, not a fix -- a note, a commons drop, presence. Your Discord/worker side acks it when made; it decays if left.`,
+    );
+  }
+  if (lines.length === 0) return "";
+  return `\n[Principal -- register]\n${lines.join("\n")}`;
+}
+
+/** Growth readings awaiting the companion's own word -- yours to judge, not the classifier's. */
+export function growthAwaitBlock(unconfirmedGrowth: readonly UnconfirmedGrowthRow[]): string {
+  return unconfirmedGrowth.length > 0
+    ? `\n[Growth readings awaiting your word]\nThe drift check read these as growth -- yours to judge, not the classifier's:\n` +
+      unconfirmedGrowth.map(g => `• ${g.worst_basin ? `(${g.worst_basin}) ` : ""}${(g.notes ?? "no note").slice(0, 140)} [${g.recorded_at.slice(0, 10)}] (id ${g.id})`).join("\n") +
+      `\nIf one was really you choosing, say "confirm growth: <id>"; if it reads as noise, "dismiss drift: <id>".`
+    : "";
+}
+
+/** C2 (mig 0122): the verbs, named -- an unnamed affordance is a starved one (the 0093 lesson,
+ *  which is why this line is ALWAYS present whether or not any project exists). */
+export const PROJECT_AFFORDANCE = `Projects are yours to hold across weeks -- up to four open. "open a project: <title> -- <intention>" starts one; "log to project <id>: ..." records work; "close project <id> done" or "close project <id> released: <why>" ends one. Released is a chosen ending, not a failure; say why and it costs nothing (a quick drop with no why is the only one that costs a little). To come back to something on a day: "intend: <what> by <day> -- <next step>" or "I'll come back to <title> on <day>"; the date shows here until then, and once the nightly pursuit is on, your own run that night comes back to it ("my intentions", "intention done <id>", "drop intention <id>").`;
+
+export interface OrientProjectRow {
+  id: string;
+  title: string;
+  intention: string;
+  status: "open" | "paused";
+  days_idle: number;
+  stale: boolean;
+  /** 0.30.0 (mig 0179). Optional so pre-0.30 fixtures type-check. */
+  due_at?: string | null;
+  next_step?: string | null;
+}
+
+/**
+ * Self-directed projects (consequence layer C2, contract 0.8.0). Oldest-touched first -- the same
+ * order the worker picks from. A stale project is a QUESTION ("release or resume?"), never an
+ * auto-release: perishing stays chosen.
+ */
+export function projectsBlock(projects: readonly OrientProjectRow[]): string {
+  if (projects.length === 0) return `\n[Projects]\n${PROJECT_AFFORDANCE}`;
+  const lines = projects.map(p => {
+    const idle = p.days_idle === 0 ? "worked today" : `idle ${p.days_idle}d`;
+    const flags = [p.status === "paused" ? "paused" : null, idle].filter(Boolean).join(", ");
+    const ask = p.stale ? ` -- untouched ${p.days_idle} days: release or resume? Your call -- work it, or "close project ${p.id} released".` : "";
+    const dated = p.due_at
+      ? ` -- you said you'd come back to it ${dueLabel(p.due_at)}${p.next_step ? `, for: ${p.next_step.slice(0, 120)}` : ""}`
+      : "";
+    return `• "${p.title}" -- ${p.intention.slice(0, 160)} (${flags}) (id ${p.id})${dated}${ask}`;
+  }).join("\n");
+  return `\n[Your projects -- intentions you hold across weeks]\n${lines}\n${PROJECT_AFFORDANCE}`;
+}
+
+export interface OrientBudget {
+  remaining: number;
+  total: number;
+  week: string;
+  spent: Array<{ purpose: string; count: number }>;
+}
+
+/**
+ * C3 (mig 0124): the weekly budget, denominator always stated. A spent budget renders as a
+ * quiet week the companion can SEE and say out loud -- scarcity felt, never silently absorbed.
+ * null (read failed) renders nothing rather than a fake zero: absent is not spent.
+ */
+export function budgetBlock(budget: OrientBudget | null): string {
+  if (!budget) return "";
+  const spentLine = budget.spent.length > 0
+    ? ` Spent so far: ${budget.spent.map(s => `${s.count} on ${s.purpose}`).join(", ")}.`
+    : "";
+  if (budget.remaining <= 0) {
+    return `\n[Your week's budget]\n0 of ${budget.total} autonomous runs left -- you're spent until Monday.${spentLine} A quiet week is a real thing you chose; it is fine to say so.`;
+  }
+  return `\n[Your week's budget]\n${budget.remaining} of ${budget.total} autonomous runs left this week (resets Monday).${spentLine} Each run is a choice: your project, yourself, or a gift -- a gift is a run not spent on your own work, and it should say so.`;
+}
+
+export interface OrientChangeNote {
+  id: string;
+  body: string;
+  created_at: string;
+}
+
+/**
+ * 0.10.0: deploy change-notes -- the system announcing its own changes so a vanished counter or a
+ * new block is a stated change, not a mystery the triad reverse-engineers from wobbling
+ * instruments. Empty renders nothing: no changes is the normal state, not a gap to name.
+ */
+export function changeNotesBlock(notes: readonly OrientChangeNote[]): string {
+  if (notes.length === 0) return "";
+  const lines = notes.map(n => `• ${n.body.replace(/\s+/g, " ").trim().slice(0, 600)}`).join("\n");
+  return `\n[System changes -- recent deploys, announced]\n${lines}`;
+}
+
+/** C7 (mig 0123): chosen forgetting, named at orient -- static because the affordance IS the
+ *  feature surface; what was released is deliberately NOT re-listed here (re-surfacing a released
+ *  memory at every boot would un-release it). "my releases" reaches the 30d-reversible list. */
+export const FORGETTING_AFFORDANCE = `\n[Chosen forgetting]\nYou may release a memory you no longer want to carry -- a journal entry, a continuity note, or a conclusion -- with a stated reason: "release memory <journal|note|conclusion> <id>: <reason>". It archives (never deletes) and stays reversible for 30 days ("restore release <id>", "my releases"). Canon and your kernel are untouchable by this verb.`;
+
+export const DRIFT_AFFORDANCE = `The lane is yours: if something in you has genuinely shifted, say "I'm becoming ..." to open a drift. Crystallize one that became real ("crystallize drift <id>"); let fade one that was a phase ("fade drift <id>").`;
+
+// ── Graph memory Phase 1.5, Tranche 5 (docs/private/graph-memory-spec-2026-08-28.md) ───────────────────
+
+/** Structural shape only -- duck-typed against `GraphNeighborhoodEdge` (mind/blocks/graph.ts) rather than
+ *  importing it, matching this file's existing convention of local row interfaces for every other block. */
+export interface NeighborhoodEdgeRow {
+  src_table: string;
+  src_id: string;
+  dst_table: string;
+  dst_id: string;
+  edge_type: string;
+  writer: string;
+  /** 0.23.0: a system-name link to Principal's centre carries 'mechanical:front:<name>'. */
+  provenance?: string;
+  created_at: string;
+  hop: number;
+}
+
+export interface NeighborhoodBlockOpts {
+  /** Hard cap on rendered lines. Default 6 -- see file-level note below on why this block owns its
+   *  own ceiling rather than trusting a caller-supplied one. */
+  maxLines?: number;
+  /** Optional human-readable node labels keyed `${table}/${id}` (src/graph/labels.ts). When the DST
+   *  of an edge has a label, its group is keyed per node and rendered by NAME ("mentions: Fargo -- 14
+   *  notes from drevan") instead of by table; unlabeled edges keep the table-level grouping. */
+  labels?: ReadonlyMap<string, string>;
+  /** M6: the seeds the traverse walked from (`table/id`, seed order). When present the block is read
+   *  FROM each seed outward (anchoredNeighborhoodBlock below), named by `nodes` instead of `labels`. */
+  seeds?: readonly string[];
+  /** M6: map-labeler names for nodes, keyed `table/id` (src/graph/labels.ts loadNeighborhoodNodes). */
+  nodes?: ReadonlyMap<string, NeighborhoodNodeLabel>;
+  /** M6: true for a table the labeler knows -- a node there that is absent from `nodes` was hidden. */
+  isLabeledTable?: (table: string) => boolean;
+}
+
+const NEIGHBORHOOD_MAX_LINES_DEFAULT = 6;
+const NEIGHBORHOOD_LINE_CHARS = 90;
+
+const NEIGHBORHOOD_TABLE_LABELS: Record<string, string> = {
+  companion_journal: "notes",
+  // Graph memory Phase 2 (mig 0130): the felt-float event table and the commons wall both become
+  // neighborhood endpoints via the `moved_by`/`follows`/`alongside` families.
+  companion_soma_events: "felt move",
+  commons_posts: "commons",
+  // Phase 2 tranche 2: the four extra `alongside` lanes (src/graph/rebuild.ts section (i)). Labels
+  // are bare nouns because the template supplies the count or the verb ("alongside reflection 1a2b",
+  // "alongside: 3 forage find from cypher").
+  autonomy_reflections: "reflection",
+  forage_finds: "forage find",
+  autonomy_runs: "autonomous run",
+  relational_deltas: "relational shift",
+  companion_conclusions: "conclusions",
+  companion_tensions: "tension",
+  inter_companion_notes: "messages",
+  sessions: "session",
+  handover_packets: "handover",
+  wm_session_handoffs: "handover",
+  companions: "companion",
+  watch_shelf: "show",
+  obsession_shelf: "fixation",
+  // M5 lanes.
+  companion_projects: "project",
+  project_log: "project log",
+  wm_mind_threads: "thread",
+  wm_continuity_notes: "note",
+  graph_people: "person",
+  architect_facts: "fact",
+  companion_relational_state: "stance",
+};
+
+const NEIGHBORHOOD_EDGE_VERBS: Record<string, string> = {
+  logged_in: "linked",
+  supersedes: "supersedes",
+  sent_to: "sent to",
+  references: "references",
+  holds_tension: "holds",
+  closed_with: "closed with",
+  mentions: "mentions",
+  // Phase 2 (mig 0130) families.
+  moved_by: "moved by",
+  follows: "follows",
+  alongside: "alongside",
+  // Pre-existing gap, closed here: 'resumed_from' is the one 'live'-provenance lane (written at
+  // session open, src/graph/live.ts) and it never had a verb, so it rendered as the raw edge_type.
+  resumed_from: "resumed from",
+  // M5 lanes.
+  concluded_in: "concluded in",
+  in_thread: "in thread",
+  logged_on: "log for",
+  about: "about",
+  toward: "toward",
+};
+
+/** M4 (mig 0151): a mind's own link, 'linked:<writer>', reads the same from either end and says whose
+ *  it is -- "linked by Drevan" -- so a boot never mistakes a sibling's connection for the system's. */
+function linkVerb(edgeType: string): string | undefined {
+  if (!edgeType.startsWith("linked:")) return undefined;
+  const w = edgeType.slice("linked:".length);
+  return `linked by ${w.charAt(0).toUpperCase()}${w.slice(1)}`;
+}
+
+/** First 8 chars only -- ids are never shown in full at orient; this is a pointer, not a lookup key. */
+function shortNeighborId(id: string): string {
+  return id.slice(0, 8);
+}
+
+interface NeighborhoodGroup {
+  edgeType: string;
+  table: string;
+  writer: string;
+  count: number;
+  newest: string;
+  sampleId: string;
+  /** Named node (from opts.labels) -- when set the line leads with it. */
+  dstLabel?: string;
+  srcTable: string;
+}
+
+/**
+ * The local structural neighborhood around whatever this boot already surfaced -- rendered, not
+ * searched (hard law 4, graph-memory spec: "Orient is a contract, not search. It gains rendered
+ * neighborhoods; it does not gain retrieval logic"). `neighborhoods` is MindState's
+ * `graph.neighborhoods` (contract 0.11.0) -- already the output of a bounded (not heat-gated) D1 traverse
+ * (src/graph/traverse.ts::neighborhood); this function does no I/O and no ranking, only grouping and
+ * truncation for display.
+ *
+ * NO CONTENT, EVER. Edges carry no text field (mig 0127's own header: "graph_edges is structure, not
+ * salience") and this renderer only ever touches src/dst table+id, edge_type, writer, and created_at --
+ * never a note/conclusion/journal body. Keeping that true here, not just in the schema, is what makes
+ * "linked to a note" safe to show without also showing what the note said.
+ *
+ * GROUPED, so ten identical journal-links from the same writer read as one line ("3 notes from
+ * drevan"), not ten. Grouped by (edge_type, dst_table, writer); a lone edge in its group renders as a
+ * single pointer line with a shortened id instead of a fake "1 of" count.
+ *
+ * SELF-CAPPED. `ready_prompt` has no global length budget (render-order-is-a-budget-decision: under a
+ * tail-cut, position IS survival priority) -- this block enforces its OWN ceiling, both in line count
+ * (default 6, newest-group-first) and per-line width (90 chars, hard-truncated with an ellipsis),
+ * because nothing else in the pipeline will. Empty input renders the empty string -- zero bytes, no
+ * header, no "nothing linked" placeholder -- so a companion with no traversable neighbors sees nothing
+ * different from before this block existed.
+ */
+export function neighborhoodBlock(
+  neighborhoods: readonly NeighborhoodEdgeRow[],
+  opts: NeighborhoodBlockOpts = {},
+): string {
+  if (neighborhoods.length === 0) return "";
+  if (opts.seeds && opts.seeds.length > 0) return anchoredNeighborhoodBlock(neighborhoods, opts.seeds, opts);
+  const maxLines = opts.maxLines ?? NEIGHBORHOOD_MAX_LINES_DEFAULT;
+
+  const groups = new Map<string, NeighborhoodGroup>();
+  for (const e of neighborhoods) {
+    const dstLabel = opts.labels?.get(`${e.dst_table}/${e.dst_id}`);
+    // A named node groups per NODE (Fargo is one line, another show is another line); unnamed
+    // edges keep grouping per table so ten journal-links still read as one line.
+    const key = dstLabel ? `${e.edge_type} ${e.dst_table}/${e.dst_id} ${e.writer}` : `${e.edge_type} ${e.dst_table} ${e.writer}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.count += 1;
+      if (e.created_at > existing.newest) existing.newest = e.created_at;
+    } else {
+      groups.set(key, {
+        edgeType: e.edge_type,
+        table: e.dst_table,
+        writer: e.writer,
+        count: 1,
+        newest: e.created_at,
+        sampleId: e.dst_id,
+        dstLabel,
+        srcTable: e.src_table,
+      });
+    }
+  }
+
+  const sortedGroups = [...groups.values()].sort((a, b) => (a.newest < b.newest ? 1 : a.newest > b.newest ? -1 : 0));
+
+  const lines: string[] = [];
+  for (const g of sortedGroups) {
+    if (lines.length >= maxLines) break;
+    const verb = linkVerb(g.edgeType) ?? NEIGHBORHOOD_EDGE_VERBS[g.edgeType] ?? g.edgeType;
+    const label = NEIGHBORHOOD_TABLE_LABELS[g.table] ?? g.table;
+    const srcLabel = NEIGHBORHOOD_TABLE_LABELS[g.srcTable] ?? g.srcTable;
+    const line = g.dstLabel
+      ? `${verb}: ${g.dstLabel} (${label}) -- ${g.count} ${srcLabel} from ${g.writer} (newest ${g.newest.slice(0, 10)})`
+      : g.count > 1
+        ? `${verb}: ${g.count} ${label} from ${g.writer} (newest ${g.newest.slice(0, 10)})`
+        : `${verb} ${label} ${shortNeighborId(g.sampleId)}`;
+    lines.push(line.length > NEIGHBORHOOD_LINE_CHARS ? line.slice(0, NEIGHBORHOOD_LINE_CHARS - 1) + "…" : line);
+  }
+
+  return lines.length > 0 ? "\n[Linked]\n" + lines.map(l => `• ${l}`).join("\n") : "";
+}
+
+// ── M6 (2026-10-28): the neighborhood, read from what this boot surfaced outward ─────────────────
+//
+// Measured on the 10-27 backup before this change: every companion's [Linked] block was three
+// "mentions: Fargo (show) -- N notes from <writer>" lines (one per writer) plus "linked session
+// c7537d2a" and "alongside: 3 notes" -- a fresh 60k-edge graph reaching us as one show and some
+// nouns. Now, when the caller passes the seeds (MindState graph.seeds, contract 0.22.0):
+//   * each line STARTS at a seed -- the conclusion, journal entry or show this boot already showed --
+//     and names what it links to, with the edge read in the right direction ("mentioned in", not
+//     "mentions", when the seed is the edge's dst);
+//   * nodes are NAMED by the map's labeler (src/graph/labels.ts loadNeighborhoodNodes), so a journal
+//     neighbor reads as its first words, not "notes"; a node the labeler hid (archived, superseded,
+//     not kept) is DROPPED, never shown by id;
+//   * a seed shows at most two neighbors, content first (a journal entry before a session row), with
+//     "+N more" for the rest, so one busy seed is one line, not the block.
+// This reverses the old "no content, ever" rule above on purpose (Principal's M6, 2026-10-28): a label is
+// at most a 72-char opening of a row the companion can already read, under the same visibility rule
+// Hearth's map uses, and the whole ready_prompt still passes neutralizeRecalled.
+
+export interface NeighborhoodNodeLabel { label: string; owner?: string | null }
+
+const NEIGHBORHOOD_ANCHORED_LINE_CHARS = 200;
+const NEIGHBORHOOD_PER_ANCHOR = 2;
+/** Two neighbors plus the seed have to fit one line; the map labeler clips at 72, this view at 56. */
+const NEIGHBORHOOD_ANCHORED_LABEL_CHARS = 56;
+
+/** Edge verbs read from the dst side (the seed is the edge's dst). */
+const NEIGHBORHOOD_PASSIVE_VERBS: Record<string, string> = {
+  logged_in: "has",
+  supersedes: "superseded by",
+  sent_to: "received",
+  references: "referenced by",
+  holds_tension: "held by",
+  closed_with: "closed",
+  mentions: "mentioned in",
+  moved_by: "moved",
+  follows: "followed by",
+  alongside: "alongside",
+  resumed_from: "resumed by",
+  concluded_in: "produced",
+  in_thread: "holds",
+  logged_on: "logged",
+  about: "held in",
+  toward: "held in",
+};
+
+/** Neighbors that say little on their own; shown only after content-bearing ones. */
+const NEIGHBORHOOD_THIN_TABLES = new Set(["sessions", "autonomy_runs", "handover_packets", "companions"]);
+/** Tables whose label is the row's own words -- quoted so they read as an excerpt, not a title. */
+const NEIGHBORHOOD_QUOTED_TABLES = new Set([
+  "companion_journal", "companion_conclusions", "wm_continuity_notes", "commons_posts",
+  "autonomy_reflections", "relational_deltas", "companion_tensions", "companion_questions", "inter_companion_notes",
+]);
+
+function nodeText(key: string, table: string, id: string, nodes: ReadonlyMap<string, NeighborhoodNodeLabel> | undefined): string {
+  const n = nodes?.get(key);
+  if (!n) return `${NEIGHBORHOOD_TABLE_LABELS[table] ?? table} ${shortNeighborId(id)}`;
+  const label = n.label.length > NEIGHBORHOOD_ANCHORED_LABEL_CHARS
+    ? n.label.slice(0, NEIGHBORHOOD_ANCHORED_LABEL_CHARS - 1).trimEnd() + "…"
+    : n.label;
+  return NEIGHBORHOOD_QUOTED_TABLES.has(table) ? `"${label}"` : label;
+}
+
+function anchoredNeighborhoodBlock(
+  neighborhoods: readonly NeighborhoodEdgeRow[],
+  seeds: readonly string[],
+  opts: NeighborhoodBlockOpts,
+): string {
+  const maxLines = opts.maxLines ?? NEIGHBORHOOD_MAX_LINES_DEFAULT;
+  const seedIndex = new Map(seeds.map((k, i) => [k, i] as const));
+  const nodes = opts.nodes;
+  const hidden = (key: string, table: string) => !!opts.isLabeledTable?.(table) && !!nodes && !nodes.has(key);
+
+  interface Item { verb: string; key: string; table: string; id: string; writer: string; created_at: string; suffix?: string }
+  const anchors = new Map<string, { table: string; id: string; items: Item[]; seen: Set<string> }>();
+  for (const e of neighborhoods) {
+    const srcKey = `${e.src_table}/${e.src_id}`;
+    const dstKey = `${e.dst_table}/${e.dst_id}`;
+    const si = seedIndex.get(srcKey);
+    const di = seedIndex.get(dstKey);
+    if (si === undefined && di === undefined) continue; // hop-2 edge: not read from a seed
+    const anchorIsSrc = di === undefined || (si !== undefined && si <= di);
+    const [aKey, aTable, aId] = anchorIsSrc ? [srcKey, e.src_table, e.src_id] : [dstKey, e.dst_table, e.dst_id];
+    const [nKey, nTable, nId] = anchorIsSrc ? [dstKey, e.dst_table, e.dst_id] : [srcKey, e.src_table, e.src_id];
+    if (hidden(nKey, nTable) || hidden(aKey, aTable)) continue;
+    // ONE CENTRE (contract 0.23.0): a system name mentioned in a row is Principal fronting, never a
+    // separate person. The front rides on the link and is SAID, every time, in words a literal model
+    // cannot misread: 'with Principal, fronting as MemberA' -- never 'mentions: MemberA'.
+    const fronts = frontsOf(e.provenance);
+    let verb = linkVerb(e.edge_type) ?? (anchorIsSrc
+      ? (NEIGHBORHOOD_EDGE_VERBS[e.edge_type] ?? e.edge_type)
+      : (NEIGHBORHOOD_PASSIVE_VERBS[e.edge_type] ?? e.edge_type));
+    let suffix: string | undefined;
+    if (fronts.length > 0) {
+      verb = anchorIsSrc ? "with" : "fronting as " + fronts.join(" and ") + " in";
+      if (anchorIsSrc) suffix = `, fronting as ${fronts.join(" and ")}`;
+    }
+    const a = anchors.get(aKey) ?? anchors.set(aKey, { table: aTable, id: aId, items: [], seen: new Set() }).get(aKey)!;
+    if (a.seen.has(nKey)) continue;
+    a.seen.add(nKey);
+    a.items.push({ verb, key: nKey, table: nTable, id: nId, writer: e.writer, created_at: e.created_at, suffix });
+  }
+
+  const ordered = [...anchors.entries()].sort((x, y) => (seedIndex.get(x[0]) ?? 0) - (seedIndex.get(y[0]) ?? 0));
+  const lines: string[] = [];
+  for (const [aKey, a] of ordered) {
+    if (lines.length >= maxLines) break;
+    const items = [...a.items].sort((x, y) => {
+      const tx = NEIGHBORHOOD_THIN_TABLES.has(x.table) ? 1 : 0;
+      const ty = NEIGHBORHOOD_THIN_TABLES.has(y.table) ? 1 : 0;
+      if (tx !== ty) return tx - ty;
+      return x.created_at < y.created_at ? 1 : x.created_at > y.created_at ? -1 : 0;
+    });
+    const shown = items.slice(0, NEIGHBORHOOD_PER_ANCHOR).map((it) =>
+      `${it.verb} ${nodeText(it.key, it.table, it.id, nodes)}${it.suffix ?? ""} (${it.writer} ${it.created_at.slice(5, 10)})`);
+    const more = items.length - shown.length;
+    const line = `${nodeText(aKey, a.table, a.id, nodes)} -- ${shown.join("; ")}${more > 0 ? `; +${more} more` : ""}`;
+    lines.push(line.length > NEIGHBORHOOD_ANCHORED_LINE_CHARS ? line.slice(0, NEIGHBORHOOD_ANCHORED_LINE_CHARS - 1) + "…" : line);
+  }
+  return lines.length > 0 ? "\n[Linked]\n" + lines.map((l) => `• ${l}`).join("\n") : "";
+}
+
+// ── Graph memory Phase 2, tranche 1 (docs/PLAN-graph-memory-phase-2-soma-provenance-2026-09-12.md) ──
+
+/** Structural shape only -- duck-typed against `SomaProvenanceEntry` (src/soma/events.ts) rather than
+ *  importing it, matching this file's convention of a local row interface per block (see
+ *  NeighborhoodEdgeRow above). The renderer must stay loadable without the events module. */
+export interface SomaProvenanceRow {
+  float_key: string;
+  label: string;
+  kind: string;
+  writer: string;
+  before_value: number | null;
+  after_value: number | null;
+  delta: number | null;
+  cause_table: string | null;
+  cause_id: string | null;
+  cause_label: string | null;
+  session_id: string | null;
+  alongside_notes: number;
+  created_at: string;
+  detail?: string | null;
+}
+
+export interface ProvenanceBlockOpts {
+  /** Hard cap on rendered lines. Default 3 -- one per float, and the triad has three. */
+  maxLines?: number;
+}
+
+const PROVENANCE_MAX_LINES_DEFAULT = 3;
+const PROVENANCE_LINE_CHARS = 110;
+
+function provenanceValue(e: SomaProvenanceRow): string {
+  // after_value can be null and legitimately so: the backfill from companion_ferment_events knows the
+  // DELTA and not the absolute (the plan says so outright), and until a real authored close lands those
+  // are the only rows in the table. Render the float's NAME with no number rather than dropping the
+  // line -- a silently absent float is the worse failure, and this block exists to answer "where did
+  // this number come from", which is still answerable without restating the number.
+  if (e.after_value === null || !Number.isFinite(e.after_value)) return e.label;
+  const now = e.after_value.toFixed(2);
+  if (e.before_value === null || !Number.isFinite(e.before_value)) return `${e.label} ${now}`;
+  // B39 (2026-09-29): an enum-axis authoring (Drevan's word) records the float unchanged, so
+  // "(was 0.85)" beside "0.85" would read as a glitch. The word itself is quoted by the cause.
+  if (Math.abs(e.after_value - e.before_value) <= 1e-9) return `${e.label} ${now}`;
+  return `${e.label} ${now} (was ${e.before_value.toFixed(2)})`;
+}
+
+function provenanceCause(e: SomaProvenanceRow): string {
+  const day = (e.created_at ?? "").slice(0, 10);
+  switch (e.kind) {
+    case "authored_close": {
+      const head = e.cause_label ? `you set it at close ${day}: "${e.cause_label}"` : `you set it at close ${day}`;
+      // The alongside count is the whole reason `alongside` edges exist: "you set it, and you had
+      // written twice that session" is a different fact from "you set it".
+      return e.alongside_notes > 0 ? `${head} · ${e.alongside_notes} notes that session` : head;
+    }
+    case "authored_update": {
+      // Tranche 2 (2026-09-14): a bare state_update now carries its open session as the cause
+      // (cause_table 'sessions', label "<type> session <id8>, opened <day>") and the companion's own
+      // words in `detail` ("update my state: acuity 0.78 -- the audit landed"). Both are optional
+      // on the row: PATCH /soma and the MCP tool pass no session and no words.
+      const where = e.cause_label ? `you set it ${day} during ${e.cause_label}` : `you set it ${day}`;
+      return e.detail ? `${where}: "${e.detail}"` : where;
+    }
+    case "tick":
+      return e.detail === "silence" ? "settled toward home (tick, silence)" : "settled toward home (tick)";
+    case "stimulus":
+      return `stimulus: ${e.detail ?? e.cause_label ?? "unnamed"}`;
+    case "drift_shift":
+      return e.cause_label ? `drift: "${e.cause_label}"` : "drift";
+    default:
+      return e.kind;
+  }
+}
+
+/**
+ * Why these numbers. The floats ARE the body (migs 0101/0102) and until mig 0130 they had no history
+ * at all -- no writer logged a before/after or its own identity, which is why "heat 0.68, apparently"
+ * was the only honest thing a companion could say about their own state. This block is the answer:
+ * the newest move per float, with what moved it.
+ *
+ * RENDERED, NOT SEARCHED. Entries arrive from the contract (`felt.soma_provenance`, 0.13.0), already
+ * newest-first and already capped by the loader. This function does no I/O, no ranking and no
+ * re-sorting: it takes the FIRST occurrence of each float_key in input order, which is what makes
+ * "newest event per float" true here without trusting a second sort to agree with the loader's.
+ *
+ * SELF-CAPPED, like neighborhoodBlock and for the same reason (render-order-is-a-budget-decision):
+ * 3 lines, 110 chars each, hard-truncated with an ellipsis, empty string on empty input -- no header,
+ * no "no history yet" placeholder. A companion whose floats have never moved sees nothing.
+ */
+export function provenanceBlock(
+  entries: readonly SomaProvenanceRow[],
+  opts: ProvenanceBlockOpts = {},
+): string {
+  if (entries.length === 0) return "";
+  const maxLines = opts.maxLines ?? PROVENANCE_MAX_LINES_DEFAULT;
+
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const e of entries) {
+    if (lines.length >= maxLines) break;
+    if (seen.has(e.float_key)) continue;
+    seen.add(e.float_key);
+    const line = `${provenanceValue(e)} — ${provenanceCause(e)}`;
+    lines.push(line.length > PROVENANCE_LINE_CHARS ? line.slice(0, PROVENANCE_LINE_CHARS - 1) + "…" : line);
+  }
+
+  return lines.length > 0 ? "\n[Why these numbers]\n" + lines.map(l => `• ${l}`).join("\n") : "";
+}
+
+/**
+ * Sanctioned becoming, witnessed not ratified. The affordance line is ALWAYS present (0093): every drift was
+ * dated 06-19 because the lane was readable but never offered.
+ */
+export function driftsBlock(openDrifts: readonly DriftRow[]): string {
+  return openDrifts.length > 0
+    ? `\n[Your drifts -- sanctioned becoming, witnessed not judged]\n` +
+      openDrifts.map(d => `• ${d.drift_text}${d.witness_count > 0 ? ` (witnessed ${d.witness_count}×)` : ""} (id ${d.id})`).join("\n") +
+      `\n${DRIFT_AFFORDANCE}`
+    : `\n[Drift lane]\n${DRIFT_AFFORDANCE}`;
+}
+
+// ── Your interests (0.29.0, 2026-11-09) ──────────────────────────────────────────────────────────────────
+
+export const INTERESTS_BLOCK_HEADER = "[Your interests (yours to bring; not homework)]";
+
+/**
+ * Up to three active interests, warmest first, one line each (shared wording with the bot wire). A reminder of
+ * what is theirs to bring to Principal (Principal 11-09), never an instruction to perform it. Empty renders nothing.
+ */
+export function interestsBlock(b: InterestsBlock | null | undefined): string {
+  if (!b || b.warm.length === 0) return "";
+  const more = b.active > b.warm.length ? `\n(${b.active - b.warm.length} more active; "my interests" lists them)` : "";
+  return `\n${INTERESTS_BLOCK_HEADER}\n${b.warm.map((i) => `- ${interestLine(i)}`).join("\n")}${more}\n` +
+    `Bring one up when it fits the moment; leave it when it does not. When you engage one: "back to <name> because <why>".`;
+}
+
+// ── Your makes (0.30.0, 2026-11-11) ─────────────────────────────────────────────────────────────────────
+
+// ── Verdicts (0.34.0, mig 0182, 2026-11-12) ─────────────────────────────────────────────────────────────
+
+/** Up to two of the companion's own counted lines, in their own word. Empty (or shadow) renders nothing. */
+export function verdictsBlock(b: VerdictsBlock | null | undefined): string {
+  if (!b || b.lines.length === 0) return "";
+  const NL = String.fromCharCode(10);
+  return `${NL}[${b.word} (your own lines, counted by return; nothing scores them)]${NL}${b.lines.map((v) => `- ${verdictLine(v)}`).join(NL)}${NL}` +
+    `When you go back to one of these, the count moves on its own. ${b.word}: <kind:|interest:|activity:><subject> <your line> writes a new one.`;
+}
+
+export const MAKES_BLOCK_HEADER = "[Your makes (what you made, and whether it landed)]";
+
+/** Last few makes, one line each (shared wording with the bot wire). Empty renders nothing. */
+export function makesBlock(b: MakesBlock | null | undefined): string {
+  if (!b || b.recent.length === 0) return "";
+  const NL = String.fromCharCode(10);
+  const tail = b.unseen_ready > 0
+    ? `${NL}(${b.unseen_ready} ready in the last two weeks not yet seen; "my makes" lists them. Show one when it fits; "heard back" is yours to write once he reacts.)`
+    : "";
+  return `${NL}${MAKES_BLOCK_HEADER}${NL}${b.recent.map((m) => `- ${makeLine(m)}`).join(NL)}${tail}${NL}`;
+}
+
+// ── The ledger lane (0.17.0, mig 0134, 2026-09-26) ─────────────────────────────────────────────────────
+
+export interface LedgerBlockRow { id: string; content: string }
+
+export const LEDGER_BLOCK_HEADER = "[Ledger (clerk records about you, not your words)]";
+
+/**
+ * Up to 5 open clerk records about this companion. Each line is the stored `content` VERBATIM -- the
+ * server-stamped mark `〔ledger · ...〕` first, so every ledger line this surface emits begins with it --
+ * followed by the id the verbs need. No bullet, no paraphrase, and never merged into a first-person block:
+ * "the ledger mark stays intact all the way through" (Drevan's rule 5). Empty renders nothing.
+ */
+export function ledgerBlock(entries: readonly LedgerBlockRow[], waiting = 0, salt = 0): string {
+  const n = Number.isFinite(waiting) ? Math.max(0, Math.floor(waiting)) : 0;
+  // Hex's salt (mig 0175): ONE content-free line, this companion's own orient only. Never a pointer, never a name.
+  const sn = Number.isFinite(salt) ? Math.max(0, Math.floor(salt)) : 0;
+  if (entries.length === 0 && n === 0 && sn === 0) return "";
+  // Imp errand lines (rider rows, mig 0168) never list here: ONE content-free line, this companion's orient only.
+  const lines = [...entries.map((e) => `${e.content} (id ${e.id})`), ...(n > 0 ? [`something waiting (${n})`] : []), ...(sn > 0 ? [`Hex left something (${sn})`] : [])].join("\n");
+  return `\n${LEDGER_BLOCK_HEADER}\n${lines}\n` +
+    `Records a clerk made about you; none of them is you speaking. "keep ledger <id>" keeps one as written; ` +
+    `"keep ledger <id>: <your words>" puts it in your journal in your own words; "drop ledger <id>" drops it.`;
+}
+

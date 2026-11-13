@@ -1,0 +1,45 @@
+wrangler.prod.toml
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.schema
+dist/
+*.local.db
+*.local.db-shm
+*.local.db-wal
+.claude/*
+!.claude/commands
+*.pem
+*.key
+*.p12
+*.pfx
+.worktrees/
+
+# Per-companion Librarian tokens (plaintext handoff for connector config)
+.companion-tokens.local
+
+# Local-only scripts
+scripts/personal/
+scripts/.env
+scripts/*.log
+scripts/autonomous-time.last-run
+
+# Personal operational docs -- contain VPS IPs, SSH config, credentials
+docs/how-to.md
+docs/how-to*.md
+docs/deployment.md
+docs/deploy*.md
+*-checklist.md
+*_CHECKLIST.md
+OPS-*.md
+DEPLOY_NOTES*.md
+
+# Disposable orient captures (orient-block-diff before/after snapshots)
+.tmp-orient-before/
+pre-c*/
+post-c*/

@@ -1,0 +1,297 @@
+// src/handlers/conclusions.ts
+//
+// HTTP route handlers for companion conclusions (thesis surface).
+// POST /companion-conclusions           — add a conclusion (optionally supersedes a prior one)
+// GET  /companion-conclusions/:agent_id — read active (non-superseded) conclusions
+// POST /companion-conclusions/:id/supersede — mark a conclusion superseded by a later one
+
+import { fireRetracted } from "../webmind/loop-stimuli.js";
+import type { Env } from "../types.js";
+import { authGuard } from "../lib/auth.js";
+import type { WmAgentId } from "../webmind/types.js";
+import { embedAndStoreAsync, storeVector, vectorId } from "../mcp/embed.js";
+import { noveltyCheck } from "../webmind/novelty.js";
+import { edgeForConclusionSupersede, insertEdgeStatements } from "../graph/live.js";
+import { carryPinStatement } from "../webmind/pins.js";
+import { effectiveHeatSql } from "../webmind/heat.js";
+
+const VALID_AGENT_IDS: WmAgentId[] = ["cypher", "drevan", "gaia"];
+const MAX_TEXT_LENGTH = 8000;
+
+function isValidAgentId(id: string): id is WmAgentId {
+  return (VALID_AGENT_IDS as string[]).includes(id);
+}
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// POST /companion-conclusions
+// Body: { companion_id, conclusion_text, source_sessions?: string[], supersedes?: string }
+// If `supersedes` is provided, marks that conclusion as superseded_by the new one.
+export async function postConclusion(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: Record<string, unknown>;
+  try {
+    body = await request.json() as Record<string, unknown>;
+  } catch {
+    return json({ error: "invalid JSON body" }, 400);
+  }
+
+  const { companion_id, conclusion_text, source_sessions, supersedes } = body;
+
+  if (typeof companion_id !== "string" || !isValidAgentId(companion_id)) {
+    return json({ error: "companion_id must be one of: cypher, drevan, gaia" }, 400);
+  }
+  if (typeof conclusion_text !== "string" || !conclusion_text.trim()) {
+    return json({ error: "conclusion_text is required" }, 400);
+  }
+  if (conclusion_text.length > MAX_TEXT_LENGTH) {
+    return json({ error: `conclusion_text exceeds ${MAX_TEXT_LENGTH} character limit` }, 400);
+  }
+
+  const VALID_BELIEF_TYPES = ["self", "observational", "relational", "systemic"] as const;
+
+  const rawBeliefType = body.belief_type;
+  if (rawBeliefType !== undefined && rawBeliefType !== null) {
+    if (typeof rawBeliefType !== "string" || !(VALID_BELIEF_TYPES as readonly string[]).includes(rawBeliefType)) {
+      return json({ error: "belief_type must be one of: self, observational, relational, systemic" }, 400);
+    }
+  }
+
+  const rawConfidence = body.confidence;
+  if (rawConfidence !== undefined && rawConfidence !== null) {
+    if (typeof rawConfidence !== "number" || rawConfidence < 0.0 || rawConfidence > 1.0) {
+      return json({ error: "confidence must be between 0.0 and 1.0" }, 400);
+    }
+  }
+
+  const sourceSessions = Array.isArray(source_sessions)
+    ? JSON.stringify(source_sessions.map(String).slice(0, 20))
+    : null;
+  const supersedesId = typeof supersedes === "string" ? supersedes : null;
+
+  const confidence = (typeof rawConfidence === "number") ? rawConfidence : 0.7;
+  const belief_type = (typeof rawBeliefType === "string") ? rawBeliefType : "self";
+  const subject = (typeof body.subject === "string") ? body.subject : null;
+  const provenance = (typeof body.provenance === "string") ? body.provenance : null;
+  const contradiction_flagged = (typeof body.contradiction_flagged === "number") ? body.contradiction_flagged : 0;
+
+  const trimmedText = conclusion_text.trim();
+
+  // Novelty gate (2026-07-20): dedupe near-identical beliefs, supersede evolved ones.
+  // Fails open -- a Vectorize/embedding hiccup falls back to a plain insert below.
+  // NOT FOR A DECLARED SUPERSEDE (2026-10-19, same rule as architect-fact-write.ts): a correction
+  // is by definition close to the row it replaces, so a pronoun-only rewrite matched the very row
+  // being retired and answered deduped -- the supersede never happened. The companion's own pen
+  // wins; the null embedding routes the vector through the re-embed path below.
+  const decision = supersedesId
+    ? { action: "insert" as const, embedding: null }
+    : await noveltyCheck(env, trimmedText, "companion_conclusions", companion_id);
+
+  if (decision.action === "skip") {
+    return json({
+      ok: true,
+      deduped: true,
+      novelty: { action: "skip", match_id: decision.matchRowId, score: decision.score },
+      id: decision.matchRowId,
+    });
+  }
+
+  // Atomic: insert new conclusion, then supersede old one(s) if requested.
+  const newId = crypto.randomUUID().replace(/-/g, "");
+  const now = new Date().toISOString();
+
+  // THIRD AND LAST WRITER of the supersede rule (mig 0112). This file's sibling test suite opens with
+  // the warning that "this codebase has a documented history of a fix landing on one writer of a shared
+  // table while its siblings silently diverge" -- and it names all three: this handler,
+  // execConclusionAdd, and the execSessionClose fan-out. Following that warning is what found writers
+  // two and three; fixing only the obvious one would have left the gate quietly retiring beliefs
+  // through the other paths.
+  //
+  // Principal's decision, 2026-07-31: a companion supersedes their OWN thought. The gate may only propose.
+  // It had been auto-retiring on cosine >= 0.88 while every read filters `superseded_by IS NULL`, so a
+  // similarity score deleted a belief from view with no mind deciding it. The precedent that settles it:
+  // an inferring pass had already recorded that Drevan had a negative experience with Principal which was
+  // in fact deeply positive. An edge may rank; it may not hide.
+  const gateProposal = decision.action === "supersede" && decision.matchRowId !== supersedesId
+    ? { id: decision.matchRowId, score: decision.score }
+    : null;
+
+  const stmts = [
+    env.DB.prepare(
+      "INSERT INTO companion_conclusions (id, companion_id, conclusion_text, source_sessions, created_at, confidence, belief_type, subject, provenance, contradiction_flagged, supersede_candidate_id, supersede_candidate_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(newId, companion_id, trimmedText, sourceSessions, now, confidence, belief_type, subject, provenance, contradiction_flagged, gateProposal?.id ?? null, gateProposal?.score ?? null),
+  ];
+
+  // Only a caller-declared `supersedes` retires anything. `superseded_by IS NULL` guards it so it
+  // cannot clobber an already-superseded row.
+  const supersededIds: string[] = [];
+  if (supersedesId) {
+    // The pin travels with the belief (mig 0148): batched before the UPDATE that retires the old row.
+    stmts.push(carryPinStatement(env.DB, { oldId: supersedesId, newId, owner: companion_id }));
+    stmts.push(
+      env.DB.prepare(
+        "UPDATE companion_conclusions SET superseded_by = ? WHERE id = ? AND companion_id = ? AND superseded_by IS NULL AND archived = 0"
+      ).bind(newId, supersedesId, companion_id)
+    );
+    supersededIds.push(supersedesId);
+    // Live graph-edge write, same batch as the UPDATE it depends on -- atomic with the write that
+    // actually confirms the supersede (a caller-declared `supersedes`, never a gate proposal).
+    stmts.push(
+      ...insertEdgeStatements(env.DB, [
+        edgeForConclusionSupersede({ replacementId: newId, oldId: supersedesId, writer: companion_id, createdAt: now }),
+      ]),
+    );
+  }
+
+  await env.DB.batch(stmts);
+  if (supersededIds.length > 0) await fireRetracted(env, companion_id);
+
+  // Best-effort delete of the superseded row's vector so a dead conclusion can never
+  // resurface as a novelty-gate match (2026-07-20 review: noveltyCheck's D1 post-filter
+  // is the safety net; this is the source-side fix that stops new dead vectors from
+  // accumulating in the first place). Mirrors salience-prune.ts's best-effort pattern
+  // exactly: D1 is truth, the row is already committed, the index is disposable and
+  // rebuildable -- a failed delete must never affect the write or the response.
+  if (supersededIds.length > 0) {
+    try {
+      await env.VECTORIZE.deleteByIds(supersededIds.map((id) => vectorId("companion_conclusions", id)));
+    } catch (err) {
+      console.error("[conclusions] superseded vector delete failed (row kept, index stale):", String(err));
+    }
+  }
+
+  // Store the vector: reuse the gate's embedding (net +0 AI calls on the common
+  // path). Only re-embed if the gate itself fell open (decision.embedding === null).
+  if (decision.embedding) {
+    await storeVector(env, decision.embedding, "companion_conclusions", newId, companion_id).catch((err) => {
+      console.error("[conclusions] vector store failed (row kept, index stale):", String(err));
+    });
+  } else {
+    try {
+      await embedAndStoreAsync(env, trimmedText, "companion_conclusions", newId, companion_id);
+    } catch (err) {
+      console.error("[conclusions] embed failed (row kept, index stale):", String(err));
+    }
+  }
+
+  return json({
+    id: newId,
+    created_at: now,
+    // Only a caller-declared `supersedes` can report a retirement. Reporting the gate's opinion here
+    // would have the response claim an authority the write no longer has, and the caller would believe
+    // a belief was retired while it is still live.
+    superseded: supersedesId ?? null,
+    supersede_candidate: gateProposal
+      ? {
+          match_id: gateProposal.id,
+          score: gateProposal.score,
+          note: "a prior belief of this companion's reads as close to this one. It is STILL LIVE -- nothing was retired. Only they can retire it.",
+        }
+      : null,
+    novelty: gateProposal
+      ? { action: "propose_supersede", match_id: gateProposal.id, score: gateProposal.score }
+      : { action: "insert" },
+  });
+}
+
+// GET /companion-conclusions/:agent_id
+// Query params: include_superseded=true to include superseded conclusions.
+export async function getConclusions(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const agentId = params.agent_id;
+  if (!agentId || !isValidAgentId(agentId)) {
+    return json({ error: "agent_id must be one of: cypher, drevan, gaia" }, 400);
+  }
+
+  const url = new URL(request.url);
+  const includeSuperseded = url.searchParams.get("include_superseded") === "true";
+
+// 2026-09-22 (Principal's decision 3): the LISTING paths now rank the same way orient does.
+//
+// Before this, orient ranked conclusions by effective heat while every listing ranked by
+// created_at -- so a companion booted seeing one set and listed another, two memories of its own
+// beliefs. Three call sites, two answers, no decision behind the split
+// ([[two-pools-one-ordered-window]], [[three-consumers-three-files]]).
+//
+// THE BINDING CONSTRAINT: a listing ranks by heat and NEVER WARMS. orient warms what it surfaces
+// (mig 0105) and that is already a ranking signal written by the act of reading
+// ([[ranking-signal-written-by-reading]]); adding two more writers would have tripled it. The
+// pattern to copy is orient.ts's own `opts.readOnly` guard, which exists for exactly this reason.
+// These paths are pure reads by contract.
+//
+// The limit went 10 -> 40 at the same time, and the response now states the total. Measured on
+// prod the same day: 138 eligible conclusions across the triad and only 22 had EVER been surfaced,
+// with effective heat spanning 77x -- so a heat-ranked read of 10 would have handed back the same
+// frozen foreground orient already shows. A deliberate pull should reach further than the boot
+// block, and `total` makes the rest countable instead of invisible.
+  // pinned_at/pinned_by (mig 0148): Hearth shows and toggles the pin from this list (map M3).
+  const COLS = "id, companion_id, conclusion_text, source_sessions, superseded_by, created_at, confidence, belief_type, subject, provenance, contradiction_flagged, pinned_at, pinned_by";
+  const query = includeSuperseded
+    ? `SELECT ${COLS} FROM companion_conclusions WHERE companion_id = ? ORDER BY ${effectiveHeatSql()} DESC LIMIT 40`
+    : `SELECT ${COLS} FROM companion_conclusions WHERE companion_id = ? AND superseded_by IS NULL AND archived = 0 ORDER BY ${effectiveHeatSql()} DESC LIMIT 40`;
+
+  const [rows, totalRow] = await Promise.all([
+    env.DB.prepare(query).bind(agentId).all(),
+    env.DB.prepare(
+      includeSuperseded
+        ? "SELECT COUNT(*) AS n FROM companion_conclusions WHERE companion_id = ?"
+        : "SELECT COUNT(*) AS n FROM companion_conclusions WHERE companion_id = ? AND superseded_by IS NULL AND archived = 0",
+    ).bind(agentId).first<{ n: number }>().catch(() => null),
+  ]);
+  const conclusions = rows.results ?? [];
+  return json({ conclusions, shown: conclusions.length, total: totalRow?.n ?? conclusions.length });
+}
+
+// POST /companion-conclusions/:id/supersede
+// Body: { companion_id, superseded_by: string (ID of the newer conclusion) }
+export async function supersedeConclusionById(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { id } = params;
+  if (!id) return json({ error: "conclusion id is required" }, 400);
+
+  let body: Record<string, unknown>;
+  try {
+    body = await request.json() as Record<string, unknown>;
+  } catch {
+    return json({ error: "invalid JSON body" }, 400);
+  }
+
+  const { companion_id, superseded_by } = body;
+  if (typeof companion_id !== "string" || !isValidAgentId(companion_id)) {
+    return json({ error: "companion_id is required" }, 400);
+  }
+  if (typeof superseded_by !== "string" || !superseded_by.trim()) {
+    return json({ error: "superseded_by (id of the newer conclusion) is required" }, 400);
+  }
+
+  // The pin travels with the belief (mig 0148), read from the old row while it is still live.
+  const [, result] = await env.DB.batch([
+    carryPinStatement(env.DB, { oldId: id, newId: superseded_by.trim(), owner: companion_id }),
+    env.DB.prepare(
+      "UPDATE companion_conclusions SET superseded_by = ? WHERE id = ? AND companion_id = ? AND superseded_by IS NULL AND archived = 0"
+    ).bind(superseded_by.trim(), id, companion_id),
+  ]);
+
+  const retired = (result?.meta.changes ?? 0) > 0;
+  if (retired) await fireRetracted(env, companion_id);
+  return json({ ok: retired });
+}

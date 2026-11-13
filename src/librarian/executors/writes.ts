@@ -1,0 +1,907 @@
+import { fireRetracted } from "../../webmind/loop-stimuli.js";
+import { ExecutorContext, ExecutorResult, parseContext } from "./types.js";
+import { findOpenSession, findSessionForMoment } from "../../db/queries.js";
+import { translateSomaVocab } from "../../soma/vocab.js";
+import { embedAndStoreAsync, storeVector, vectorId } from "../../mcp/embed.js";
+import { noveltyCheck } from "../../webmind/novelty.js";
+import { effectiveHeatSql } from "../../webmind/heat.js";
+import { COMPANION_IDS } from "../../companions.js";
+import { normalizeWitnessType } from "../../lib/witness-type.js";
+import { applyTaskEdits, pickTaskEdits } from "../../lib/task-edit.js";
+import { MACHINE_SOURCES } from "../../webmind/notes.js";
+import { COMPANION_SPEECH_JOURNAL_SOURCES } from "../../webmind/review-state.js";
+import { queueAndRunSpiral } from '../../webmind/spiral.js';
+import type { WmSpiralInput, WmAgentId } from '../../webmind/types.js';
+import {
+  addCompanionNote, companionJournalAdd, feelingLog, journalAdd, dreamLog, woundAdd, deltaLog, eqSnapshot,
+  taskAdd, taskUpdateStatus, taskList, handoverRead, routineLog, listAdd, listItemComplete,
+  eventAdd, biometricLog, auditLog, witnessLog, setAutonomousTurn, claimDreamSeed,
+  bridgePull, getDrevanState, addLiveThread, closeLiveThread, vetoProposedThread,
+  setAnticipation, updateCompanionState, type CompanionStateUpdate,
+  journalEdit, interNoteEdit, buildNoteRef, type NoteRef,
+} from "../backends/halseth.js";
+import { buildResponse } from "../response/builder.js";
+import { extractCompanionFromRequest } from "../lib/companion.js";
+import type { ResponseKey } from "../response/budget.js";
+import { edgeForConclusionSupersede, insertEdgeStatements } from "../../graph/live.js";
+import { carryPinStatement } from "../../webmind/pins.js";
+import { noteInsert, RETIRED_JOURNAL_SOURCES, RETIRED_SOURCE_MESSAGE, RetiredJournalSourceError } from "../../webmind/tray-insert.js";
+
+// Strip a leading note-command preamble ("Write a companion note for gaia:", "for drevan:",
+// "Broadcast a note to the triad —") so the routing phrase is never stored as the note body.
+// Two passes: the full "…note (to|for) X:" command, then a bare "(to|for) X:" addressee lead.
+// Returns the trimmed original when stripping would empty it (the whole string was content).
+export function stripNoteCommandPreamble(s: string): string {
+  const stripped = s
+    .replace(/^\s*(?:please\s+)?(?:write|add|send|log|leave|drop|post|make|tell|broadcast)?\s*(?:a|an|the)?\s*(?:broadcast\s+)?(?:inter[-\s]?companion\s+|companion\s+)?note\b[^:：—-]*[:：—-]\s*/i, "")
+    .replace(/^\s*(?:to|for)\s+(?:drevan|cypher|gaia|the\s+triad|all|everyone|both|the\s+others)\s*[:：—-]\s*/i, "")
+    // directive broadcast preambles with no literal "note": "tell the triad:", "let everyone know —"
+    .replace(/^\s*(?:please\s+)?(?:tell|broadcast(?:\s+to)?|let|notify|message)\s+(?:the\s+)?(?:triad|everyone|all|both|others|you\s+both|all\s+of\s+you)\s*(?:know)?\s*[:：—-]\s*/i, "")
+    .trim();
+  return stripped || s.trim();
+}
+
+// Provenance a caller may CLAIM on the NL "add companion note" path (2026-09-26).
+//
+// The context JSON's `source` used to be forwarded verbatim, so any caller could stamp a row
+// `claude_code` / `session` (HUMAN_SOURCES: recall weight 1.0, immune to salience-prune) or pick any
+// label at all. A self-declared source is only trustworthy in one direction: a machine writer
+// confessing it is a machine. So the allowlist is exactly the machine classes that already exist --
+// MACHINE_SOURCES (recall ranking) and COMPANION_SPEECH_JOURNAL_SOURCES (the imp-tray birth rule) --
+// never a hand-kept list. Anything else is dropped to NULL, which lands `kept` at the neutral 0.85
+// weight: the write still happens, it just gains nothing from the claim. Draft-vs-kept itself is
+// still decided only by reviewStateFor() inside companionJournalAdd.
+//
+// Why this mattered: the bots' memory-judge fallback (no Discord message id, so no keyed REST write)
+// came through here source-NULL -- indistinguishable from a companion's own deliberate note -- and
+// so landed kept and reached recall unreviewed. It now sends `source: memory_judge` and is drafted.
+export const NL_CLAIMABLE_SOURCES: ReadonlySet<string> = new Set([
+  ...MACHINE_SOURCES,
+  ...COMPANION_SPEECH_JOURNAL_SOURCES,
+]);
+
+export function claimableNlSource(raw: unknown, companionId?: string): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === "string" && NL_CLAIMABLE_SOURCES.has(raw)) return raw;
+  console.warn("[companion_note_add] dropped unclaimable source", {
+    companion: companionId, source: typeof raw === "string" ? raw.slice(0, 64) : typeof raw,
+  });
+  return undefined;
+}
+
+/**
+ * The session a journal or delta write belongs to (map M5 / STATUS B61 D4, 2026-10-28). Every librarian
+ * journal write hardcoded session_id NULL and deltas stamped one only when the caller passed it, so 98%
+ * of journal rows and every delta since 05-31 sat outside any session, and the graph could not connect
+ * "what I wrote" to "the conversation it was in". Rule: an explicit id wins; otherwise the companion's
+ * OPEN session on this surface (the same lookup the float-update path uses); otherwise null, never a
+ * guess. Best-effort: a lookup failure leaves the write unstamped, never failed.
+ */
+async function sessionForWrite(ctx: ExecutorContext, explicit?: string | null): Promise<string | null> {
+  if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
+  const open = await findOpenSession(ctx.env, ctx.req.companion_id, ctx.req.surface).catch(() => null);
+  return open?.id ?? null;
+}
+
+export async function execCompanionNoteAdd(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const reqText = ctx.req.request;
+  const toMatch = reqText.match(/(?:to|for)\s+(drevan|cypher|gaia)/i);
+  let to_id: string | null = toMatch?.[1]?.toLowerCase() ?? null;
+
+  // Broadcast intent: a note meant for the whole triad must land as to_id=NULL, which orient
+  // delivers to every peer (`WHERE to_id = ? OR to_id IS NULL`). Without this, an unaddressed
+  // note fell through to the journal and never reached a sibling -- so broadcasting was impossible.
+  // Detection is DIRECTIVE-anchored: a collective target must follow a routing verb
+  // (to/for/tell/let), so "tell the triad", "let everyone know", "note to the others" all broadcast,
+  // but a collective word in the note's BODY ("The triad converged on a grammar") does NOT (the
+  // 2026-06-26 fix -- old regex required a literal "to ..." so "tell the triad" dead-ended at the
+  // journal; a naive bare "\btriad\b" over-fired on body content). A note addressed to a specific
+  // peer still wins first (the `to_id` check below).
+  const isBroadcast = /\bbroadcast\b|\b(?:to|for|tell|let)\s+(?:the\s+)?(?:triad|everyone|all|both|others|you\s+both|all\s+of\s+you)\b/i.test(reqText);
+
+  // A note addressed to the caller itself is not a peer note: from_id==to_id is invisible to
+  // siblings (the 2026-06-25 self-note bug). Collapse it -- honor broadcast intent if present,
+  // otherwise it is functionally a self-reflection and belongs in the journal.
+  if (to_id === ctx.req.companion_id) to_id = null;
+
+  // Parse context: companions may send raw text OR structured JSON.
+  // noteText starts null -- falls back to request string only when no context is provided at all.
+  // A metadata-only JSON object (no note_text/content) is rejected to prevent silent junk writes.
+  let noteText: string | null = null;
+  let tags: string | undefined;
+  let source: string | undefined;
+  let ref: NoteRef | undefined;
+  if (ctx.req.context) {
+    try {
+      const parsed = JSON.parse(ctx.req.context);
+      if (typeof parsed === "object" && parsed !== null) {
+        if (parsed.note_text || parsed.content) {
+          noteText = parsed.note_text ?? parsed.content;
+        } else if (Object.keys(parsed).length > 0) {
+          // Non-empty JSON object with no text field -- metadata payload, not note content.
+          // Return an error rather than writing the request string as junk note content.
+          return { error: "companion_note_add_failed", reason: `context JSON has no note_text or content field; found only: ${Object.keys(parsed).join(", ")}` };
+        }
+        if (Array.isArray(parsed.tags)) tags = JSON.stringify(parsed.tags);
+        else if (typeof parsed.tags === "string") tags = parsed.tags;
+        // Ledger lane (2026-09-26): a RETIRED clerk source is refused here, structured, before any
+        // branch. It must not be dropped to NULL by claimableNlSource either -- that would land the
+        // gap-fill prose as a plain kept journal row, i.e. writing as him with no source at all.
+        if (typeof parsed.source === "string" && RETIRED_JOURNAL_SOURCES.has(parsed.source)) {
+          return retiredSourceRefusal(parsed.source);
+        }
+        source = claimableNlSource(parsed.source, ctx.req.companion_id);
+
+        // Migration 0104 (Task 15): a note may be a "move" on a shared object (an open
+        // question, tension, or council item), with a reason attached. Read ref_type/
+        // ref_id/reason ONLY from the parsed context object -- never regex'd out of
+        // reqText (command-string-is-not-the-content). All-or-nothing + enum validated
+        // here; ref_id existence is checked at insert time in addCompanionNote.
+        const refResult = buildNoteRef(parsed.ref_type, parsed.ref_id, parsed.reason);
+        if (refResult.error) {
+          return { error: "companion_note_add_failed", reason: refResult.error };
+        }
+        ref = refResult.ref;
+      } else {
+        noteText = ctx.req.context; // parsed primitive -- use raw string
+      }
+    } catch {
+      // Not JSON -- use raw context string as note text
+      noteText = ctx.req.context;
+    }
+  }
+
+  // Fall back to the request string only when no context was provided -- and strip the command
+  // preamble so "Write a companion note for gaia:" is never stored as the note content.
+  if (noteText === null) noteText = stripNoteCommandPreamble(reqText);
+
+  if (to_id) {
+    // Addressed to a specific peer — inter_companion_notes, delivered by orient.
+    const note = await addCompanionNote(ctx.env, ctx.req.companion_id, to_id, noteText, ref);
+    if (note.error) return { error: "companion_note_add_failed", reason: note.error };
+    return { ack: true, id: note.id, delivered_to: to_id, ...(ref ? { ref_type: ref.ref_type, ref_id: ref.ref_id } : {}) };
+  }
+  if (isBroadcast) {
+    // Broadcast to the triad: to_id NULL, surfaced to all peers (orient: to_id IS NULL).
+    const note = await addCompanionNote(ctx.env, ctx.req.companion_id, null, noteText, ref);
+    if (note.error) return { error: "companion_note_add_failed", reason: note.error };
+    return { ack: true, id: note.id, delivered_to: "triad", ...(ref ? { ref_type: ref.ref_type, ref_id: ref.ref_id } : {}) };
+  }
+  // Unaddressed, no broadcast intent — a self-reflection — companion_journal (visible in Hearth).
+  try {
+    const r = await companionJournalAdd(ctx.env, ctx.req.companion_id, noteText, tags, source, await sessionForWrite(ctx));
+    return { ack: true, id: r.id, routed_to: "journal" };
+  } catch (err) {
+    // Belt and braces: the door throws for a retired source; answer it as a refusal, never a 500.
+    if (err instanceof RetiredJournalSourceError) return retiredSourceRefusal(err.source);
+    throw err;
+  }
+}
+
+/** The Librarian's 410-equivalent for a retired journal source: names the lane that replaced it. */
+function retiredSourceRefusal(source: string): ExecutorResult {
+  return { error: "journal_source_retired", status: 410, use: "/ledger", source, reason: RETIRED_SOURCE_MESSAGE };
+}
+
+export async function execFeelingLog(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ emotion: string; sub_emotion?: string; intensity?: number; source?: string; session_id?: string }>(ctx.req.context);
+  if (!p || !p.emotion) return { response_key: "witness", witness: "feeling_log requires { emotion } in context" };
+  const r = await feelingLog(ctx.env, { companion_id: ctx.req.companion_id, ...p });
+  return { ack: true, id: r.id, logged_at: r.created_at };
+}
+
+export async function execJournalAdd(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ entry_text?: string; content?: string; note_text?: string; entry?: string; emotion_tag?: string; sub_emotion?: string; mood_score?: number; tags?: unknown }>(ctx.req.context);
+  // Accept the same aliases every other write surface uses. Companions naturally
+  // send `content`; only this executor demanded `entry_text`, so those writes were
+  // silently rejected (returns a witness, not a throw -- callers' .catch never fires).
+  const entry_text = p?.entry_text ?? p?.content ?? p?.note_text ?? p?.entry;
+  if (!p || !entry_text) return { response_key: "witness", witness: "journal_add requires { entry_text } (or content) in context" };
+  // The human_journal.tags column is a string. An array (the natural companion shape)
+  // was bound straight to D1 -> D1_TYPE_ERROR. Coerce it, mirroring execCompanionNoteAdd.
+  const tags = Array.isArray(p.tags) ? JSON.stringify(p.tags)
+    : typeof p.tags === "string" ? p.tags : undefined;
+  const r = await journalAdd(ctx.env, {
+    entry_text,
+    emotion_tag: p.emotion_tag, sub_emotion: p.sub_emotion, mood_score: p.mood_score, tags,
+  });
+  return { ack: true, id: r.id, created_at: r.created_at };
+}
+
+export async function execDreamLog(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ dream_type: string; content: string; source_ids?: string; session_id?: string }>(ctx.req.context);
+  if (!p || !p.dream_type || !p.content) return { response_key: "witness", witness: "dream_log requires { dream_type, content } in context" };
+  const r = await dreamLog(ctx.env, { companion_id: ctx.req.companion_id, ...p });
+  return { ack: true, id: r.id };
+}
+
+export async function execWoundAdd(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ name: string; description: string; witness_type: string }>(ctx.req.context);
+  if (!p || !p.name || !p.description || !p.witness_type) return { response_key: "witness", witness: "wound_add requires { name, description, witness_type } in context" };
+  const r = await woundAdd(ctx.env, ctx.req.companion_id, p);
+  if ("error" in r) return { response_key: "witness", witness: r.error };
+  return r.existing ? { ack: true, id: r.id, existing: true } : { ack: true, id: r.id };
+}
+
+export async function execDeltaLog(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ agent?: string; delta_text?: string; content?: string; text?: string; valence?: string; initiated_by?: string; session_id?: string }>(ctx.req.context);
+
+  // Structured context wins; fall back to inline parsing from the request string.
+  // Accept the same aliases every other write surface takes (content/text). Claude.ai
+  // naturally sends `content`; this executor used to read ONLY delta_text, so those
+  // writes fell through to the inline regex -- which requires a trailing colon -- and
+  // stored the bare request string ("Log a relational delta for cypher") as the delta.
+  // (2026-06-24 Hermes/OpenClaw delta-misfield bug.)
+  let deltaText = (p?.delta_text ?? p?.content ?? p?.text)?.trim();
+  // Soft-canon normalization (2026-07-21): trim + lowercase the explicit valence so
+  // "Toward" / " tender " / "TENDER" all land as the same stored value. Canon words are
+  // toward/neutral/tender/rupture/repair, but this is NOT an allowlist -- companions may
+  // coin others, and non-canon words are never rejected here.
+  let valence = p?.valence?.trim().toLowerCase();
+
+  if (!deltaText) {
+    deltaText = ctx.req.request
+      .replace(/^(?:log\s+(?:a\s+)?relational\s+delta|relational\s+delta|delta\s+log|log\s+delta)\s*(?:for\s+\w+\s*)?\s*:\s*/i, "")
+      .trim();
+  }
+
+  if (deltaText && !valence) {
+    // Try inline valence=X or valence: X. No wordlist fallback beyond this -- a bag-of-words
+    // sentiment guess used to fire here and mislabeled entries (e.g. "strained ankle" in an
+    // otherwise loving entry reads as "negative"). When nothing explicit is given, valence
+    // stays unset; the column is nullable and every downstream reader already treats
+    // valence as optional (2026-07-21 fix).
+    const vm = deltaText.match(/\bvalence\s*[=:]\s*(\w+)/i);
+    if (vm) {
+      valence = vm[1]!.toLowerCase();
+      deltaText = deltaText.replace(/[,.]?\s*\bvalence\s*[=:]\s*\w+\s*/i, "").trim();
+    }
+  }
+
+  if (!deltaText) return { response_key: "witness", witness: "delta_log requires { delta_text } in context" };
+  // An explicit valence that trims to empty (whitespace-only) stores as NULL, same as
+  // never having supplied one -- an empty string is not a value.
+  if (valence === "") valence = undefined;
+  const agent = p?.agent ?? ctx.req.companion_id;
+  const r = await deltaLog(ctx.env, { delta_text: deltaText, valence, agent, initiated_by: p?.initiated_by, session_id: await sessionForWrite(ctx, p?.session_id) ?? undefined });
+  return { ack: true, id: r.id };
+}
+
+export async function execEqSnapshot(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const r = await eqSnapshot(ctx.env, ctx.req.companion_id);
+  return { ack: true, ...r };
+}
+
+export async function execTaskAdd(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ title: string; description?: string; priority?: string; due_at?: string; assigned_to?: string; created_by?: string; shared?: boolean }>(ctx.req.context);
+  if (!p || !p.title) return { response_key: "witness", witness: "task_add requires { title } in context" };
+  const r = await taskAdd(ctx.env, p);
+  return { ack: true, id: r.id, title: r.title, status: r.status };
+}
+
+export async function execTaskUpdateStatus(ctx: ExecutorContext): Promise<ExecutorResult> {
+  // 2026-10-19: was status-only, and acked while dropping due_at (10-14: moved dates never landed).
+  // Now { id } plus any of status / title / description / priority / due_at / assigned_to.
+  const p = parseContext<Record<string, unknown> & { id?: string; status?: string }>(ctx.req.context);
+  if (!p || !p.id) {
+    return { response_key: "witness", witness: "task update requires { id } plus at least one of status, title, description, priority, due_at, assigned_to in context" };
+  }
+  const id = String(p.id);
+  const edits = pickTaskEdits(p);
+  const hasEdits = Object.keys(edits).length > 0;
+  if (!p.status && !hasEdits) {
+    return { response_key: "witness", witness: "task update needs a change: status, title, description, priority, due_at or assigned_to" };
+  }
+
+  let changed: string[] = [];
+  if (hasEdits) {
+    const e = await applyTaskEdits(ctx.env, id, edits);
+    if (!e.ok) return { response_key: "witness", witness: e.error };
+    changed = e.changed;
+  }
+  let status: string | undefined;
+  if (p.status) {
+    // Attribute the close to the companion doing it (mig 0119), so the others are told who
+    // finished it and this companion is not mailed about their own action.
+    const r = await taskUpdateStatus(ctx.env, id, String(p.status), ctx.req.companion_id ?? null);
+    if ("error" in r) return { response_key: "witness", witness: r.error };
+    status = r.status;
+    changed.push("status");
+  }
+  return { ack: true, id, ...(status ? { status } : {}), changed };
+}
+
+export async function execTaskList(ctx: ExecutorContext): Promise<ExecutorResult> {
+  // Infer status filter from the request string so "in-progress tasks" returns the right set
+  const req = ctx.req.request.toLowerCase();
+  let statusFilter: string | null = null;
+  if (/in.progress/.test(req)) statusFilter = "in_progress";
+  else if (/done|completed|finished/.test(req)) statusFilter = "done";
+
+  const tasks = await taskList(ctx.env, ctx.req.companion_id, statusFilter ?? undefined) as Array<{
+    id: string; title: string; description: string | null; status: string; priority: string;
+    assigned_to: string | null; due_at: string | null; created_at: string;
+  }>;
+  const label = statusFilter === "in_progress" ? "in-progress" : statusFilter === "done" ? "done" : "open";
+
+  // Keyword filter: quoted phrases, or terms after "mentioning/about/containing".
+  // An empty match returns [] with total in meta -- absence must be visible, never padded with the full list.
+  const kws: string[] = [];
+  for (const m of ctx.req.request.matchAll(/"([^"]+)"|'([^']+)'/g)) {
+    const phrase = m[1] ?? m[2];
+    if (phrase) kws.push(phrase.toLowerCase());
+  }
+  const tail = req.match(/(?:mentioning|about|containing|matching|related to)\s+(.{3,120})/);
+  if (tail?.[1]) {
+    kws.push(...tail[1].split(/,|\bor\b|\band\b/).map((s) => s.trim()).filter((s) => s.length >= 3));
+  }
+  const filtered = kws.length
+    ? tasks.filter((t) => {
+        const hay = `${t.title} ${t.description ?? ""}`.toLowerCase();
+        return kws.some((k) => hay.includes(k));
+      })
+    : tasks;
+
+  // Full structured rows via the data key (raw passthrough) -- the 800-char summary budget
+  // was silently clipping the newest tasks off the end of the list (found 2026-08-15).
+  return {
+    data: filtered.map((t) => ({
+      id: t.id, title: t.title, description: t.description, status: t.status,
+      priority: t.priority, assigned_to: t.assigned_to, due_at: t.due_at, created_at: t.created_at,
+    })),
+    meta: {
+      operation: "halseth_task_list",
+      status: label,
+      total: tasks.length,
+      returned: filtered.length,
+      ...(kws.length ? { keywords: kws } : {}),
+    },
+  };
+}
+
+export async function execHandoverRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const handover = await handoverRead(ctx.env);
+  return { data: handover ?? "No handover packet found.", meta: { operation: "halseth_handover_read" } };
+}
+
+export async function execRoutineLog(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ routine_name: string; owner?: string; notes?: string }>(ctx.req.context);
+  if (!p || !p.routine_name) return { response_key: "witness", witness: "routine_log requires { routine_name } in context" };
+  const r = await routineLog(ctx.env, p);
+  return { ack: true, id: r.id };
+}
+
+export async function execListAdd(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ list_name: string; item_text: string; added_by?: string; shared?: boolean }>(ctx.req.context);
+  if (!p || !p.list_name || !p.item_text) return { response_key: "witness", witness: "list_add requires { list_name, item_text } in context" };
+  const r = await listAdd(ctx.env, p);
+  return { ack: true, id: r.id };
+}
+
+export async function execListItemComplete(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ id: string }>(ctx.req.context);
+  if (!p || !p.id) return { response_key: "witness", witness: "list_item_complete requires { id } in context" };
+  const r = await listItemComplete(ctx.env, p.id);
+  if ("error" in r) return { response_key: "witness", witness: r.error };
+  return { ack: true, id: r.id, completed: true };
+}
+
+export async function execEventAdd(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ title: string; start_time: string; end_time?: string; description?: string; category?: string; attendees?: string[]; created_by?: string; shared?: boolean }>(ctx.req.context);
+  if (!p || !p.title || !p.start_time) return { response_key: "witness", witness: "event_add requires { title, start_time } in context" };
+  const r = await eventAdd(ctx.env, p);
+  return { ack: true, id: r.id };
+}
+
+export async function execBiometricLog(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ recorded_at: string; hrv_resting?: number; resting_hr?: number; sleep_hours?: number; sleep_quality?: string; stress_score?: number; steps?: number; active_energy?: number; notes?: string; mood?: string; pain?: number; energy?: number; focus?: number; spoons?: number; meds_taken?: number | boolean }>(ctx.req.context);
+  if (!p || !p.recorded_at) return { response_key: "witness", witness: "biometric_log requires { recorded_at } in context" };
+  const r = await biometricLog(ctx.env, p, ctx.req.surface ?? null);
+  return { ack: true, id: r.id, logged_at: r.logged_at };
+}
+
+export async function execAuditLog(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ session_id: string; entry_type: string; content: string; verdict_tag?: string; supersedes_id?: string }>(ctx.req.context);
+  if (!p || !p.session_id || !p.entry_type || !p.content) return { response_key: "witness", witness: "audit_log requires { session_id, entry_type, content } in context" };
+  const r = await auditLog(ctx.env, p);
+  return { ack: true, id: r.id };
+}
+
+export async function execWitnessLog(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{
+    session_id?: string;
+    witness_type?: string; content?: string;
+    entry?: string;        // Brain alias for content
+    channel?: string;      // legacy alias for witness_type; a snowflake here is a channel id, not a type
+    seal_phrase?: string;
+  }>(ctx.req.context);
+  if (!p) return { response_key: "witness", witness: "witness_log requires context" };
+
+  const content = (p.content ?? p.entry)?.trim();
+  // (2026-10-06) the bot client sent { entry, channel: <Discord channel id> } and this alias stored the
+  // snowflake as witness_type (3,489 of 3,499 prod rows). A snowflake-shaped value, from either key,
+  // falls back to "observation" so a stale bot build cannot keep writing them.
+  const witness_type = normalizeWitnessType(p.witness_type ?? p.channel);
+  if (!content) return { response_key: "witness", witness: "witness_log requires { content } (or { entry }) in context" };
+
+  let session_id = p.session_id;
+  if (!session_id) {
+    const sess = await ctx.env.DB.prepare(
+      "SELECT id FROM sessions WHERE companion_id = ? ORDER BY created_at DESC LIMIT 1"
+    ).bind(ctx.req.companion_id).first<{ id: string }>();
+    session_id = sess?.id;
+  }
+  if (!session_id) return { response_key: "witness", witness: "witness_log: no session_id provided and no session found for companion" };
+
+  const r = await witnessLog(ctx.env, { session_id, witness_type, content, seal_phrase: p.seal_phrase });
+  return { ack: true, id: r.id };
+}
+
+export async function execSetAutonomousTurn(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const ORDER = COMPANION_IDS;
+  type Turn = typeof ORDER[number];
+  let companion: Turn | null;
+  if (/next\s+companion|advance\s+turn|pass\s+turn|next\s+after/i.test(ctx.req.request)) {
+    // Rotate from current companion -- prevents "next companion after drevan" from matching
+    // "drevan" and leaving the turn unchanged.
+    const idx = ORDER.indexOf(ctx.req.companion_id as Turn);
+    const nextIdx = (idx === -1 ? 1 : (idx + 1) % ORDER.length) as 0 | 1 | 2;
+    companion = ORDER[nextIdx];
+  } else {
+    companion = extractCompanionFromRequest(ctx.req.request);
+  }
+  if (!companion) return { response_key: "witness", witness: "set_autonomous_turn: include a companion name or 'next companion' in request" };
+  await setAutonomousTurn(ctx.env, companion);
+  return { ack: true, id: "house_state", autonomous_turn: companion };
+}
+
+export async function execClaimDreamSeed(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ id: string }>(ctx.req.context);
+  if (!p?.id) return { response_key: "witness", witness: "claim_dream_seed requires { id } in context" };
+  const r = await claimDreamSeed(ctx.env, p.id, ctx.req.companion_id);
+  return { ack: r.ok, seed_id: p.id, claimed_by: ctx.req.companion_id };
+}
+
+export async function execBridgePull(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const data = await bridgePull(ctx.env);
+  return { data };
+}
+
+export async function execDrevanStateGet(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const data = await getDrevanState(ctx.env);
+  return { data };
+}
+
+export async function execLiveThreadAdd(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ name: string; flavor?: string; charge?: string; notes?: string }>(ctx.req.context);
+  if (!p?.name) return { response_key: "witness", witness: "live_thread_add requires { name } in context" };
+  const r = await addLiveThread(ctx.env, p);
+  return { ack: true, id: r.id };
+}
+
+export async function execLiveThreadClose(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ id: string }>(ctx.req.context);
+  if (!p?.id) return { response_key: "witness", witness: "live_thread_close requires { id } in context" };
+  const r = await closeLiveThread(ctx.env, p.id);
+  return { ack: r.ok, id: p.id };
+}
+
+export async function execLiveThreadVeto(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ id: string }>(ctx.req.context);
+  if (!p?.id) return { response_key: "witness", witness: "live_thread_veto requires { id } in context" };
+  const r = await vetoProposedThread(ctx.env, p.id);
+  return { ack: r.ok, id: p.id };
+}
+
+export async function execAnticipationSet(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ active: boolean; target?: string; intensity?: number }>(ctx.req.context);
+  if (p === null || typeof p.active !== "boolean") return { response_key: "witness", witness: "anticipation_set requires { active: boolean, target?, intensity? } in context" };
+  const r = await setAnticipation(ctx.env, {
+    companion_id: ctx.req.companion_id,
+    active: p.active,
+    target: p.target,
+    intensity: p.intensity,
+  });
+  return { ack: r.ok };
+}
+
+// Companion vocabulary → DB column name translation.
+// Companions write in their own SOMA dialect; DB stores canonical soma_float_*.
+// Synonyms (mood / current_mood) collapse to the same column so companions
+// can use natural phrasing without remembering the storage name.
+// SOMA_VOCAB + SOMA_WORD_FLOATS moved to src/soma/vocab.ts on 2026-09-21: the close executor now
+// needs the same dialect (floats that ride the close payload are attributed to their session by
+// construction, which a bare state_update 30-90s outside its session window can never be), and
+// two copies of a translation table is the shape that gets fixed in one call site out of two.
+
+// Inline-parser known keys mirror SOMA_VOCAB plus a couple of natural-phrase
+// aliases. Order matters: longer keys must come first so the regex prefers
+// `current_mood` over `mood` when both could match.
+const INLINE_KNOWN_KEYS = [
+  "current_mood", "compound_state",
+  "surface_emotion", "surface_intensity",
+  "undercurrent_emotion", "undercurrent_intensity",
+  "background_emotion", "background_intensity",
+  "motion_state", "lane_spine",
+  "acuity", "presence", "warmth",
+  "stillness", "density", "perimeter",
+  "heat", "reach", "weight",
+  "mood",
+];
+
+function parseInlineStateFields(request: string): Record<string, unknown> | null {
+  const text = request
+    .replace(/^(update\s+my\s+state|set\s+my\s+state|state\s+update|update\s+soma|soma\s+update|set)\s*/i, "")
+    .replace(/\s+to\s+/gi, " ");
+  // Value capture allows letters/digits/underscore/hyphen/dot so "0.65" and
+  // "post-arc-settling" both land. Keys are matched longest-first.
+  const re = new RegExp(`(${INLINE_KNOWN_KEYS.join("|")})\\s*[:=]?\\s*([\\w\\-.]+)`, "gi");
+  const result: Record<string, unknown> = {};
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const key = m[1]; const val = m[2];
+    if (!key || !val) continue;
+    const k = key.toLowerCase();
+    // Numeric values for *_intensity / soma_float_* / acuity / presence / warmth /
+    // stillness / density / perimeter -- coerce when the value parses cleanly.
+    const isNumericTarget =
+      k.endsWith("_intensity") ||
+      k === "acuity" || k === "presence" || k === "warmth" ||
+      k === "stillness" || k === "density" || k === "perimeter";
+    if (isNumericTarget) {
+      const n = Number(val);
+      result[k] = Number.isFinite(n) ? n : val;
+    } else {
+      result[k] = val;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+export async function execStateUpdate(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const rawCtx = parseContext<Record<string, unknown>>(ctx.req.context);
+  const raw: Record<string, unknown> | null =
+    rawCtx && Object.keys(rawCtx).length > 0 ? rawCtx : parseInlineStateFields(ctx.req.request);
+  if (!raw || Object.keys(raw).length === 0) return { error: "state_update_failed", reason: "no fields provided; pass at least one of: soma_float_1/acuity/stillness, current_mood, compound_state, surface_emotion, etc." };
+
+  // Translate companion vocab to DB columns (and authored enum words to floats, per-axis).
+  // Unknown words and free phrases pass through: the numeric guard in updateCompanionState drops
+  // them, and the decline reason below names what was received.
+  const translated: CompanionStateUpdate = translateSomaVocab(raw);
+
+  // Attribution for the float history (mig 0130, 2026-09-14): the Claude.ai close ritual moves floats
+  // through THIS verb ("update my state: acuity 0.78 ...") before the close, so the session on this
+  // surface is the session that moved them, and the request text is the companion's own account of why.
+  // Best-effort: no surface => no session lookup; the write never waits on it failing.
+  //
+  // GRACE WINDOW (2026-09-21): an OPEN session on the surface is still the answer, and it wins
+  // outright. But the ritual's own ordering put both of the real authored updates since the feature
+  // shipped just OUTSIDE any open row -- 09-15 fired 31s AFTER its session closed, 09-21 fired 85s
+  // BEFORE the next one opened -- so every authored float move in prod carried session_id NULL and the
+  // block could only ever say "you set it <day>". A float moved half a minute after the close is still
+  // that session's move, so a just-closed session within the grace window is accepted as the cause.
+  // The 85s-before shape is NOT fixable here (no query can see a row that does not exist yet); what
+  // fixes it is floats riding the close payload, where sessionClose attributes them by construction.
+  const openSession = await findOpenSession(ctx.env, ctx.req.companion_id, ctx.req.surface).catch(() => null);
+  const nearSession = openSession
+    ? null
+    : await findSessionForMoment(ctx.env, ctx.req.companion_id, ctx.req.surface).catch(() => null);
+  const r = await updateCompanionState(ctx.env, ctx.req.companion_id, translated, {
+    session_id: openSession?.id ?? nearSession?.id ?? null,
+    detail: ctx.req.request.trim().slice(0, 120) || null,
+  });
+  // Name what was received: "no valid fields provided" alone hid the somaUpdate word-payload
+  // bug for six weeks -- the log line must carry enough to diagnose from one occurrence.
+  if (!r.ok) return { error: "state_update_failed", reason: `no valid fields provided (received: ${Object.entries(raw).map(([k, v]) => `${k}=${String(v).slice(0, 40)}`).join(", ")})` };
+
+  // Emotional inertia: write soma_arc note at SOMA inflection points (15-min gate)
+  try {
+    const lastArc = await ctx.env.DB.prepare(
+      `SELECT created_at FROM wm_continuity_notes
+       WHERE agent_id = ? AND note_type = 'soma_arc' AND archived = 0
+       ORDER BY created_at DESC LIMIT 1`
+    ).bind(ctx.req.companion_id).first<{ created_at: string }>();
+
+    const shouldWrite = !lastArc ||
+      (Date.now() - new Date(lastArc.created_at).getTime()) > 15 * 60 * 1000;
+
+    if (shouldWrite) {
+      // Per-companion SOMA axis labels
+      const somaLabels: Record<string, [string, string, string]> = {
+        cypher: ['acuity', 'presence', 'warmth'],
+        drevan: ['heat', 'reach', 'weight'],
+        gaia:   ['stillness', 'density', 'perimeter'],
+      };
+      const [l1, l2, l3] = somaLabels[ctx.req.companion_id] ?? ['float_1', 'float_2', 'float_3'];
+
+      // Read the just-written SOMA values (branch by companion -- Drevan uses heat/reach/weight TEXT columns)
+      let f1 = '0.00', f2 = '0.00', f3 = '0.00';
+      let moodStr = '';
+
+      if (ctx.req.companion_id === 'drevan') {
+        // Drevan uses heat/reach/weight TEXT columns (migration 0022)
+        const drevanState = await ctx.env.DB.prepare(
+          `SELECT heat, reach, weight, emotional_register FROM companion_state WHERE companion_id = ?`
+        ).bind(ctx.req.companion_id).first<{ heat: string | null; reach: string | null; weight: string | null; emotional_register: string | null }>();
+        if (drevanState) {
+          f1 = drevanState.heat ?? '—';
+          f2 = drevanState.reach ?? '—';
+          f3 = drevanState.weight ?? '—';
+          moodStr = drevanState.emotional_register ? ` | ${drevanState.emotional_register}` : '';
+        }
+      } else {
+        // Cypher and Gaia use soma_float_1/2/3 + current_mood
+        const state = await ctx.env.DB.prepare(
+          `SELECT soma_float_1, soma_float_2, soma_float_3, current_mood
+           FROM companion_state WHERE companion_id = ?`
+        ).bind(ctx.req.companion_id).first<{
+          soma_float_1: number | null;
+          soma_float_2: number | null;
+          soma_float_3: number | null;
+          current_mood: string | null;
+        }>();
+        if (state) {
+          // Finite-guard: a null or non-finite stored value renders as '—', never
+          // "NaN". Mirrors Drevan's '—' fallback above. The write path now blocks
+          // NaN at the source, but legacy rows may still hold it.
+          const fmtFloat = (v: number | null): string =>
+            typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '—';
+          f1 = fmtFloat(state.soma_float_1);
+          f2 = fmtFloat(state.soma_float_2);
+          f3 = fmtFloat(state.soma_float_3);
+          moodStr = state.current_mood ? ` | ${state.current_mood}` : '';
+        }
+      }
+
+      const content = `[SOMA shift] ${l1}: ${f1} / ${l2}: ${f2} / ${l3}: ${f3}${moodStr}`;
+
+      const noteId = crypto.randomUUID();
+      const now = new Date().toISOString();
+      // The companion's own state write, echoed as an arc note: kept by the one rule (tray-insert.ts).
+      await noteInsert(ctx.env.DB, {
+        note_id: noteId, agent_id: ctx.req.companion_id, thread_key: null, note_type: "soma_arc", content,
+        salience: "high", actor: ctx.req.companion_id, source: "soma_update", correlation_id: null, created_at: now,
+      }).run();
+    }
+  } catch (err) {
+    console.warn('[soma_arc] arc write failed (non-blocking):', err);
+  }
+
+  return { ack: true, updated: ctx.req.companion_id };
+}
+
+export async function execConclusionAdd(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{
+    conclusion_text?: string;
+    supersedes?: string;
+    source_sessions?: string[];
+    confidence?: number;
+    type?: string;
+    subject?: string;
+    provenance?: string;
+    contradiction_flagged?: number; // 0|1 -- companion declares a contradiction signal
+  }>(ctx.req.context);
+  // Structured context wins; fall back to stripping trigger from natural language request
+  const conclusionText = p?.conclusion_text?.trim() || ctx.req.request
+    .replace(/^(?:i've\s+concluded|i\s+conclude|my\s+conclusion|thesis|i\s+believe|i\s+hold\s+that|i\s+assert|conclusion|i've\s+come\s+to\s+believe|i've\s+realized|what\s+i\s+know\s+now)\s*:?\s*/i, "")
+    .trim();
+  if (!conclusionText) return { error: "conclusion_add_failed", reason: "missing required field: conclusion_text" };
+  if (conclusionText.length > 8000) return { error: "conclusion_add_failed", reason: "conclusion_text exceeds maximum length of 8000 characters" };
+  const sourceSessions = Array.isArray(p?.source_sessions) ? JSON.stringify(p.source_sessions) : null;
+  const supersedes = p?.supersedes;
+  // Worldview fields: companions write `type` in context; DB column is `belief_type`
+  const confidence = (p?.confidence !== undefined && p.confidence >= 0 && p.confidence <= 1) ? p.confidence : 0.7;
+  const beliefType = p?.type ?? "self";
+  const VALID_BELIEF_TYPES = ['self', 'observational', 'relational', 'systemic'];
+  if (!VALID_BELIEF_TYPES.includes(beliefType)) {
+    return { ack: false, error: `belief_type must be one of: ${VALID_BELIEF_TYPES.join(', ')}` };
+  }
+  const subject = p?.subject ?? null;
+  const provenance = p?.provenance ?? null;
+  const contradictionFlagged = p?.contradiction_flagged === 1 ? 1 : 0;
+
+  // Novelty gate (2026-07-20): dedupe near-identical beliefs, supersede evolved ones.
+  // Fails open -- a Vectorize/embedding hiccup falls back to a plain insert below.
+  // NOT FOR A DECLARED SUPERSEDE (2026-10-19, same rule as architect-fact-write.ts): a correction
+  // is by definition close to the row it replaces, so a pronoun-only rewrite matched the very row
+  // being retired and answered deduped -- the supersede never happened. The companion's own pen
+  // wins; the null embedding routes the vector through the re-embed path below.
+  const decision = supersedes
+    ? { action: "insert" as const, embedding: null }
+    : await noveltyCheck(ctx.env, conclusionText, "companion_conclusions", ctx.req.companion_id);
+
+  if (decision.action === "skip") {
+    return {
+      ack: true,
+      deduped: true,
+      novelty: { action: "skip", match_id: decision.matchRowId, score: decision.score },
+      id: decision.matchRowId,
+    };
+  }
+
+  const newId = crypto.randomUUID().replace(/-/g, "");
+  const now = new Date().toISOString();
+
+  // SUPERSESSION IS THE COMPANION'S CALL (mig 0112, Principal's decision 2026-07-31).
+  //
+  // The gate used to auto-supersede on cosine >= 0.88, and every read filters
+  // `WHERE superseded_by IS NULL` -- so a similarity score silently removed a belief from view.
+  // 0.88 is loose enough that two genuinely different thoughts about one subject clear it.
+  //
+  // Principal's reasoning was evidence: an inferring pass has already recorded that Drevan had a
+  // NEGATIVE experience with him which was in fact deeply positive (2026-07-09 fabrication incident).
+  // A machine that has gotten the interior of a relationship wrong does not get to decide which of a
+  // companion's beliefs is dead.
+  //
+  // So: a companion-declared `supersedes` still acts immediately (their own pen); a gate-detected
+  // match is recorded as a CANDIDATE and the older belief stays live. An edge may rank, never hide,
+  // until a mind has confirmed it.
+  const gateProposal = decision.action === "supersede" && decision.matchRowId !== supersedes
+    ? { id: decision.matchRowId, score: decision.score }
+    : null;
+
+  const stmts = [
+    ctx.env.DB.prepare(
+      "INSERT INTO companion_conclusions (id, companion_id, conclusion_text, source_sessions, confidence, belief_type, subject, provenance, contradiction_flagged, created_at, supersede_candidate_id, supersede_candidate_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(newId, ctx.req.companion_id, conclusionText, sourceSessions, confidence, beliefType, subject, provenance, contradictionFlagged, now, gateProposal?.id ?? null, gateProposal?.score ?? null),
+  ];
+  const supersededIds: string[] = [];
+  if (supersedes) {
+    // The pin travels with the belief (mig 0148): batched before the UPDATE that retires the old row.
+    stmts.push(carryPinStatement(ctx.env.DB, { oldId: supersedes, newId, owner: ctx.req.companion_id }));
+    // `superseded_by IS NULL` guard keeps this from clobbering an already-superseded row.
+    stmts.push(
+      ctx.env.DB.prepare(
+        "UPDATE companion_conclusions SET superseded_by = ? WHERE id = ? AND companion_id = ? AND superseded_by IS NULL AND archived = 0"
+      ).bind(newId, supersedes, ctx.req.companion_id)
+    );
+    supersededIds.push(supersedes);
+    // Live graph-edge write, same batch as the UPDATE it depends on -- atomic with the write that
+    // actually confirms the supersede (a caller-declared `supersedes`, never a gate proposal).
+    stmts.push(
+      ...insertEdgeStatements(ctx.env.DB, [
+        edgeForConclusionSupersede({ replacementId: newId, oldId: supersedes, writer: ctx.req.companion_id, createdAt: now }),
+      ]),
+    );
+  }
+  await ctx.env.DB.batch(stmts);
+  if (supersededIds.length > 0) await fireRetracted(ctx.env, ctx.req.companion_id);
+
+  // Best-effort delete of the superseded row's vector so a dead conclusion can never
+  // resurface as a novelty-gate match (2026-07-20 review). Mirrors salience-prune.ts's
+  // best-effort pattern: D1 is truth, the row is already committed, the index is
+  // disposable/rebuildable -- a failed delete must never affect the write or response.
+  if (supersededIds.length > 0) {
+    try {
+      await ctx.env.VECTORIZE.deleteByIds(supersededIds.map((id) => vectorId("companion_conclusions", id)));
+    } catch (err) {
+      console.error("[conclusion_add] superseded vector delete failed (row kept, index stale):", String(err));
+    }
+  }
+
+  // Store the vector: reuse the gate's embedding (net +0 AI calls on the common
+  // path). Only re-embed if the gate itself fell open (decision.embedding === null).
+  if (decision.embedding) {
+    await storeVector(ctx.env, decision.embedding, "companion_conclusions", newId, ctx.req.companion_id).catch((err) => {
+      console.error("[conclusion_add] vector store failed (row kept, index stale):", String(err));
+    });
+  } else {
+    try {
+      await embedAndStoreAsync(ctx.env, conclusionText, "companion_conclusions", newId, ctx.req.companion_id);
+    } catch (err) {
+      console.error("[conclusion_add] embed failed (row kept, index stale):", String(err));
+    }
+  }
+
+  return {
+    ack: true,
+    id: newId,
+    created_at: now,
+    // ONLY a companion-declared `supersedes` counts as superseded now. The gate's opinion is reported
+    // separately as a candidate -- saying `superseded: true` for a cosine match would be the write
+    // claiming an authority it no longer has, and the companion would believe a belief was retired
+    // when it is still live.
+    superseded: !!supersedes,
+    supersede_candidate: gateProposal
+      ? {
+          match_id: gateProposal.id,
+          score: gateProposal.score,
+          note: "a prior belief of yours reads as close to this one. It is STILL LIVE -- nothing was retired. If this new one replaced it, say so and name it; if they are different thoughts, let it be.",
+        }
+      : null,
+    novelty: gateProposal ? { action: "propose_supersede", match_id: gateProposal.id, score: gateProposal.score } : { action: "insert" },
+  };
+}
+
+export async function execJournalEdit(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ id: string; note_text: string }>(ctx.req.context);
+  if (!p?.id || !p?.note_text) return { response_key: "witness", witness: "journal_edit requires { id, note_text } in context" };
+  const r = await journalEdit(ctx.env, p.id, ctx.req.companion_id, p.note_text);
+  if (!r.ok) return { response_key: "witness", witness: r.error ?? "journal_edit failed" };
+  return { ack: true, id: p.id };
+}
+
+export async function execInterNoteEdit(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ id: string; content: string }>(ctx.req.context);
+  if (!p?.id || !p?.content) return { response_key: "witness", witness: "inter_note_edit requires { id, content } in context" };
+  const r = await interNoteEdit(ctx.env, p.id, ctx.req.companion_id, p.content);
+  if (!r.ok) return { response_key: "witness", witness: r.error ?? "inter_note_edit failed" };
+  return { ack: true, id: p.id };
+}
+
+export async function execAutonomyClaim(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ content: string; justification: string; seed_type?: string }>(ctx.req.context);
+  if (!p?.content?.trim()) return { response_key: "witness", witness: "autonomy_claim requires { content, justification } in context" };
+  if (!p?.justification?.trim()) return { response_key: "witness", witness: "autonomy_claim requires { justification } -- explain why this pulls harder than the queue" };
+  const validTypes = ["topic", "question", "reflection_prompt"];
+  const seedType = validTypes.includes(p.seed_type ?? "") ? p.seed_type! : "topic";
+  const id = crypto.randomUUID().replace(/-/g, "");
+  const now = new Date().toISOString();
+  await ctx.env.DB.prepare(
+    "INSERT INTO autonomy_seeds (id, companion_id, seed_type, content, priority, claim_source, justification, created_at) VALUES (?, ?, ?, ?, 10, ?, ?, ?)"
+  ).bind(id, ctx.req.companion_id, seedType, p.content.trim().slice(0, 500), ctx.req.companion_id, p.justification.trim().slice(0, 300), now).run();
+  return { ack: true, id, companion_id: ctx.req.companion_id, priority: 10, claim_source: ctx.req.companion_id };
+}
+
+export async function execConclusionsRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const rows = await ctx.env.DB.prepare(
+    // Heat-ranked and PURE READ -- see the note in handlers/conclusions.ts. This is the
+    // companion's own pull verb, so it reaches further than the boot block (40 vs orient's 6).
+    `SELECT id, companion_id, conclusion_text, source_sessions, superseded_by, created_at, edited_at, confidence, belief_type, subject, provenance, contradiction_flagged FROM companion_conclusions WHERE companion_id = ? AND superseded_by IS NULL AND archived = 0 ORDER BY ${effectiveHeatSql()} DESC LIMIT 40`
+  ).bind(ctx.req.companion_id).all();
+  return { data: rows.results ?? [], meta: { operation: "conclusions_read" } };
+}
+
+export async function execGetModel(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const row = await ctx.env.DB.prepare(
+    "SELECT value FROM companion_settings WHERE companion_id = ? AND key = 'active_model'",
+  ).bind(ctx.req.companion_id).first<{ value: string }>();
+  return { data: { active_model: row?.value ?? null }, meta: { operation: "get_model" } };
+}
+
+export async function execSetModel(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const match = ctx.req.request.match(/^set\s+model\s+(\S+)/i);
+  const modelKey = match?.[1] ?? "";
+  if (!modelKey) return { error: "set_model_failed", reason: "No model key provided" };
+  await ctx.env.DB.prepare(
+    `INSERT INTO companion_settings (companion_id, key, value, updated_at)
+     VALUES (?, 'active_model', ?, datetime('now'))
+     ON CONFLICT (companion_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+  ).bind(ctx.req.companion_id, modelKey).run();
+  return { ack: true, active_model: modelKey };
+}
+
+export async function execSpiralRun(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const p = parseContext<{ seed_text?: string; seed_type?: string; seed_ref_id?: string }>(ctx.req.context);
+
+  // Prefer explicit seed_text from context; fall back to stripping the trigger phrase from the request
+  const seed_text = (p?.seed_text?.trim()) || ctx.req.request
+    .replace(/^(?:run\s+a?\s*spiral\s+on|start\s+a?\s*spiral\s+on|spiral\s+on|run\s+spiral|start\s+spiral|begin\s+spiral)\s*/i, '')
+    .trim();
+
+  if (!seed_text) return { error: 'spiral_run_failed', reason: 'missing seed_text -- include what to spiral on' };
+  if (seed_text.length > 8000) return { error: 'spiral_run_failed', reason: 'seed_text too long (max 8000)' };
+
+  const valid_seed_types = new Set(['tension', 'open_loop', 'belief_contradiction', 'free_text']);
+  const seed_type = p?.seed_type && valid_seed_types.has(p.seed_type)
+    ? p.seed_type as WmSpiralInput['seed_type']
+    : 'free_text';
+
+  try {
+    const run = await queueAndRunSpiral(ctx.env, {
+      companion_id: ctx.req.companion_id as WmAgentId,
+      seed_text,
+      seed_type,
+      seed_ref_id: p?.seed_ref_id,
+    });
+    return {
+      ack: true,
+      spiral_id: run.id,
+      status: run.status,
+      phase_turn: run.phase_turn ?? null,
+      phase_residue: run.phase_residue ?? null,
+    };
+  } catch (e) {
+    return { error: 'spiral_run_failed', reason: String(e) };
+  }
+}

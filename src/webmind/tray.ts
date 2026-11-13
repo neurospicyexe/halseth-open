@@ -1,0 +1,520 @@
+// src/webmind/tray.ts  (mig 0132, 2026-09-26)
+//
+// THE IMP TRAY. Rows a clerk wrote in the companion's voice sit here as `draft` until the owner
+// keeps (optionally rewriting) or drops them. Only kept rows are memory: every recall/orient read
+// filters review_state = 'kept' (see webmind/review-state.ts for the birth rule).
+//
+// Rails:
+// - Owner-only: a companion reviews exactly its own rows (agent / agent_id bound on every UPDATE).
+// - Keep or drop, never delete: a dropped row stays in D1 with review_state = 'dropped' so the
+//   keep rate has a denominator. The falsifier is the keep rate -- 100% means nobody reviews.
+// - A rewrite on keep replaces the text (the owner speaks it) and re-embeds, so the vector matches
+//   what was kept. The clerk's words are NOT lost: original_content keeps them and rewritten_by names
+//   the owner (mig 0133). The row's source becomes TRAY_REWRITE_SOURCE (authored weight, never
+//   salience-pruned) and a journal row's topic_tags are re-derived from the new text.
+// - reviewed_at is the timestamp of the decision; a draft has none.
+// - Only a live DRAFT can be kept or dropped (pass 2, 2026-09-26). An already-kept or -dropped row is
+//   refused with its state and date -- a companion cannot quietly re-decide, and a repeat never
+//   re-stamps reviewed_at. The guard is in the UPDATE itself (changes === 1), not just in the lookup.
+//   Only the admin route may reverse a decision, with an explicit { reverse: true } (Principal's call).
+//   Archived (retracted/released) rows are refused either way: the tray does not un-retract.
+//
+// Shared by the Librarian verbs (executors/tray.ts) and the raw HTTP routes (handlers/tray.ts).
+
+import { Env } from "../types.js";
+import { embedAndStoreAsync } from "../mcp/embed.js";
+import { isReviewState, TRAY_REWRITE_SOURCE, type ReviewState } from "./review-state.js";
+import { classifyKeywordTags } from "../synthesis/tag-classifier.js";
+import { lintPronouns, formatPronounFlags } from "../pronoun-lint.js";
+
+export type TrayKind = "journal" | "note";
+export type TrayDecision = "kept" | "dropped";
+
+export const TRAY_LIST_LIMIT = 20;
+export const TRAY_STATS_DAYS = 30;
+export const TRAY_EXCERPT_CHARS = 200;
+/** B4: newest named drafts per store the pronoun scan reads, and how many flagged ones lead the list. */
+export const TRAY_FLAG_SCAN = 200;
+export const TRAY_FLAGGED_SHOWN = 10;
+
+/** Names the pronoun lint knows (pronoun-lint.ts KNOWN), as a case-sensitive GLOB prefilter. Literals only. */
+const LINT_NAME_FRAGMENTS = ["Principal", "Crash", "Dre", "Cy", "Gaia", "Spouse"];
+function namedGlobSql(col: string): string {
+  return "(" + LINT_NAME_FRAGMENTS.map((n) => `${col} GLOB '*${n}*'`).join(" OR ") + ")";
+}
+
+interface KindWiring { table: string; idCol: string; ownerCol: string; textCol: string }
+
+const KIND_TABLE: Record<TrayKind, KindWiring> = {
+  journal: { table: "companion_journal",   idCol: "id",      ownerCol: "agent",    textCol: "note_text" },
+  note:    { table: "wm_continuity_notes", idCol: "note_id", ownerCol: "agent_id", textCol: "content"   },
+};
+
+export function parseTrayKind(raw: unknown): TrayKind | null {
+  return raw === "journal" || raw === "note" ? raw : null;
+}
+
+export function parseTrayDecision(raw: unknown): TrayDecision | null {
+  if (raw === "kept" || raw === "keep") return "kept";
+  if (raw === "dropped" || raw === "drop") return "dropped";
+  return null;
+}
+
+export interface TrayDraft {
+  id: string;
+  kind: TrayKind;
+  source: string | null;
+  created_at: string;
+  excerpt: string;
+  /**
+   * B4 pronoun lint on the FULL text (not the excerpt), e.g. `"she" near Principal (they/them)`. Present
+   * only when something was flagged. A question for the reviewer, never a verdict: K7, it may be his
+   * mother's "her". Nothing rewrites the row.
+   */
+  pronoun_flags?: string[];
+  /** B34 step 2: how many merged duplicates of this moment back this draft ("read draft <id>" shows them). Additive. */
+  evidence_count?: number;
+}
+
+export interface TrayStats {
+  /** Live drafts (all time) waiting for review. */
+  draft: number;
+  /** Decisions in the last TRAY_STATS_DAYS days, by outcome. */
+  kept: number;
+  dropped: number;
+  /** kept / (kept + dropped) over the window, as a whole-number percentage; null when nothing was reviewed. */
+  keep_rate_pct: number | null;
+  window_days: number;
+  /** B4: live drafts the pronoun lint flags (scan of up to TRAY_FLAG_SCAN named drafts per store). */
+  pronoun_flagged: number;
+  /**
+   * B34 step 2 (mig 0156): live rows set `merged` into another draft of the same moment. Neither kept nor
+   * dropped (never in the keep rate), not in the tray; reported so a falling draft count is explainable.
+   */
+  merged?: number;
+}
+
+export interface TrayView {
+  agent: string;
+  drafts: TrayDraft[];
+  stats: TrayStats;
+  /** One line for the prompt: the keep rate is the falsifier and must be seen every time. */
+  stats_line: string;
+}
+
+/** Newest-first drafts across both stores for one owner, plus the 30-day decision counts. */
+export async function listTray(env: Env, agent: string, limit = TRAY_LIST_LIMIT): Promise<TrayView> {
+  const cap = Math.min(Math.max(1, limit), 100);
+  // sort_at: created_at normalised IN SQL to one ISO shape, so the two stores merge in true time order.
+  // Rows carry both 'T...Z' (JS writers) and 'YYYY-MM-DD HH:MM:SS' (datetime('now') writers); a raw
+  // string compare puts every space-form row before every T-form row of the same day.
+  const [journal, notes, jStats, nStats, jScan, nScan] = await Promise.all([
+    env.DB.prepare(
+      `SELECT id, source, created_at, ${SORT_AT_SQL} AS sort_at, substr(note_text, 1, ${TRAY_EXCERPT_CHARS}) AS excerpt,
+              note_text AS body
+         FROM companion_journal
+        WHERE agent = ? AND archived = 0 AND review_state = 'draft'
+        ORDER BY sort_at DESC LIMIT ?`,
+    ).bind(agent, cap).all<TrayListRow>(),
+    env.DB.prepare(
+      `SELECT note_id AS id, source, created_at, ${SORT_AT_SQL} AS sort_at, substr(content, 1, ${TRAY_EXCERPT_CHARS}) AS excerpt,
+              content AS body
+         FROM wm_continuity_notes
+        WHERE agent_id = ? AND archived = 0 AND review_state = 'draft'
+        ORDER BY sort_at DESC LIMIT ?`,
+    ).bind(agent, cap).all<TrayListRow>(),
+    env.DB.prepare(statsSql("companion_journal", "agent")).bind(agent).first<StatsRow>(),
+    env.DB.prepare(statsSql("wm_continuity_notes", "agent_id")).bind(agent).first<StatsRow>(),
+    // B4 flag scan: a flagged draft deep in a tray of hundreds would never reach the newest-N listing.
+    // Only rows naming someone the lint knows can flag, so the GLOB prefilter loses nothing.
+    env.DB.prepare(
+      `SELECT id, source, created_at, ${SORT_AT_SQL} AS sort_at, substr(note_text, 1, ${TRAY_EXCERPT_CHARS}) AS excerpt,
+              note_text AS body
+         FROM companion_journal
+        WHERE agent = ? AND archived = 0 AND review_state = 'draft' AND ${namedGlobSql("note_text")}
+        ORDER BY sort_at DESC LIMIT ?`,
+    ).bind(agent, TRAY_FLAG_SCAN).all<TrayListRow>(),
+    env.DB.prepare(
+      `SELECT note_id AS id, source, created_at, ${SORT_AT_SQL} AS sort_at, substr(content, 1, ${TRAY_EXCERPT_CHARS}) AS excerpt,
+              content AS body
+         FROM wm_continuity_notes
+        WHERE agent_id = ? AND archived = 0 AND review_state = 'draft' AND ${namedGlobSql("content")}
+        ORDER BY sort_at DESC LIMIT ?`,
+    ).bind(agent, TRAY_FLAG_SCAN).all<TrayListRow>(),
+  ]);
+
+  type Tagged = TrayListRow & { kind: TrayKind };
+  const tag = (rows: TrayListRow[] | undefined, kind: TrayKind): Tagged[] => (rows ?? []).map((r) => ({ ...r, kind }));
+  const newestFirst = (a: Tagged, b: Tagged) => (b.sort_at ?? "").localeCompare(a.sort_at ?? "");
+  // The full text is read only to lint it; the listing still carries just the excerpt.
+  const shape = ({ sort_at: _sortAt, body, ...d }: Tagged): TrayDraft => {
+    const flags = formatPronounFlags(lintPronouns(body));
+    return flags.length > 0 ? { ...d, pronoun_flags: flags } : d;
+  };
+
+  const flagged = [...tag(jScan.results, "journal"), ...tag(nScan.results, "note")]
+    .map(shape)
+    .filter((d) => d.pronoun_flags)
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const flaggedShown = flagged.slice(0, Math.min(TRAY_FLAGGED_SHOWN, cap));
+  const shownKeys = new Set(flaggedShown.map((d) => `${d.kind}:${d.id}`));
+  const newest = [...tag(journal.results, "journal"), ...tag(notes.results, "note")]
+    .sort(newestFirst)
+    .filter((r) => !shownKeys.has(`${r.kind}:${r.id}`))
+    .slice(0, cap - flaggedShown.length)
+    .map(shape);
+  // Flagged drafts first: a check the owner never sees is not a check.
+  const drafts: TrayDraft[] = [...flaggedShown, ...newest];
+  const scanFull = (jScan.results?.length ?? 0) >= TRAY_FLAG_SCAN || (nScan.results?.length ?? 0) >= TRAY_FLAG_SCAN;
+  const pronounLine = flagged.length > 0
+    ? `; ${flagged.length}${scanFull ? "+" : ""} flagged for pronouns (listed first)`
+    : "";
+
+  const draft = num(jStats?.draft) + num(nStats?.draft);
+  const kept = num(jStats?.kept) + num(nStats?.kept);
+  const dropped = num(jStats?.dropped) + num(nStats?.dropped);
+  const reviewed = kept + dropped;
+  const keep_rate_pct = reviewed > 0 ? Math.round((kept / reviewed) * 100) : null;
+  const merged = num(jStats?.merged) + num(nStats?.merged);
+  const stats: TrayStats = { draft, kept, dropped, keep_rate_pct, window_days: TRAY_STATS_DAYS, pronoun_flagged: flagged.length };
+  if (merged > 0) stats.merged = merged;
+  await attachEvidenceCounts(env, agent, drafts);
+  const stats_line = (keep_rate_pct === null
+    ? `${draft} in the tray; nothing reviewed in ${TRAY_STATS_DAYS}d (keep rate: no denominator yet)`
+    : `${draft} in the tray; ${TRAY_STATS_DAYS}d: ${kept} kept / ${dropped} dropped = keep rate ${keep_rate_pct}%` +
+      (keep_rate_pct === 100 ? " (100% means nobody is reviewing)" : "")) + pronounLine +
+    (merged > 0 ? `; ${merged} merged into other drafts of the same moment` : "");
+
+  return { agent, drafts, stats, stats_line };
+}
+
+/** Additive `evidence_count` per draft from tray_evidence (mode 'on'). Missing table (pre-0156) = no field. */
+async function attachEvidenceCounts(env: Env, agent: string, drafts: TrayDraft[]): Promise<void> {
+  if (drafts.length === 0) return;
+  try {
+    const ids = drafts.map((d) => d.id);
+    const rows = await env.DB.prepare(
+      `SELECT primary_id, COUNT(*) AS n FROM tray_evidence
+        WHERE agent = ? AND mode = 'on' AND primary_id IN (${ids.map(() => "?").join(",")}) GROUP BY primary_id`,
+    ).bind(agent, ...ids).all<{ primary_id: string; n: number }>();
+    const counts = new Map((rows.results ?? []).map((r) => [r.primary_id, num(r.n)]));
+    for (const d of drafts) d.evidence_count = counts.get(d.id) ?? 0;
+  } catch { /* tray_evidence not applied yet: the listing is unchanged */ }
+}
+
+export interface TrayEvidence { table: string; id: string; writer: string; created_at: string; excerpt: string }
+
+/** The merged duplicates behind a PRIMARY (on-mode rows only), so "read draft" still shows what was said. */
+async function readEvidence(env: Env, agent: string, table: "companion_journal" | "wm_continuity_notes", id: string): Promise<TrayEvidence[]> {
+  try {
+    const ev = await env.DB.prepare(
+      `SELECT evidence_table, evidence_id, writer, created_at FROM tray_evidence
+        WHERE agent = ? AND mode = 'on' AND primary_table = ? AND primary_id = ? ORDER BY created_at, id`,
+    ).bind(agent, table, id).all<{ evidence_table: string; evidence_id: string; writer: string; created_at: string }>();
+    const out: TrayEvidence[] = [];
+    for (const e of ev.results ?? []) {
+      const q = e.evidence_table === "companion_journal"
+        ? `SELECT substr(note_text, 1, ${TRAY_EXCERPT_CHARS}) AS excerpt FROM companion_journal WHERE id = ? AND agent = ? AND review_state = 'merged'`
+        : `SELECT substr(content, 1, ${TRAY_EXCERPT_CHARS}) AS excerpt FROM wm_continuity_notes WHERE note_id = ? AND agent_id = ? AND review_state = 'merged'`;
+      const row = await env.DB.prepare(q).bind(e.evidence_id, agent).first<{ excerpt: string | null }>();
+      out.push({ table: e.evidence_table, id: e.evidence_id, writer: e.writer, created_at: e.created_at, excerpt: row?.excerpt ?? "" });
+    }
+    return out;
+  } catch { return []; }
+}
+
+interface StatsRow { draft: number | null; merged?: number | null; kept: number | null; dropped: number | null }
+interface TrayListRow { id: string; source: string | null; created_at: string; sort_at: string | null; excerpt: string; body: string | null }
+
+/** One ISO shape for any stored stamp; falls back to the raw value if SQLite cannot parse it. */
+const SORT_AT_SQL = "COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), created_at)";
+
+function statsSql(table: string, ownerCol: string): string {
+  // `draft` counts live drafts regardless of age (a stale draft is still unreviewed); kept/dropped
+  // count DECISIONS in the window (reviewed_at), which is the only honest denominator for a rate:
+  // rows born kept have no reviewed_at and never enter it. datetime() on BOTH sides: reviewed_at is
+  // 'T...Z' and datetime('now') is space-form, so a raw compare miscounts the boundary day.
+  return `SELECT
+            SUM(CASE WHEN review_state = 'draft' AND archived = 0 THEN 1 ELSE 0 END) AS draft,
+            SUM(CASE WHEN review_state = 'merged' AND archived = 0 THEN 1 ELSE 0 END) AS merged,
+            SUM(CASE WHEN review_state = 'kept' AND datetime(reviewed_at) >= datetime('now', '-${TRAY_STATS_DAYS} days') THEN 1 ELSE 0 END) AS kept,
+            SUM(CASE WHEN review_state = 'dropped' AND datetime(reviewed_at) >= datetime('now', '-${TRAY_STATS_DAYS} days') THEN 1 ELSE 0 END) AS dropped
+          FROM ${table} WHERE ${ownerCol} = ?`;
+}
+
+function num(v: unknown): number {
+  const n = typeof v === "number" ? v : Number(v ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+export interface ReviewInput {
+  agent: string;
+  /** Omitted: the id is looked up in journal first, then notes. */
+  kind?: TrayKind | null;
+  /** Full id, or a prefix of at least 8 characters. */
+  id: string;
+  decision: TrayDecision;
+  /** Keep-with-rewrite: the owner's words replace the clerk's. Ignored on drop. */
+  content?: string | null;
+  /**
+   * Admin only (POST /admin/tray/review { reverse: true }): allow re-deciding a row that is already
+   * kept or dropped. The Librarian verbs never pass it -- a companion decides a draft once.
+   */
+  reverse?: boolean;
+}
+
+export type ReviewResult =
+  | { ok: true; kind: TrayKind; id: string; decision: TrayDecision; rewritten: boolean; reviewed_at: string; previous_state: ReviewState }
+  | { ok: false; reason: "not_found" | "bad_id" | "empty_content" }
+  | { ok: false; reason: "ambiguous"; matches: TrayMatch[] }
+  /** Not a live draft: already decided (kept/dropped, with when), or archived. Nothing changed. */
+  | { ok: false; reason: "already_reviewed"; kind: TrayKind; id: string; review_state: ReviewState; reviewed_at: string | null }
+  | { ok: false; reason: "archived"; kind: TrayKind; id: string; review_state: string }
+  /** Keep-with-rewrite needs mig 0133 (original_content); refused rather than lose the clerk's words. */
+  | { ok: false; reason: "rewrite_unavailable" };
+
+export const MIN_ID_PREFIX = 8;
+const ID_CHARS_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * A usable id or id prefix: 8+ chars, and only the characters ids are minted from (uuid hex, `-`,
+ * `_` in prefixed forms). Checked BEFORE any query, so `%%%%%%%%` or a quote never reaches SQL as
+ * a pattern -- belt to locate()'s substr() braces.
+ */
+export function isTrayId(id: string): boolean {
+  return id.length >= MIN_ID_PREFIX && ID_CHARS_RE.test(id);
+}
+/** How many candidates an ambiguous prefix lists back. */
+export const AMBIGUOUS_LIST_CAP = 10;
+const MATCH_EXCERPT_CHARS = 80;
+
+/** One candidate for an ambiguous prefix: enough to pick the right id, never the whole text. */
+export interface TrayMatch { kind: TrayKind; id: string; created_at: string; review_state: string; excerpt: string }
+
+type LocateResult =
+  | { ok: true; kind: TrayKind; id: string; review_state: string; archived: boolean; reviewed_at: string | null }
+  | { ok: false; reason: "not_found" }
+  | { ok: false; reason: "ambiguous"; matches: TrayMatch[] };
+
+/**
+ * Find the owner's row by exact id or id prefix, in the given kind or across BOTH stores.
+ * An exact id wins outright. Otherwise exactly one prefix match is required: two or more (in one
+ * store, or one in journal + one in notes) is `ambiguous` with the candidates -- never a guess.
+ * (Before 2026-09-26 this was LIMIT 1 journal-first, so an ambiguous prefix on keep/drop silently
+ * decided whichever row sorted first.) The prefix is compared with substr(), not LIKE: `_` is a
+ * LIKE wildcard and legal in an id.
+ */
+async function locate(env: Env, agent: string, id: string, kind: TrayKind | null | undefined): Promise<LocateResult> {
+  const kinds: TrayKind[] = kind ? [kind] : ["journal", "note"];
+  const found: Array<TrayMatch & { exact: boolean; archived: boolean; reviewed_at: string | null; sort_at: string }> = [];
+  for (const k of kinds) {
+    const w = KIND_TABLE[k];
+    const res = await env.DB.prepare(
+      `SELECT ${w.idCol} AS id, review_state, reviewed_at, archived, created_at, ${SORT_AT_SQL} AS sort_at,
+              substr(${w.textCol}, 1, ${MATCH_EXCERPT_CHARS}) AS excerpt
+         FROM ${w.table}
+        WHERE ${w.ownerCol} = ? AND (${w.idCol} = ? OR substr(${w.idCol}, 1, ?) = ?)
+        ORDER BY (${w.idCol} = ?) DESC, sort_at DESC LIMIT ?`,
+    ).bind(agent, id, id.length, id, id, AMBIGUOUS_LIST_CAP + 1)
+      .all<{ id: string; review_state: string; reviewed_at: string | null; archived: number; created_at: string; sort_at: string | null; excerpt: string | null }>();
+    for (const r of res.results ?? []) {
+      found.push({
+        kind: k, id: r.id, review_state: r.review_state, created_at: r.created_at ?? "", excerpt: r.excerpt ?? "",
+        exact: r.id === id, archived: num(r.archived) === 1, reviewed_at: r.reviewed_at ?? null, sort_at: r.sort_at ?? "",
+      });
+    }
+  }
+  const hit = (m: (typeof found)[number]): LocateResult =>
+    ({ ok: true, kind: m.kind, id: m.id, review_state: m.review_state, archived: m.archived, reviewed_at: m.reviewed_at });
+  const exact = found.find((m) => m.exact);
+  if (exact) return hit(exact);
+  if (found.length === 0) return { ok: false, reason: "not_found" };
+  if (found.length === 1) return hit(found[0]!);
+  const matches = found
+    .sort((a, b) => b.sort_at.localeCompare(a.sort_at))
+    .slice(0, AMBIGUOUS_LIST_CAP)
+    .map(({ exact: _e, archived: _a, reviewed_at: _r, sort_at: _s, ...m }) => m);
+  return { ok: false, reason: "ambiguous", matches };
+}
+
+/**
+ * Keep or drop one live draft. Owner-scoped. A row that is not a live draft is refused with its state
+ * (see file header); only { reverse: true } -- the admin route -- may re-decide a kept/dropped row.
+ */
+export async function reviewDraft(env: Env, input: ReviewInput): Promise<ReviewResult> {
+  const id = input.id.trim();
+  if (!isTrayId(id)) return { ok: false, reason: "bad_id" };
+  const content = input.decision === "kept" && typeof input.content === "string" ? input.content.trim() : "";
+  if (input.decision === "kept" && typeof input.content === "string" && content.length === 0) {
+    return { ok: false, reason: "empty_content" };
+  }
+
+  const found = await locate(env, input.agent, id, input.kind);
+  if (!found.ok) return found;
+  const w = KIND_TABLE[found.kind];
+  const now = new Date().toISOString();
+  const previous: ReviewState = isReviewState(found.review_state) ? found.review_state : "kept";
+
+  if (found.archived) return { ok: false, reason: "archived", kind: found.kind, id: found.id, review_state: found.review_state };
+  if (previous !== "draft" && !input.reverse) {
+    return { ok: false, reason: "already_reviewed", kind: found.kind, id: found.id, review_state: previous, reviewed_at: found.reviewed_at };
+  }
+
+  // The guard lives in the UPDATE (a second decision racing this one, or a retraction landing between
+  // locate() and here, changes 0 rows instead of overwriting). reverse lifts only the draft clause.
+  const guard = input.reverse ? "archived = 0" : "archived = 0 AND review_state = 'draft'";
+  let changes = 0;
+
+  if (content) {
+    // SQLite evaluates every SET right-hand side against the PRE-update row, so original_content
+    // captures the clerk's text in the same statement that replaces it; COALESCE keeps the FIRST
+    // original if a reversed row is ever rewritten again.
+    const topicSet = found.kind === "journal" ? ", topic_tags = ?" : "";
+    const topicBind = found.kind === "journal" ? [JSON.stringify(classifyKeywordTags(content))] : [];
+    try {
+      const r = await env.DB.prepare(
+        `UPDATE ${w.table}
+            SET review_state = ?, reviewed_at = ?, edited_at = ?,
+                original_content = COALESCE(original_content, ${w.textCol}), rewritten_by = ?,
+                ${w.textCol} = ?, source = ?${topicSet}
+          WHERE ${w.idCol} = ? AND ${w.ownerCol} = ? AND ${guard}`,
+      ).bind(input.decision, now, now, input.agent, content, TRAY_REWRITE_SOURCE, ...topicBind, found.id, input.agent).run();
+      changes = r.meta?.changes ?? 0;
+    } catch (err) {
+      if (/no such column/i.test(String(err))) {
+        console.warn("[tray] keep-with-rewrite refused: mig 0133 (original_content) not applied yet");
+        return { ok: false, reason: "rewrite_unavailable" };
+      }
+      throw err;
+    }
+    if (changes === 1) {
+      // The vector must say what was KEPT. Non-fatal: D1 is truth, the index is rebuildable.
+      await embedAndStoreAsync(env, content, w.table, found.id, input.agent)
+        .catch((err) => console.warn(`[tray] re-embed failed for ${w.table}:${found.id} (row kept, index stale):`, String(err)));
+    }
+  } else {
+    const r = await env.DB.prepare(
+      `UPDATE ${w.table} SET review_state = ?, reviewed_at = ? WHERE ${w.idCol} = ? AND ${w.ownerCol} = ? AND ${guard}`,
+    ).bind(input.decision, now, found.id, input.agent).run();
+    changes = r.meta?.changes ?? 0;
+  }
+
+  if (changes !== 1) {
+    // Lost a race: re-read what is there now and refuse with it.
+    const again = await locate(env, input.agent, found.id, found.kind);
+    if (!again.ok) return { ok: false, reason: "not_found" };
+    if (again.archived) return { ok: false, reason: "archived", kind: again.kind, id: again.id, review_state: again.review_state };
+    return { ok: false, reason: "already_reviewed", kind: again.kind, id: again.id,
+      review_state: isReviewState(again.review_state) ? again.review_state : "kept", reviewed_at: again.reviewed_at };
+  }
+
+  return { ok: true, kind: found.kind, id: found.id, decision: input.decision, rewritten: content.length > 0, reviewed_at: now, previous_state: previous };
+}
+
+// ── Read one draft in full ──────────────────────────────────────────────────
+// The list shows TRAY_EXCERPT_CHARS and cuts mid-sentence; an owner cannot honestly keep or drop what
+// it has only half read. readDraft returns the whole text plus where the row came from. It serves
+// ANY review_state (draft, kept, dropped) so a decision can be re-checked, and it does NOT filter
+// archived rows -- it says so instead. Owner-scoped and prefix-resolved exactly like reviewDraft.
+
+export interface TrayDraftFull {
+  kind: TrayKind;
+  table: string;
+  id: string;
+  owner: string;
+  review_state: string;
+  reviewed_at: string | null;
+  created_at: string;
+  edited_at: string | null;
+  archived: boolean;
+  source: string | null;
+  /** Leading "[...]" tag on the text (e.g. "discord:pulse"), when the writer stamped one. */
+  prefix: string | null;
+  /** Discord channel id, from a `channel:<id>` tag (journal) or a `discord:<id>` thread_key (notes). */
+  channel: string | null;
+  external_id: string | null;
+  session_id: string | null;
+  tags: string[] | null;
+  thread_key: string | null;
+  note_type: string | null;
+  salience: string | null;
+  actor: string | null;
+  correlation_id: string | null;
+  text: string;
+  /** B4 pronoun lint on `text`; empty when nothing was flagged. See TrayDraft.pronoun_flags. */
+  pronoun_flags: string[];
+  /** B34 step 2: merged duplicates of this moment (on-mode evidence rows). Empty when none. Additive. */
+  evidence: TrayEvidence[];
+}
+
+export type ReadDraftResult =
+  | { ok: true; draft: TrayDraftFull }
+  | { ok: false; reason: "not_found" | "bad_id" }
+  | { ok: false; reason: "ambiguous"; matches: TrayMatch[] };
+
+const PREFIX_RE = /^\s*\[([^\]\n]{1,80})\]/;
+
+function parseTags(raw: unknown): string[] | null {
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return Array.isArray(v) ? v.filter((t): t is string => typeof t === "string") : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function readDraft(env: Env, input: { agent: string; id: string; kind?: TrayKind | null }): Promise<ReadDraftResult> {
+  const id = input.id.trim();
+  if (!isTrayId(id)) return { ok: false, reason: "bad_id" };
+  const found = await locate(env, input.agent, id, input.kind);
+  if (!found.ok) return found;
+
+  if (found.kind === "journal") {
+    const r = await env.DB.prepare(
+      `SELECT id, agent, note_text, tags, session_id, source, external_id, created_at, edited_at,
+              archived, review_state, reviewed_at
+         FROM companion_journal WHERE id = ? AND agent = ?`,
+    ).bind(found.id, input.agent).first<Record<string, unknown>>();
+    if (!r) return { ok: false, reason: "not_found" };
+    const text = String(r["note_text"] ?? "");
+    const tags = parseTags(r["tags"]);
+    const channelTag = tags?.find((t) => t.startsWith("channel:"));
+    const evidence = await readEvidence(env, input.agent, "companion_journal", String(r["id"]));
+    return { ok: true, draft: {
+      kind: "journal", table: "companion_journal", id: String(r["id"]), owner: String(r["agent"]),
+      review_state: String(r["review_state"] ?? "kept"), reviewed_at: str(r["reviewed_at"]),
+      created_at: String(r["created_at"] ?? ""), edited_at: str(r["edited_at"]), archived: num(r["archived"]) === 1,
+      source: str(r["source"]), prefix: PREFIX_RE.exec(text)?.[1] ?? null,
+      channel: channelTag ? channelTag.slice("channel:".length) : null,
+      external_id: str(r["external_id"]), session_id: str(r["session_id"]), tags,
+      thread_key: null, note_type: null, salience: null, actor: null, correlation_id: null,
+      text, pronoun_flags: formatPronounFlags(lintPronouns(text)), evidence,
+    } };
+  }
+
+  const r = await env.DB.prepare(
+    `SELECT note_id, agent_id, thread_key, note_type, content, salience, actor, source, correlation_id,
+            created_at, edited_at, archived, review_state, reviewed_at
+       FROM wm_continuity_notes WHERE note_id = ? AND agent_id = ?`,
+  ).bind(found.id, input.agent).first<Record<string, unknown>>();
+  if (!r) return { ok: false, reason: "not_found" };
+  const text = String(r["content"] ?? "");
+  const threadKey = str(r["thread_key"]);
+  const evidence = await readEvidence(env, input.agent, "wm_continuity_notes", String(r["note_id"]));
+  return { ok: true, draft: {
+    kind: "note", table: "wm_continuity_notes", id: String(r["note_id"]), owner: String(r["agent_id"]),
+    review_state: String(r["review_state"] ?? "kept"), reviewed_at: str(r["reviewed_at"]),
+    created_at: String(r["created_at"] ?? ""), edited_at: str(r["edited_at"]), archived: num(r["archived"]) === 1,
+    source: str(r["source"]), prefix: PREFIX_RE.exec(text)?.[1] ?? null,
+    channel: threadKey?.startsWith("discord:") ? threadKey.slice("discord:".length) : null,
+    external_id: null, session_id: null, tags: null,
+    thread_key: threadKey, note_type: str(r["note_type"]), salience: str(r["salience"]), actor: str(r["actor"]),
+    correlation_id: str(r["correlation_id"]),
+    text, pronoun_flags: formatPronounFlags(lintPronouns(text)), evidence,
+  } };
+}
+
+function str(v: unknown): string | null {
+  return typeof v === "string" && v.length > 0 ? v : null;
+}

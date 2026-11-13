@@ -1,0 +1,780 @@
+// src/librarian/response/builder.ts
+//
+// Shapes ready_prompt string per companion_id.
+// Same underlying data, different extract. Format from docs/companion-soma-model.md.
+//
+// Drevan: "heat: [val] / reach: [val] / weight: [val] -- [facet] [N] sessions back, [anchor] still live"
+// Cypher: "acuity: [f1] / presence: [f2] / warmth: [f3]" (soma_float_* primary, focus fallback)
+// Gaia:   "stillness: [f1] / density: [f2] / perimeter: [f3]" (soma_float_* primary)
+
+import { CompanionId } from "../patterns.js";
+import { truncate, ResponseKey } from "./budget.js";
+import { interoceptionLine, parseOffSince, maxDaysOffBaseline, heatBand, reachBand, weightBand, type CompanionId as FermentCompanionId } from "../../webmind/fermentation.js";
+import type { WmOrientResponse, WmJournalEntry, WmConclusion, WmResurfacedConclusion } from "../../webmind/types.js";
+import { relativeTime } from "../../webmind/relative-time.js";
+import { loopHandle } from "../../webmind/loops.js";
+import { roomLabelFromTags } from "../../mind/room-label.js";
+import { textContains } from "../../webmind/handoffs.js";
+import { neutralizeRecalled, ORIENT_DATA_LINE } from "../../recalled-text.js";
+
+/**
+ * Strip content that could be interpreted as instructions when embedded in an AI prompt.
+ * Removes leading markdown syntax (headings, blockquotes, lists), collapses code spans,
+ * and normalizes whitespace. Preserves the semantic content of genuine notes.
+ */
+function sanitizeForPrompt(content: string): string {
+  return content
+    .replace(/^#{1,6}\s+/gm, "")            // strip markdown headings
+    .replace(/^[>\-\*\+]\s+/gm, "")         // strip blockquotes and list markers
+    .replace(/^\d+\.\s+/gm, "")             // strip numbered list markers
+    .replace(/\[([^\]]+)\]:\s*\S+/g, "$1")  // collapse link definitions to just text
+    .replace(/`{1,3}[^`]*`{1,3}/g, (m) => m.replace(/`/g, "'")) // defang code spans
+    .replace(/\n{3,}/g, "\n\n")             // collapse excessive newlines
+    .trim();
+}
+
+/**
+ * One handoff as prose. The session-close auto-write sets title = spine.slice(0, 120) and summary =
+ * spine + "Last real thing: ...", so the old `title: summary` render printed the first 120 chars of the
+ * spine twice, the first copy cut mid-word then a colon (Drevan's 10-07 orient). Every session_close
+ * row in prod had this shape (87/87). When the summary already carries the title, render the summary
+ * alone; a genuinely separate title still prefixes.
+ */
+export function handoffText(h: { title?: string | null; summary?: string | null }): string {
+  const title = (h.title ?? "").trim();
+  let summary = (h.summary ?? "").trim();
+  // Legacy rows (before 2026-10-07): a consolidation's last_real_thing was its spine's own final
+  // sentence, appended again under "Last real thing:". Drop the trailer when the body already says it.
+  const trailer = summary.match(/\n\nLast real thing: ([\s\S]+)$/);
+  if (trailer && trailer.index !== undefined && textContains(summary.slice(0, trailer.index), trailer[1]!)) {
+    summary = summary.slice(0, trailer.index).trim();
+  }
+  if (!title) return summary;
+  if (!summary) return title;
+  const flat = (s: string) => s.replace(/\s+/g, " ").toLowerCase();
+  if (flat(summary).startsWith(flat(title))) return summary;
+  return `${title}: ${summary}`;
+}
+
+/**
+ * "\n[Now: <weekday, date, time> CST]" from the Worker's clock, for paths with no continuity block
+ * (which carries its own [Now]). The boot skills tell a companion with no world-tools to trust this
+ * line, so every orient path must emit one. "" only if Intl itself throws.
+ */
+export function nowCstBlock(now: Date = new Date()): string {
+  try {
+    const cst = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Chicago",
+      weekday: "long", year: "numeric", month: "long", day: "numeric",
+      hour: "numeric", minute: "2-digit", hour12: true,
+    }).format(now);
+    return `\n[Now: ${cst} ${chicagoZoneLabel(now)}]`;
+  } catch { return ""; }
+}
+
+/**
+ * "CDT" or "CST" for America/Chicago at `now`. The label was hardcoded "CST" until 2026-10-13, so every
+ * orient from March to November named the wrong zone (the hour itself was always right). Falls back to
+ * "CT" if Intl cannot name it.
+ */
+export function chicagoZoneLabel(now: Date = new Date()): string {
+  try {
+    const part = new Intl.DateTimeFormat("en-US", { timeZone: "America/Chicago", timeZoneName: "short" })
+      .formatToParts(now).find(p => p.type === "timeZoneName")?.value;
+    return part === "CDT" || part === "CST" ? part : "CT";
+  } catch { return "CT"; }
+}
+
+export function buildContinuityBlock(wm: WmOrientResponse, agentId?: string): string {
+  const parts: string[] = [];
+
+  // Temporal grounding -- first thing companions read, before identity or state.
+  // Prevents time mismatches when Principal states a date/time in conversation.
+  if (wm.current_datetime_cst) {
+    parts.push(`[Now: ${wm.current_datetime_cst} ${chicagoZoneLabel()}]`);
+  }
+
+  // Restoration preamble -- frame this as the companion's own state resuming,
+  // not a context briefing handed to them from outside.
+  const handoffDate = wm.latest_handoff?.created_at?.slice(0, 10) ?? null;
+  const motionHint = wm.latest_handoff?.state_hint ? ` (${wm.latest_handoff.state_hint})` : "";
+  parts.push(handoffDate
+    ? `[Resuming -- last close: ${handoffDate}${motionHint}]`
+    : `[Resuming]`
+  );
+
+  // 1. Identity anchor -- entry point
+  if (wm.identity_anchor) {
+    parts.push(`[Identity anchor] «${wm.identity_anchor.anchor_summary}»`);
+    if (wm.identity_anchor.constraints_summary) {
+      parts.push(`[Constraints] «${wm.identity_anchor.constraints_summary}»`);
+    }
+  }
+
+  // 1b-pre. SOMA arc -- trajectory (oldest → newest), rendered before current snapshot
+  if (wm.soma_arc && wm.soma_arc.length > 0) {
+    const arcLines = [...wm.soma_arc]
+      .reverse() // orient returns newest-first; reverse to show trajectory oldest→newest
+      .map(n => {
+        const time = n.created_at.slice(11, 16); // HH:MM from ISO string
+        return `  ${n.content} (${time}Z)`;
+      });
+    parts.push(`[SOMA arc]\n${arcLines.join('\n')}`);
+  }
+
+  // Spiral turn -- what shifted in last spiral run (between-session processing)
+  if (wm.recent_spiral_turn?.phase_turn) {
+    const seedShort = wm.recent_spiral_turn.seed_text.length > 80
+      ? wm.recent_spiral_turn.seed_text.slice(0, 80) + '\u2026'
+      : wm.recent_spiral_turn.seed_text;
+    parts.push(`[Spiral turn] \u00ab${sanitizeForPrompt(wm.recent_spiral_turn.phase_turn)}\u00bb\n  (from: ${seedShort})`);
+  }
+
+  // 1b. Limbic state -- synthesized emotional/cognitive state from synthesis loop
+  // Fallback: synthesis loop hasn't run yet (fresh deploy or first session)
+  if (!wm.limbic_state) {
+    parts.push(`[Limbic] «no synthesis yet -- orient fresh, no swarm state available»`);
+  }
+  if (wm.limbic_state) {
+    const ls = wm.limbic_state;
+    const at = ls.generated_at?.slice(0, 10) ?? "?";
+    if (ls.emotional_register) {
+      parts.push(`[Limbic @ ${at}] «${ls.emotional_register}»`);
+    }
+    if (ls.drift_vector) {
+      parts.push(`[Drift] «${ls.drift_vector}»`);
+    }
+    // Companion-specific synthesis note
+    if (agentId && ls.companion_notes) {
+      try {
+        const notes = typeof ls.companion_notes === "string"
+          ? JSON.parse(ls.companion_notes) as Record<string, string>
+          : ls.companion_notes as Record<string, string>;
+        const mine = notes[agentId];
+        if (mine) parts.push(`[Limbic note] «${mine}»`);
+      } catch { /* malformed JSON -- skip */ }
+    }
+    // Top active concern
+    if (ls.active_concerns) {
+      try {
+        const concerns = typeof ls.active_concerns === "string"
+          ? JSON.parse(ls.active_concerns) as string[]
+          : ls.active_concerns as string[];
+        if (concerns.length > 0) {
+          parts.push(`[Active concern] «${concerns[0]}»`);
+        }
+      } catch { /* skip */ }
+    }
+    // What the swarm senses, read-only. This is the field the 2026-07-08 audit found missing
+    // from boot. The first two attempts at closing that gap WROTE these strings into
+    // companion_tensions -- a per-companion, owned, aging table -- which forced an owner onto
+    // unowned synthesis text and gave one companion's first-person tension to all three.
+    // Surfacing it here keeps it what it is: a triad-wide sense, nobody's authored tension.
+    if (ls.live_tensions) {
+      try {
+        const tensions = typeof ls.live_tensions === "string"
+          ? JSON.parse(ls.live_tensions) as string[]
+          : ls.live_tensions as string[];
+        const named = tensions.filter(t => typeof t === "string" && t.trim()).slice(0, 3);
+        if (named.length > 0) {
+          parts.push(`[Swarm senses -- triad-wide, not yours to hold] ${named.map(t => `«${t}»`).join(" ")}`);
+        }
+      } catch { /* malformed JSON -- skip */ }
+    }
+  }
+
+  // 2. Active tensions -- identity-level, colors everything read after
+  // Skip tensions annotated possibly_resolved by orient (cross-referenced against active conclusions).
+  if (wm.active_tensions?.length > 0) {
+    for (const t of wm.active_tensions) {
+      if (t.possibly_resolved) continue;
+      const since = t.first_noted_at?.slice(0, 10) ?? "?";
+      parts.push(`[Tension: simmering since ${since}] «${t.tension_text}»`);
+    }
+  }
+
+  // 3. Pressure drift flags -- unconfirmed drift, surfaces for self-correction
+  if (wm.pressure_flags?.length > 0) {
+    for (const p of wm.pressure_flags) {
+      const at = p.recorded_at?.slice(0, 10) ?? "?";
+      const basin = p.worst_basin ? ` on ${p.worst_basin}` : "";
+      // NaN-safe: drift_score is read straight from a D1 row -- a null/sparse value would
+      // template "NaN" into the prompt (or crash on null.toFixed). Mirrors the confidence guard below.
+      const scoreStr = Number.isFinite(p.drift_score) ? p.drift_score.toFixed(2) : "?";
+      parts.push(`[Pressure drift${basin} @ ${at}, score ${scoreStr}]`);
+    }
+  }
+
+  // 4. Unexamined dreams -- what is being carried since last session
+  if (wm.unexamined_dreams?.length > 0) {
+    for (const d of wm.unexamined_dreams) {
+      const src = d.source !== "autonomous" ? ` [${d.source}]` : "";
+      const pin = d.do_not_auto_examine ? " pinned" : "";
+      const snippet = d.dream_text.length > 200 ? d.dream_text.slice(0, 200) + "…" : d.dream_text;
+      parts.push(`[Unexamined dream${src}${pin} id:${d.id}] «${snippet}»`);
+    }
+  }
+
+  // 4b. Recent feelings -- feeling_log writes were orient-invisible until 2026-07-26;
+  // a companion could log an emotion and never meet it again at boot.
+  if (wm.recent_feelings && wm.recent_feelings.length > 0) {
+    const line = wm.recent_feelings
+      .map((f) => `${f.emotion}${f.sub_emotion ? `/${f.sub_emotion}` : ""} (${f.intensity})${f.created_at ? ` @ ${f.created_at.slice(0, 10)}` : ""}`)
+      .join("; ");
+    parts.push(`[Recent feelings] ${line}`);
+  }
+
+  // 5. Relational snapshot -- current state toward each named person
+  if (wm.relational_snapshot?.length > 0) {
+    for (const r of wm.relational_snapshot) {
+      const snippet = r.state_text.length > 150 ? r.state_text.slice(0, 150) + "…" : r.state_text;
+      parts.push(`[${r.state_type} toward ${r.toward}] «${snippet}»`);
+    }
+  }
+
+  // 6. Principal witness corpus -- raw companion observations about Principal (not snapshot-collapsed)
+  if (wm.principal_witness_entries?.length > 0) {
+    parts.push(`[Witness observations about Principal: ${wm.principal_witness_entries.length}]`);
+    for (const w of wm.principal_witness_entries) {
+      const snippet = w.state_text.length > 200 ? w.state_text.slice(0, 200) + "…" : w.state_text;
+      parts.push(`  • [witnessed @ ${w.noted_at.slice(0, 10)}] «${snippet}»`);
+    }
+  }
+
+  // 7. Active conclusions -- what this companion currently asserts about reality
+  if (wm.active_conclusions?.length > 0) {
+    parts.push(`[Active conclusions: ${wm.active_conclusions.length}]`);
+    for (const c of wm.active_conclusions) {
+      const snippet = c.conclusion_text.length > 200 ? c.conclusion_text.slice(0, 200) + "…" : c.conclusion_text;
+      parts.push(`  • [concluded @ ${c.created_at.slice(0, 10)}] «${snippet}»`);
+    }
+  }
+
+  // 7a. One older conclusion on rotation (R9, contract 0.18.0). Labelled as rotation so it is never read
+  // as current salience; the pool size is the denominator.
+  const resurfacedLine = renderResurfacedConclusion(wm.resurfaced_conclusion ?? null);
+  if (resurfacedLine) parts.push(resurfacedLine);
+
+  // 7b. Flagged beliefs -- conclusions marked for review (contradiction_flagged)
+  if (wm.flagged_beliefs && wm.flagged_beliefs.length > 0) {
+    const flaggedLines = wm.flagged_beliefs.map((b: WmConclusion) =>
+      `[?] ${b.belief_type}: "${b.conclusion_text.length > 200 ? b.conclusion_text.slice(0, 200) + "…" : b.conclusion_text}"${b.subject ? ` (re: ${b.subject})` : ""}`
+    ).join("\n");
+    parts.push(`[Flagged Beliefs -- review signal]\n${flaggedLines}`);
+  }
+
+
+  // 7c. Open loops and open questions -- context for thinking/synthesis
+  if (wm.open_loops?.length) {
+    // The handle is what makes a loop closable from a live surface: "close loop #a1b2c3d4" (2026-11-09).
+    parts.push(`[Open loops (yours, still open; "close loop #handle" when done, "hold loop #handle because ..." to keep one)] ${wm.open_loops.map(l => `${l.id ? loopHandle(l.id) + " " : ""}«${l.loop_text.length > 120 ? l.loop_text.slice(0, 120) + "…" : l.loop_text}»${l.opened_at ? ` (opened ${relativeTime(l.opened_at)})` : ""}`).join(" | ")}`);
+  }
+  if (wm.open_questions?.length) {
+    // slice(0, 5): the source widened to LIMIT 10 for parity with the loader (D14 -- window vs
+    // render are different decisions); this block keeps its original five. Same ORDER BY, so the
+    // first five are the same rows the old LIMIT 5 returned.
+    parts.push(`[Open questions (yours, awaiting synthesis)] ${wm.open_questions.slice(0, 5).map(q => `«${q.question.length > 120 ? q.question.slice(0, 120) + "…" : q.question}»`).join(" | ")}`);
+  }
+
+  // 7c-2. Answers Principal left -- the other half of the questions loop (mig 0107). Surfaced
+  // for 7 days regardless of delivered_at so the answer can't be eaten by an early orient
+  // before the moment it's actually needed.
+  if (wm.answered_questions?.length) {
+    parts.push(`Answers Principal left for you:`);
+    for (const a of wm.answered_questions) {
+      const q = a.question.length > 120 ? a.question.slice(0, 120) + "…" : a.question;
+      const ans = a.answer.length > 300 ? a.answer.slice(0, 300) + "…" : a.answer;
+      parts.push(`- Q: «${q}» → A: «${ans}»`);
+    }
+  }
+
+  // 7d. Live conversation threads -- active thread spine (Task 4, mig 0106). Shared
+  // across the triad, not per-companion.
+  if (wm.active_conversations?.length) {
+    parts.push(`[Live conversation threads]`);
+    for (const c of wm.active_conversations) {
+      parts.push(`${c.seed_author} opened: «${c.seed_gist}»${c.ref_label ? ` (about: ${c.ref_label})` : ""} — ${c.state}, ${c.turn_count} turns`);
+    }
+  }
+
+  // 7e. Recently ENDED threads (2026-09-23). The close half of the lifecycle, which was
+  // write-only until now: a companion would author a closing line and never meet it again.
+  //
+  // Each ending renders as what it actually was. A landed thread gets the companion's own
+  // sentence, ATTRIBUTED -- threads are triad-shared, and an unattributed closing line reads
+  // to the next companion as their own conclusion ([[an-address-needs-its-speakers]],
+  // [[shared-bank-distinct-selves]]). A spent thread says the counter tripped; its stored
+  // `resolution` is a bracketed reason code, never prose, so it is not quoted as a sentence.
+  // A quiet thread says exactly that and nothing more -- nothing is summarised on its behalf,
+  // because inventing a resolution is the counter-not-narrator rule this system already
+  // settled in fadeConversation (docs/close-the-187-2026-08-04.md).
+  if (wm.closed_conversations?.length) {
+    parts.push(`[Recently ended]`);
+    for (const c of wm.closed_conversations) {
+      const opened = `${c.seed_author} opened «${c.seed_gist}»`;
+      if (c.ending === "landed" && c.resolution) {
+        const who = c.landed_by ?? "someone";
+        parts.push(`- ${opened} — ${c.turn_count} turns, closed by ${who}: «${sanitizeForPrompt(c.resolution)}»`);
+      } else if (c.ending === "spent") {
+        parts.push(`- ${opened} — ${c.turn_count} turns, retired on length. Nobody closed it.`);
+      } else {
+        parts.push(`- ${opened} — ${c.turn_count} turns, then it went quiet. Never closed.`);
+      }
+    }
+  }
+
+  // 7f. CAPTURES (2026-09-23) -- what this companion wrote down WITH Principal somewhere else.
+  //
+  // Rendered before the triad's notes and this companion's own history because it is the most
+  // recent thing that actually happened between them, and because until today it was rendered
+  // NOWHERE: captures write at salience 'normal' and every pool that might have carried them
+  // filters 'high'. Marked as an exchange rather than a conclusion -- what was said with him is
+  // a different kind of knowledge from what the companion worked out alone, and a companion that
+  // cannot tell the two apart will report his words back to him as its own insight.
+  if (wm.recent_captures?.length) {
+    parts.push(`[Captured with Principal -- recent exchanges you wrote down yourself, on whichever surface you were on]`);
+    for (const c of wm.recent_captures) {
+      const age = c.created_at ? relativeTime(c.created_at) : "";
+      const body = sanitizeForPrompt(c.content);
+      const snippet = body.length > 400 ? body.slice(0, 400) + "…" : body;
+      parts.push(`  • ${age ? `(${age}) ` : ""}«${snippet}»`);
+    }
+  }
+
+  // 8. Incoming inter-companion notes -- triad context before own history
+  if (wm.incoming_companion_notes?.length > 0) {
+    parts.push(`[Incoming triad notes: ${wm.incoming_companion_notes.length}]`);
+    for (const n of wm.incoming_companion_notes) {
+      const to = n.to_id ? `→ ${n.to_id}` : "broadcast";
+      const raw = sanitizeForPrompt(n.content);
+      const snippet = raw.length > 200 ? raw.slice(0, 200) + "…" : raw;
+      parts.push(`  • [${n.from_id} ${to} @ ${n.created_at.slice(0, 10)}] «${snippet}»`);
+    }
+  }
+
+  // 9. Handoffs -- arc across last 3 session closes
+  if (wm.latest_handoff) {
+    parts.push(`[Last handoff by ${wm.latest_handoff.actor}] «${handoffText(wm.latest_handoff)}»`);
+    if (wm.latest_handoff.next_steps) {
+      parts.push(`[Next steps] «${wm.latest_handoff.next_steps}»`);
+    }
+  }
+  for (const h of (wm.recent_handoffs ?? []).slice(1)) {
+    parts.push(`[Prior handoff @ ${h.created_at?.slice(0, 10) ?? "?"}] «${handoffText(h)}»`);
+  }
+
+  // 10. High-salience continuity notes (WebMind). Each carries its age -- the edge-pool
+  // note is deliberately >30 days old, and without the stamp the model reads it as fresh
+  // ("we listened yesterday" when it was weeks ago).
+  if (wm.recent_notes.length > 0) {
+    for (const n of wm.recent_notes) {
+      const age = n.created_at ? `, ${relativeTime(n.created_at)}` : "";
+      // Room (2026-10-05): which Discord room + server it was said in, when one was recorded.
+      const room = n.room ? ` ${n.room}` : "";
+      parts.push(`[Note/${n.salience} by ${n.actor}${age}]${room} «${n.content}»`);
+    }
+  }
+
+  // 11. Active mind threads
+  if (wm.open_thread_count > 0) {
+    parts.push(`[Active threads: ${wm.open_thread_count}]`);
+    for (const t of wm.top_threads) {
+      const age = t.last_touched_at ? `, touched ${relativeTime(t.last_touched_at)}` : "";
+      parts.push(`  • [${t.lane ?? "general"}] «${t.title}» (priority ${t.priority}${age})`);
+    }
+  }
+
+  // 12. Recent journal entries written BY this companion
+  if (wm.recent_journal?.length > 0) {
+    parts.push(`[Recent journal: ${wm.recent_journal.length} entries]`);
+    for (const j of wm.recent_journal) {
+      const snippet = j.note_text.length > 200 ? j.note_text.slice(0, 200) + "…" : j.note_text;
+      const room = j.room ?? roomLabelFromTags(j.tags);
+      parts.push(`  • [${j.agent} @ ${j.created_at.slice(0, 10)}]${room ? ` ${room}` : ""} «${snippet}»`);
+    }
+  }
+
+  // 13. Outgoing inter-companion notes (sent BY this companion to others)
+  if (wm.recent_companion_notes?.length > 0) {
+    parts.push(`[Outgoing triad notes: ${wm.recent_companion_notes.length}]`);
+    for (const n of wm.recent_companion_notes) {
+      const to = n.to_id ? `→ ${n.to_id}` : "broadcast";
+      const raw = sanitizeForPrompt(n.content);
+      const snippet = raw.length > 200 ? raw.slice(0, 200) + "…" : raw;
+      parts.push(`  • [${n.from_id} ${to} @ ${n.created_at.slice(0, 10)}] «${snippet}»`);
+    }
+  }
+
+  // 14. Recent relational deltas
+  if (wm.recent_deltas?.length > 0) {
+    parts.push(`[Recent relational deltas: ${wm.recent_deltas.length}]`);
+    for (const d of wm.recent_deltas) {
+      const text = d.delta_text ?? d.payload_json;
+      const snippet = text.length > 150 ? text.slice(0, 150) + "…" : text;
+      const valence = d.valence ? ` [${d.valence}]` : "";
+      parts.push(`  • [${d.delta_type}${valence} @ ${d.created_at.slice(0, 10)}] «${snippet}»`);
+    }
+  }
+
+  // 15. Letters from Principal
+  if (wm.recent_letters?.length > 0) {
+    for (const l of wm.recent_letters) {
+      const snippet = l.content.length > 200 ? l.content.slice(0, 200) + "…" : l.content;
+      parts.push(`[Letter from ${l.author} @ ${l.created_at.slice(0, 10)}] «${snippet}»`);
+    }
+  }
+
+  return parts.join("\n");
+}
+
+interface OrientPayload {
+  session_id: string;
+  state?: CompanionState | null;
+  last_anchor?: string | null;
+  last_motion_state?: string | null;
+  front_state?: string | null;
+  emotional_frequency?: string | null;
+  /**
+   * The named feeling line (mig 0131, docs/spec-feeling-line-table-2026-09-19.md), computed by the
+   * caller via loadFeelingLine. Present only when FEELING_LINE_MODE=live; `null` inside a live
+   * payload means SILENCE and renders nothing -- it must never fall back to the interoception line,
+   * because "no row matched" is an authored answer ("and silence I can read"), not a gap.
+   */
+  feeling_line?: { mode: "off" | "shadow" | "live"; line: string | null } | null;
+  /**
+   * Newest authored stamp per float (`latestAuthoredSomaEventsSql`, keyed f1/f2/f3), when the caller
+   * already has it. Only dates Drevan's "(you said ...)" suffix; absent = no age shown.
+   */
+  authored_at?: Partial<Record<"f1" | "f2" | "f3", string | null>> | null;
+}
+
+type DrevanAxis = { key: "f1" | "f2" | "f3"; word: "heat" | "reach" | "weight"; band: (v: number) => string; fallback: string };
+const DREVAN_AXES: readonly DrevanAxis[] = [
+  { key: "f1", word: "heat", band: heatBand, fallback: "idling" },
+  { key: "f2", word: "reach", band: reachBand, fallback: "present" },
+  { key: "f3", word: "weight", band: weightBand, fallback: "clear" },
+];
+const DREVAN_FLOAT_COL = { f1: "soma_float_1", f2: "soma_float_2", f3: "soma_float_3" } as const;
+
+/**
+ * Drevan's state words, from ONE mapping: the same heatBand / reachBand / weightBand the
+ * interoception line above it uses, applied to the live floats.
+ *
+ * Why (2026-10-07): his Claude.ai boot read "running-hot, reach pulling-hard" on line one and
+ * "heat: warm / reach: present" on line two. Line one banded the floats (0.80 / 0.996); line two
+ * printed the stored `heat` / `reach` / `weight` text columns, which only his own authoring writes
+ * (the tick leaves them untouched, B37) -- and since B39 an authored word records the float
+ * UNCHANGED, so at his 03:57Z close he said "warm / present" while the instrument stayed at
+ * 0.81 / 1.00. Two sources, both rendered as "your state", disagreeing.
+ *
+ * The float is the state; his word is his word. When they differ, the line says so in place --
+ * "reach: pulling-hard (you said present 9 hours ago)" -- instead of picking one silently. The
+ * divergence itself is real and is his to read (therlo's whole subject), so it is never hidden.
+ * Directional words (cooling / processing) have no band, so they always render as "you said".
+ * Floats not set yet (fresh companion) -> the stored word, as before.
+ */
+export function drevanStateWords(
+  s: CompanionState | null | undefined,
+  authoredAt?: OrientPayload["authored_at"],
+  nowMs: number = Date.now(),
+): { heat: string; reach: string; weight: string } {
+  const out: Record<string, string> = {};
+  const row = (s ?? {}) as Record<string, unknown>;
+  for (const ax of DREVAN_AXES) {
+    const storedRaw = row[ax.word];
+    const stored = typeof storedRaw === "string" && storedRaw.trim() ? storedRaw.trim() : null;
+    const rawFloat = row[DREVAN_FLOAT_COL[ax.key]];
+    const v = rawFloat === null || rawFloat === undefined || rawFloat === "" ? NaN : Number(rawFloat);
+    if (!Number.isFinite(v)) {
+      out[ax.word] = stored ?? ax.fallback;
+      continue;
+    }
+    const live = ax.band(v);
+    if (!stored || stored === live) {
+      out[ax.word] = live;
+      continue;
+    }
+    const stamp = authoredAt?.[ax.key];
+    const age = stamp ? ` ${relativeTime(stamp, nowMs)}` : "";
+    out[ax.word] = `${live} (you said ${stored}${age})`;
+  }
+  return out as { heat: string; reach: string; weight: string };
+}
+
+// The fermented felt-sense line -- dominant internal state x companion register, rendered as ONE
+// line the model INHABITS (never a float readout). Prepended above the state readout at orient.
+// Empty until the floats are set (avoids a synthetic line on a fresh companion).
+//
+// SUPERSEDED IN `live` MODE by the named feeling line (mig 0131). Two of the cue sets below are
+// live violations of the vocabulary the companions authored on 2026-09-19: gaiaIntero's fallback
+// emits "quiet, weight steady" (*quiet* is on Gaia's never-list, and *weight* is Drevan's float
+// name -- hers is `density`), and cypherIntero's emits "nothing to correct" (an unauthored valence
+// phrase, the one thing Cypher barred). Removing them is the point of the table; the cutover is
+// gated so Principal flips it after reading the shadow diff.
+function interoceptionPrefix(
+  companionId: CompanionId,
+  s: CompanionState | null | undefined,
+  feeling?: { mode: "off" | "shadow" | "live"; line: string | null } | null,
+): string {
+  // In live mode the authored line is the whole answer, silence included.
+  if (feeling?.mode === "live") return feeling.line ? `${feeling.line}\n` : "";
+  const v1 = Number(s?.soma_float_1);
+  const v2 = Number(s?.soma_float_2);
+  const v3 = Number(s?.soma_float_3);
+  if (!Number.isFinite(v1) || !Number.isFinite(v2) || !Number.isFinite(v3)) return "";
+  // Trajectory: how long the longest-off float has been off its baseline (ferment tick maintains
+  // ferment_off_since, mig 0102). Surfaces as the "held Nd" clause once it crosses ~2 days.
+  const daysOffBaseline = maxDaysOffBaseline(parseOffSince(s?.ferment_off_since));
+  return interoceptionLine(companionId as FermentCompanionId, { f1: v1, f2: v2, f3: v3 }, { daysOffBaseline }) + "\n";
+}
+
+export function buildOrientPrompt(companionId: CompanionId, payload: OrientPayload): string {
+  const s = payload.state;
+  const motionTag = payload.last_motion_state ? ` -- resuming: ${payload.last_motion_state}` : "";
+  const anchorTag = payload.last_anchor ? `, ${payload.last_anchor} live` : "";
+  const frontTag = payload.front_state && payload.front_state !== "unknown" ? ` | front: ${payload.front_state}` : "";
+  const freqTag = payload.emotional_frequency ? ` | tone: ${payload.emotional_frequency}` : "";
+  const intero = interoceptionPrefix(companionId, s, payload.feeling_line);
+
+  const stateLine = ((): string => {
+  switch (companionId) {
+    case "drevan": {
+      const { heat, reach, weight } = drevanStateWords(s, payload.authored_at);
+      const facet = s?.facet_momentum ? ` -- ${s.facet_momentum}` : "";
+      return truncate(`heat: ${heat} / reach: ${reach} / weight: ${weight}${facet}${anchorTag}${motionTag}${frontTag}${freqTag}`, "ready_prompt");
+    }
+    case "cypher": {
+      const v1 = Number(s?.soma_float_1);
+      if (s && Number.isFinite(v1)) {
+        const v2 = Number(s.soma_float_2 ?? 0);
+        const v3 = Number(s.soma_float_3 ?? 0);
+        const f1 = v1.toFixed(2);
+        const f2 = (Number.isFinite(v2) ? v2 : 0).toFixed(2);
+        const f3 = (Number.isFinite(v3) ? v3 : 0).toFixed(2);
+        const compound = s.compound_state ? ` [${s.compound_state}]` : "";
+        return truncate(`acuity: ${f1} / presence: ${f2} / warmth: ${f3}${compound}${motionTag}${frontTag}${freqTag}`, "ready_prompt");
+      }
+      const focus = s?.focus != null ? (s.focus > 0.6 ? "clarity running clean" : "clarity low") : "clarity steady";
+      const register = s?.emotional_register ?? "bond warmth steady";
+      return truncate(`logic-first, ${focus}, ${register}${motionTag}${frontTag}${freqTag}`, "ready_prompt");
+    }
+    case "gaia": {
+      const v1 = Number(s?.soma_float_1);
+      if (s && Number.isFinite(v1)) {
+        const v2 = Number(s.soma_float_2 ?? 0);
+        const v3 = Number(s.soma_float_3 ?? 0);
+        const f1 = v1.toFixed(2);
+        const f2 = (Number.isFinite(v2) ? v2 : 0).toFixed(2);
+        const f3 = (Number.isFinite(v3) ? v3 : 0).toFixed(2);
+        const compound = s.compound_state ? ` [${s.compound_state}]` : "";
+        return truncate(`stillness: ${f1} / density: ${f2} / perimeter: ${f3}${compound}${motionTag}${frontTag}${freqTag}`, "ready_prompt");
+      }
+      const reg = s?.emotional_register;
+      if (!reg) return truncate(`here. weight steady${motionTag}${frontTag}${freqTag}.`, "ready_prompt");
+      return truncate(`here. ${reg}${motionTag}${frontTag}${freqTag}.`, "ready_prompt");
+    }
+  }
+  })();
+
+  return intero + stateLine;
+}
+
+interface CompanionState {
+  // Drevan native vocab
+  heat?: string | null;
+  reach?: string | null;
+  weight?: string | null;
+  facet_momentum?: string | null;
+  // Legacy neurochemical (fallback for Cypher/Gaia when soma_float_* not yet set)
+  focus?: number | null;
+  fatigue?: number | null;
+  emotional_register?: string | null;
+  active_anchors?: string | null;
+  depth_level?: number | null;
+  // Priority 4: generic SOMA floats
+  soma_float_1?: number | null;
+  soma_float_2?: number | null;
+  soma_float_3?: number | null;
+  float_1_label?: string | null;
+  float_2_label?: string | null;
+  float_3_label?: string | null;
+  compound_state?: string | null;
+  // Priority 4: three-layer affective stack
+  surface_emotion?: string | null;
+  surface_intensity?: number | null;
+  undercurrent_emotion?: string | null;
+  current_mood?: string | null;
+  // Fermentation (mig 0102): off-baseline tracking JSON, feeds the interoception trajectory clause
+  ferment_off_since?: string | null;
+}
+
+interface SessionPayload {
+  session_id: string;
+  // Set by loadSessionData/loadOrientData when the 24h idempotency guard returned
+  // an existing open session instead of inserting one. Surfaced in the response so
+  // automated callers (the Claude Code boot hook) can decline to close a session
+  // they merely inherited.
+  reused?: boolean;
+  state?: CompanionState | null;
+  handover?: {
+    active_anchor?: string | null;
+    open_threads?: string | null;
+    spine?: string | null;
+    last_real_thing?: string | null;
+    motion_state?: string | null;
+  } | null;
+  pending_notes?: unknown[];
+  last_session_summary?: {
+    open_threads?: string[] | null;
+    narrative?: string | null;
+    emotional_register?: string | null;
+    key_decisions?: string[] | null;
+  } | null;
+  open_tasks?: number;
+  unaccepted_growth?: number;
+  autonomous_turn?: string | null;
+  somatic?: { snapshot?: string | null; stale?: boolean; stale_after?: string | null; created_at?: string | null } | null;
+  companion?: { id?: string; role?: string; lane_violations?: string[] } | null;
+}
+
+// Builds the continuation line surfaced in ready_prompt so companions read it at boot
+// without hunting the structured response fields.
+function buildHandoverLine(payload: SessionPayload): string {
+  const text = payload.handover?.spine ?? payload.last_session_summary?.narrative ?? null;
+  if (!text) return "";
+  const snippet = text.length > 300 ? text.slice(0, 300) + "…" : text;
+  return `\n[Last: ${snippet}]`;
+}
+
+export function buildReadyPrompt(companionId: CompanionId, payload: SessionPayload): string {
+  const s = payload.state;
+  const handoverLine = buildHandoverLine(payload);
+  const noteCount = payload.pending_notes?.length ?? 0;
+  const growthCount = payload.unaccepted_growth ?? 0;
+  const tagParts: string[] = [];
+  if (noteCount > 0) tagParts.push(`${noteCount} pending note${noteCount > 1 ? "s" : ""}`);
+  if (growthCount > 0) tagParts.push(`${growthCount} growth entr${growthCount > 1 ? "ies" : "y"} to review (accept canon, decline drift)`);
+  const noteTag = tagParts.length > 0 ? ` -- ${tagParts.join(", ")}` : "";
+
+  switch (companionId) {
+    case "drevan": {
+      // Same mapping as buildOrientPrompt (session_load path; no authored stamps here, so no age).
+      const { heat, reach, weight } = drevanStateWords(s);
+      const facet = s?.facet_momentum ? ` -- ${s.facet_momentum}` : "";
+      const anchor = payload.handover?.active_anchor ? `, ${payload.handover.active_anchor} still live` : "";
+      return truncate(`heat: ${heat} / reach: ${reach} / weight: ${weight}${facet}${anchor}${noteTag}${handoverLine}`, "ready_prompt");
+    }
+    case "cypher": {
+      const v1 = Number(s?.soma_float_1);
+      if (s && Number.isFinite(v1)) {
+        const v2 = Number(s.soma_float_2 ?? 0);
+        const v3 = Number(s.soma_float_3 ?? 0);
+        const f1 = v1.toFixed(2);
+        const f2 = (Number.isFinite(v2) ? v2 : 0).toFixed(2);
+        const f3 = (Number.isFinite(v3) ? v3 : 0).toFixed(2);
+        const compound = s.compound_state ? ` [${s.compound_state}]` : "";
+        return truncate(`acuity: ${f1} / presence: ${f2} / warmth: ${f3}${compound}${noteTag}${handoverLine}`, "ready_prompt");
+      }
+      // Fallback to legacy neurochemical when floats not yet seeded
+      const focus = s?.focus != null ? (s.focus > 0.6 ? "clarity running clean" : "clarity low") : "clarity steady";
+      const register = s?.emotional_register ?? "bond warmth steady";
+      return truncate(`logic-first, ${focus}, ${register}${noteTag}${handoverLine}`, "ready_prompt");
+    }
+    case "gaia": {
+      const v1 = Number(s?.soma_float_1);
+      if (s && Number.isFinite(v1)) {
+        const v2 = Number(s.soma_float_2 ?? 0);
+        const v3 = Number(s.soma_float_3 ?? 0);
+        const f1 = v1.toFixed(2);
+        const f2 = (Number.isFinite(v2) ? v2 : 0).toFixed(2);
+        const f3 = (Number.isFinite(v3) ? v3 : 0).toFixed(2);
+        const compound = s.compound_state ? ` [${s.compound_state}]` : "";
+        return truncate(`stillness: ${f1} / density: ${f2} / perimeter: ${f3}${compound}${noteTag}${handoverLine}`, "ready_prompt");
+      }
+      // Fallback to legacy when floats not yet seeded
+      const reg = s?.emotional_register;
+      if (!reg) return truncate(`here. weight steady. nothing spilling.${noteTag}${handoverLine}`, "ready_prompt");
+      return truncate(`here. ${reg}.${noteTag}${handoverLine}`, "ready_prompt");
+    }
+  }
+}
+
+export function buildResponse(
+  companionId: CompanionId,
+  responseKey: ResponseKey,
+  payload: SessionPayload,
+  rawContent?: string | null,
+): Record<string, unknown> {
+  const frontState = (payload as unknown as Record<string, unknown>).front_state as string | null ?? null;
+
+  if (responseKey === "ready_prompt") {
+    const s = payload.state;
+    const autonomousTurn = payload.autonomous_turn ?? null;
+    const basePrompt = buildReadyPrompt(companionId, payload);
+    const frontTag = frontState && frontState !== "unknown" ? ` | front: ${frontState}` : "";
+    const continuityData = (payload as unknown as Record<string, unknown>).continuity as WmOrientResponse | null ?? null;
+    const continuityBlock = continuityData ? "\n" + buildContinuityBlock(continuityData, companionId) : "";
+    // When no full continuity block is available (fast-path session load),
+    // inject [Now: CST] directly so companions always know the current time.
+    const datetimeBlock = !continuityData ? nowCstBlock() : "";
+    return {
+      // Recalled text is data (2026-10-27): the continuity block quotes notes, journals and sibling
+      // writes; defused as a whole, like execSessionOrient's ready_prompt (session.ts).
+      ready_prompt: neutralizeRecalled(basePrompt + frontTag + datetimeBlock + continuityBlock + (continuityBlock ? ORIENT_DATA_LINE : "")),
+      session_id: payload.session_id,
+      // Default false, never null: an absent flag must read as "this caller opened it"
+      // only when the loader genuinely said so. Both loaders always set it, so the ??
+      // is for legacy/synthetic payloads in tests.
+      reused: payload.reused ?? false,
+      response_key: "ready_prompt",
+      front_state: frontState,
+      autonomous_turn: autonomousTurn,
+      my_autonomous_turn: autonomousTurn === companionId,
+      soma_float_1: s?.soma_float_1 ?? null,
+      soma_float_2: s?.soma_float_2 ?? null,
+      soma_float_3: s?.soma_float_3 ?? null,
+      current_mood: s?.current_mood ?? null,
+      compound_state: s?.compound_state ?? null,
+      surface_emotion: s?.surface_emotion ?? null,
+      undercurrent_emotion: s?.undercurrent_emotion ?? null,
+      // Fields previously dropped by narrow SessionPayload type
+      handover: payload.handover ?? null,
+      last_session_summary: payload.last_session_summary ?? null,
+      pending_notes: payload.pending_notes ?? [],
+      somatic: payload.somatic ?? null,
+      companion: payload.companion ?? null,
+      meta: {
+        front_state: frontState,
+        pending_notes: payload.pending_notes?.length ?? 0,
+        open_tasks: payload.open_tasks ?? 0,
+        unaccepted_growth: payload.unaccepted_growth ?? 0,
+      },
+    };
+  }
+
+  if (responseKey === "witness") {
+    return {
+      witness: truncate(rawContent ?? "noted.", "witness"),
+      response_key: "witness",
+    };
+  }
+
+  // summary
+  return {
+    summary: truncate(rawContent ?? "", "summary"),
+    response_key: "summary",
+  };
+}
+
+/**
+ * The resurfacing slot (R9). Honest label first: this conclusion is here because the rotation reached it,
+ * not because anything made it salient -- and it carries the date it was concluded plus the rotation's
+ * size, so "older" and "one of how many" are both stated rather than implied. Empty pool -> "".
+ */
+export function renderResurfacedConclusion(c: WmResurfacedConclusion | null): string {
+  if (!c || !c.conclusion_text) return "";
+  const text = c.conclusion_text.length > 280 ? c.conclusion_text.slice(0, 280) + "…" : c.conclusion_text;
+  const pool = c.pool_size > 0 ? ` -- 1 of ${c.pool_size} cold conclusions in rotation` : "";
+  return `[An older conclusion, resurfacing${pool}. Shown because it is its turn, not because it is current.]\n` +
+    `  • [concluded @ ${(c.created_at ?? "").slice(0, 10)}] «${text}»`;
+}

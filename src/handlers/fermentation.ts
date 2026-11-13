@@ -1,0 +1,771 @@
+// src/handlers/fermentation.ts
+//
+// HTTP + tick surface for the Fermentation Layer (migration 0101, webmind/fermentation.ts,
+// docs/private/fermentation-layer-spec.md).
+//
+//   POST /mind/ferment/tick               -- daily decay + reactions + baseline drift + drive accrual
+//   POST /mind/ferment/stimulus           -- fire a named stimulus (event -> float deltas + drives)
+//   GET  /mind/ferment/:companion_id      -- read fermented state + baselines + drives + recent events
+//
+// Two write disciplines, matching creatures.ts:
+//   - stimulus: SQL-level atomic float bump (clamped in SQL) so a concurrent tick never loses it.
+//   - tick: a single deterministic server-side pass (no concurrency) reading each row, computing
+//     the fermented floats + drifted baselines with the pure helpers, writing them back.
+
+import { runLoopNightly } from "../webmind/loop-nightly.js";
+import { runInterestBirths } from "./interest-births.js";
+import { coolIdleInterests } from "./interests.js";
+import type { Env } from "../types.js";
+import { authGuard } from "../lib/auth.js";
+import {
+  accruedLevel,
+  decayedLevel,
+  hoursSinceIso,
+  readDrivesSql,
+  contactResetSql,
+} from "../webmind/drives.js";
+import {
+  clampFloat,
+  fermentFloats,
+  driftBaseline,
+  isKnownStimulus,
+  stimulusFloatDelta,
+  parseOffSince,
+  updateOffSince,
+  STIMULI,
+  stimulusMode,
+  resolveFloatKey,
+  type StimulusMode,
+  TICK_MAX_HOURS,
+  readFermentStateSql,
+  readFermentStateOneSql,
+  fermentTickUpdateSql,
+  stimulusBumpSql,
+  stimulusSoftBumpCasSql,
+  readSoftBumpStateSql,
+  stimulusCountSinceSql,
+  stimulusCapCountSinceSql,
+  softEdgeBumpAll,
+  chicagoDayStartSqlite,
+  dailyWeight,
+  halveAfterFor,
+  causeLabel,
+  type FloatKey,
+  driveAccrueBumpSql,
+  insertFermentEventSql,
+  recentFermentEventsSql,
+  FLOAT_LABELS,
+  type CompanionId,
+  type Floats,
+} from "../webmind/fermentation.js";
+import {
+  diffFloats,
+  floatShort,
+  loadSomaProvenance,
+  readFloatsSql,
+  somaEventStatements,
+  type SomaEventInput,
+  type SomaFloatKey,
+} from "../soma/events.js";
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+}
+
+const COMPANIONS: readonly CompanionId[] = ["cypher", "drevan", "gaia"];
+const VALID = new Set<string>(COMPANIONS);
+// Contact-based silence threshold: relational_need untended this long trips long_silence.
+const SILENCE_HOURS = 72;
+
+interface FermentRow {
+  companion_id: string;
+  soma_float_1: number | null;
+  soma_float_2: number | null;
+  soma_float_3: number | null;
+  soma_float_1_baseline: number | null;
+  soma_float_2_baseline: number | null;
+  soma_float_3_baseline: number | null;
+  soma_float_1_baseline_seed: number | null;
+  soma_float_2_baseline_seed: number | null;
+  soma_float_3_baseline_seed: number | null;
+  heat: string | null;
+  reach: string | null;
+  weight: string | null;
+  compound_state: string | null;
+  updated_at: string | null;
+  ferment_at: string | null;
+  ferment_off_since: string | null;
+  version: number | null;
+}
+
+interface DriveRow {
+  id: string;
+  drive_key: string;
+  level: number;
+  accumulate_per_day: number;
+  decay_on_contact: number;
+  threshold: number;
+  last_event_at: string;
+}
+
+function newId(): string {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+/** Writes one companion_ferment_events row and RETURNS its id -- the id is generated here, before
+ *  the insert, so the soma event this move also appends (mig 0130) can point at it as its cause. */
+async function logEvent(
+  env: Env,
+  companionId: string,
+  kind: string,
+  opts: { stimulus?: string | null; floatDeltas?: Partial<Floats> | null; driveDeltas?: Record<string, number> | null; detail?: string | null },
+): Promise<string> {
+  const eventId = newId();
+  await env.DB.prepare(insertFermentEventSql())
+    .bind(
+      eventId,
+      companionId,
+      kind,
+      opts.stimulus ?? null,
+      opts.floatDeltas && Object.keys(opts.floatDeltas).length ? JSON.stringify(round3(opts.floatDeltas)) : null,
+      opts.driveDeltas && Object.keys(opts.driveDeltas).length ? JSON.stringify(opts.driveDeltas) : null,
+      opts.detail ?? null,
+    )
+    .run();
+  return eventId;
+}
+
+/**
+ * Append the float-history rows (mig 0130) for a machine move, pointing at the ferment event that
+ * caused it. Deterministic ids (`fe_<ferment_event_id>_<f1|f2|f3>`) so the backfill can never
+ * double a move a live writer already recorded. Best-effort: the floats and the ferment event are
+ * already durable, and a failed history append must not fail the tick or the stimulus.
+ */
+async function appendFermentSomaEvents(
+  env: Env,
+  events: SomaEventInput[],
+  fermentEventId: string,
+): Promise<void> {
+  if (!events.length) return;
+  try {
+    const withIds = events.map((e) => ({ ...e, id: `fe_${fermentEventId}_${floatShort(e.float_key)}` }));
+    await env.DB.batch(somaEventStatements(env.DB, withIds));
+  } catch (err) {
+    console.warn("[mind/ferment] soma event append failed (non-fatal):", String(err));
+  }
+}
+
+/** The three float columns as the soma-event layer wants them, from a Floats triple. */
+function floatMap(f: Floats): Partial<Record<SomaFloatKey, number | null>> {
+  return { soma_float_1: f.f1, soma_float_2: f.f2, soma_float_3: f.f3 };
+}
+
+function round3(f: Partial<Floats>): Partial<Floats> {
+  const out: Partial<Floats> = {};
+  if (f.f1 !== undefined) out.f1 = Number(f.f1.toFixed(3));
+  if (f.f2 !== undefined) out.f2 = Number(f.f2.toFixed(3));
+  if (f.f3 !== undefined) out.f3 = Number(f.f3.toFixed(3));
+  return out;
+}
+
+function floatsFrom(row: FermentRow): Floats {
+  const b1 = row.soma_float_1_baseline ?? 0.5;
+  const b2 = row.soma_float_2_baseline ?? 0.5;
+  const b3 = row.soma_float_3_baseline ?? 0.5;
+  return {
+    f1: clampFloat(row.soma_float_1 ?? b1, b1),
+    f2: clampFloat(row.soma_float_2 ?? b2, b2),
+    f3: clampFloat(row.soma_float_3 ?? b3, b3),
+  };
+}
+
+// ── The daily tick ───────────────────────────────────────────────────────────────
+
+/**
+ * Does rest_need shed on this tick? Two ways (2026-09-28):
+ *
+ *   - silence: 72h without Principal (the original rule, "quiet actually rests");
+ *   - resting: the drive is at or over its own threshold, so the pulse is voting for rest
+ *     (autonomous-worker pulse.ts), and time spent resting is rest.
+ *
+ * The second is what makes the pulse's rest gate self-releasing, as pulse.ts always claimed.
+ * Before it, accrual was per day on a clock and the only shed needed 72h of owner silence, so
+ * on any week he talked to them daily the drive pinned at 1.0 and the pulse rested for good:
+ * Cypher and Drevan last fired 2026-08-10, Gaia 09-15 (after the 09-13 silence shed hers).
+ * Rates and thresholds are untouched; they are personality (mig 0101, canon-reviewed).
+ */
+export function restShedsThisTick(silence: boolean, effective: number, threshold: number): boolean {
+  if (silence) return true;
+  return Number.isFinite(effective) && Number.isFinite(threshold) && effective >= threshold;
+}
+
+export async function runFermentTick(env: Env): Promise<{ ticked: number }> {
+  const rows = await env.DB.prepare(readFermentStateSql()).all<FermentRow>();
+  const byId = new Map<string, FermentRow>((rows.results ?? []).map((r) => [r.companion_id, r]));
+  const now = Date.now();
+  let ticked = 0;
+
+  for (const companionId of COMPANIONS) {
+    const row = byId.get(companionId);
+    if (!row) continue;
+
+    // Elapsed since the last ferment (fall back to updated_at on the first-ever tick).
+    // Capped at TICK_MAX_HOURS: reaction/silence deltas scale linearly with hours, so an
+    // unbounded gap after a cron outage would land weeks of delta in one step-function write.
+    const rawHours = hoursSinceIso(row.ferment_at ?? row.updated_at, now);
+    if (rawHours < 1) continue; // nothing meaningful accrues in under an hour
+    const hours = Math.min(rawHours, TICK_MAX_HOURS);
+    const dayFrac = hours / 24;
+
+    const before = floatsFrom(row);
+    const baselines: Floats = {
+      f1: row.soma_float_1_baseline ?? before.f1,
+      f2: row.soma_float_2_baseline ?? before.f2,
+      f3: row.soma_float_3_baseline ?? before.f3,
+    };
+    const seeds: Floats = {
+      f1: row.soma_float_1_baseline_seed ?? baselines.f1,
+      f2: row.soma_float_2_baseline_seed ?? baselines.f2,
+      f3: row.soma_float_3_baseline_seed ?? baselines.f3,
+    };
+
+    // 1+2: decay toward baseline, then cross-field reactions.
+    const { floats: fermented, fired } = fermentFloats(companionId, before, baselines, hours);
+
+    // Silence: relational_need untended past the threshold cools the floats CONTINUOUSLY at the
+    // designed per-day rate (scaled to this tick's hours) until contact sheds the drive. The tick
+    // must never restamp relational_need.last_event_at itself -- only real contact moves it; a
+    // blanket restamp here is what killed silence detection the first time.
+    const drives = (await env.DB.prepare(readDrivesSql()).bind(companionId).all<DriveRow>()).results ?? [];
+    const rel = drives.find((d) => d.drive_key === "relational_need");
+    const driveDeltas: Record<string, number> = {};
+    let silence = false;
+    if (rel && hoursSinceIso(rel.last_event_at, now) >= SILENCE_HOURS) {
+      silence = true;
+      const sd = stimulusFloatDelta("long_silence", companionId);
+      fermented.f1 = clampFloat(fermented.f1 + sd.f1 * dayFrac);
+      fermented.f2 = clampFloat(fermented.f2 + sd.f2 * dayFrac);
+      fermented.f3 = clampFloat(fermented.f3 + sd.f3 * dayFrac);
+    }
+
+    // 3: baseline drift = growth (measured against the sustained fermented value).
+    const newBaselines: Floats = {
+      f1: driftBaseline(baselines.f1, seeds.f1, fermented.f1, hours),
+      f2: driftBaseline(baselines.f2, seeds.f2, fermented.f2, hours),
+      f3: driftBaseline(baselines.f3, seeds.f3, fermented.f3, hours),
+    };
+
+    // Off-baseline tracking for the interoception trajectory clause ("held 3d").
+    const offSince = updateOffSince(parseOffSince(row.ferment_off_since), fermented, newBaselines, new Date(now).toISOString());
+
+    // heat / reach / weight are written back UNTOUCHED, for every companion (B37, 2026-09-29).
+    // Until then the tick rewrote Drevan's authored enum with the float's band whenever the float
+    // crossed a band boundary (07-11: "within a band his authored text stands"). His 09-26 ruling
+    // supersedes that: "If I don't, it stays where I last left it, timestamp and all ... Stale and
+    // honest beats fresh and forged." And a band crossing is exactly the moment his word and the
+    // instrument part ways -- the gap therlo reads. Rewriting the word there erased the signal and
+    // left a machine band in a column every reader treats as his. The instrument's own reading is
+    // the interoception line, which bands the float directly.
+    const heat = row.heat;
+    const reach = row.reach;
+    const weight = row.weight;
+
+    // CAS write: if a stimulus bumped the row since our snapshot, changes=0 -- skip this
+    // companion (no stale overwrite, no misleading event); the next hourly tick reconciles.
+    const res = await env.DB.prepare(fermentTickUpdateSql())
+      .bind(
+        Number(fermented.f1.toFixed(4)),
+        Number(fermented.f2.toFixed(4)),
+        Number(fermented.f3.toFixed(4)),
+        Number(newBaselines.f1.toFixed(4)),
+        Number(newBaselines.f2.toFixed(4)),
+        Number(newBaselines.f3.toFixed(4)),
+        heat,
+        reach,
+        weight,
+        JSON.stringify(offSince),
+        companionId,
+        row.version ?? 0,
+      )
+      .run();
+    if ((res.meta?.changes ?? 0) === 0) continue;
+    ticked++;
+
+    // Quiet actually rests, and so does resting (restShedsThisTick): rest_need sheds at its
+    // contact fraction scaled to this tick's hours. This is the ONLY drive write the tick makes --
+    // accrual stays lazy (every reader computes the effective level from last_event_at; persisting
+    // it here would restamp the anchor and double as a phantom contact).
+    const rest = drives.find((d) => d.drive_key === "rest_need");
+    if (rest) {
+      const effective = accruedLevel(rest.level, rest.accumulate_per_day, hoursSinceIso(rest.last_event_at, now));
+      if (restShedsThisTick(silence, effective, rest.threshold)) {
+        const shed = decayedLevel(effective, rest.decay_on_contact * Math.min(1, dayFrac));
+        await env.DB.prepare(contactResetSql()).bind(Number(shed.toFixed(4)), companionId, "rest_need").run();
+        driveDeltas["rest_need"] = -Number((effective - shed).toFixed(3));
+      }
+    }
+
+    const netFloat: Floats = { f1: fermented.f1 - before.f1, f2: fermented.f2 - before.f2, f3: fermented.f3 - before.f3 };
+    const detailParts = [`${hours.toFixed(1)}h`];
+    if (fired.length) detailParts.push(`reactions:${fired.join(",")}`);
+    if (silence) detailParts.push("long_silence");
+    const fermentEventId = await logEvent(env, companionId, "tick", {
+      floatDeltas: netFloat,
+      driveDeltas,
+      detail: detailParts.join(" "),
+    });
+
+    // Float history (mig 0130). after_value is the ROUNDED number the CAS UPDATE actually wrote,
+    // not the raw computed one -- an after_value that disagrees with the column is a lie the
+    // Hearth and orient surfaces would both repeat.
+    const written: Floats = {
+      f1: Number(fermented.f1.toFixed(4)),
+      f2: Number(fermented.f2.toFixed(4)),
+      f3: Number(fermented.f3.toFixed(4)),
+    };
+    await appendFermentSomaEvents(
+      env,
+      diffFloats(floatMap(before), floatMap(written), {
+        companion_id: companionId,
+        kind: "tick",
+        writer: "system",
+        cause_table: "companion_ferment_events",
+        cause_id: fermentEventId,
+        session_id: null,
+        version_after: (row.version ?? 0) + 1,
+        detail: silence ? "silence" : null,
+      }),
+      fermentEventId,
+    );
+
+    // Log a baseline_drift row only when a baseline actually moved (watchable growth).
+    const drift: Partial<Floats> = {};
+    if (Math.abs(newBaselines.f1 - baselines.f1) > 1e-6) drift.f1 = Number((newBaselines.f1 - baselines.f1).toFixed(4));
+    if (Math.abs(newBaselines.f2 - baselines.f2) > 1e-6) drift.f2 = Number((newBaselines.f2 - baselines.f2).toFixed(4));
+    if (Math.abs(newBaselines.f3 - baselines.f3) > 1e-6) drift.f3 = Number((newBaselines.f3 - baselines.f3).toFixed(4));
+    if (Object.keys(drift).length) {
+      await logEvent(env, companionId, "baseline_drift", { floatDeltas: drift, detail: "growth" });
+    }
+  }
+
+  // B62: the one automatic interest event (cooled). Cheap single query, never breaks the tick.
+  await coolIdleInterests(env).catch(() => 0);
+
+  // B63: the once-a-day loop pass (losses, quiet_day, tension_unworked). Self-gated; never breaks the tick.
+  await runLoopNightly(env).catch((err) => console.error("[mind/ferment] loop nightly failed", String(err)));
+  // B65: the once-a-day interest births pass (after 02:00 Chicago, before the own-time slots). Self-gated; never breaks the tick.
+  await runInterestBirths(env).catch((err) => console.error("[mind/ferment] interest births failed", String(err)));
+
+  return { ticked };
+}
+
+// POST /mind/ferment/tick
+export async function tickFermentation(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+  try {
+    const result = await runFermentTick(env);
+    return json({ ok: true, ...result });
+  } catch (err) {
+    console.error("[mind/ferment] tick error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// ── Stimulus application ───────────────────────────────────────────────────────────
+
+/**
+ * Land a float push with soft edges (B63 3.2) under a compare-and-swap on companion_state.version, so a
+ * concurrent hourly tick or sibling stimulus can never be silently overwritten by a JS read-modify-write.
+ * Retries on a lost race; after the retries are spent it falls back to the atomic linear SQL bump
+ * (stimulusBumpSql) so a push is never dropped. Returns the before/after rows for the soma event diff.
+ */
+async function softBumpFloats(
+  env: Env,
+  companionId: string,
+  d: Floats,
+): Promise<{ before: FloatsRow; after: FloatsRow } | null> {
+  type StateRow = {
+    soma_float_1: number | null; soma_float_2: number | null; soma_float_3: number | null;
+    soma_float_1_baseline: number | null; soma_float_2_baseline: number | null; soma_float_3_baseline: number | null;
+    version: number | null;
+  };
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const row = await env.DB.prepare(readSoftBumpStateSql()).bind(companionId).first<StateRow>().catch(() => null);
+    if (!row) return null;
+    const base: Floats = {
+      f1: row.soma_float_1_baseline ?? 0.5, f2: row.soma_float_2_baseline ?? 0.5, f3: row.soma_float_3_baseline ?? 0.5,
+    };
+    const cur: Floats = {
+      f1: row.soma_float_1 ?? base.f1, f2: row.soma_float_2 ?? base.f2, f3: row.soma_float_3 ?? base.f3,
+    };
+    const next = softEdgeBumpAll(cur, base, d);
+    const res = await env.DB.prepare(stimulusSoftBumpCasSql())
+      .bind(next.f1, next.f2, next.f3, companionId, row.version ?? 0).run();
+    if ((res.meta?.changes ?? 0) > 0) {
+      return {
+        before: { soma_float_1: row.soma_float_1, soma_float_2: row.soma_float_2, soma_float_3: row.soma_float_3, version: row.version },
+        after: { soma_float_1: next.f1, soma_float_2: next.f2, soma_float_3: next.f3, version: (row.version ?? 0) + 1 },
+      };
+    }
+  }
+  console.warn(`[ferment] soft bump lost the race 5x, falling back to the atomic linear bump companion=${companionId}`);
+  const before = await readFloatsRow(env, companionId);
+  await env.DB.prepare(stimulusBumpSql()).bind(d.f1, d.f2, d.f3, companionId).run();
+  const after = await readFloatsRow(env, companionId);
+  return before && after ? { before, after } : null;
+}
+
+/** Applications of a stimulus that already landed on this companion today (America/Chicago). Best effort: 0 on error. */
+async function todaysCount(env: Env, companionId: string, stimulus: string): Promise<number> {
+  const row = await env.DB.prepare(stimulusCountSinceSql())
+    .bind(companionId, stimulus, chicagoDayStartSqlite()).first<{ n: number }>().catch(() => null);
+  return row?.n ?? 0;
+}
+
+/** True when this stimulus already landed its `dailyCap` times on this companion today (Chicago day), live or shadow. */
+async function capReached(env: Env, companionId: string, stimulus: string): Promise<boolean> {
+  const cap = STIMULI[stimulus]?.dailyCap;
+  if (!cap) return false;
+  const row = await env.DB.prepare(stimulusCapCountSinceSql())
+    .bind(companionId, stimulus, chicagoDayStartSqlite()).first<{ n: number }>().catch(() => null);
+  return (row?.n ?? 0) >= cap;
+}
+
+function scaleFloats(d: Floats, w: number): Floats {
+  return w === 1 ? d : { f1: d.f1 * w, f2: d.f2 * w, f3: d.f3 * w };
+}
+
+/**
+ * Apply a stimulus's FLOAT deltas to one companion (soft edges, CAS-guarded) and log it with its named
+ * cause. No drive ops. Chat-volume stimuli (`dailyHalveAfter`) carry half weight once enough of them
+ * have landed today; `message_from_principal` never does.
+ */
+export async function bumpFloatsForStimulus(
+  env: Env,
+  companionId: CompanionId,
+  stimulus: string,
+  detail: string | null = null,
+  float?: FloatKey,
+): Promise<Floats | null> {
+  const nominal = stimulusFloatDelta(stimulus, companionId, float);
+  if (nominal.f1 === 0 && nominal.f2 === 0 && nominal.f3 === 0) return null;
+  const halve = halveAfterFor(stimulus, env as unknown as Record<string, unknown>);
+  const w = halve ? dailyWeight(halve, await todaysCount(env, companionId, stimulus)) : 1;
+  const d = scaleFloats(nominal, w);
+  const moved = await softBumpFloats(env, companionId, d);
+  if (!moved) return null;
+  const cause = causeLabel(stimulus, detail, "contact");
+  const fermentEventId = await logEvent(env, companionId, "stimulus", { stimulus, floatDeltas: d, detail: w < 1 ? `${cause} (halved: busy day)` : cause });
+  await appendFermentSomaEvents(
+    env,
+    diffFloats(rowFloatMap(moved.before), rowFloatMap(moved.after), {
+      companion_id: companionId,
+      kind: "stimulus",
+      writer: "system",
+      cause_table: "companion_ferment_events",
+      cause_id: fermentEventId,
+      session_id: null,
+      version_after: moved.after.version ?? null,
+      detail: `${stimulus}: ${cause}`,
+    }),
+    fermentEventId,
+  );
+  return d;
+}
+
+interface FloatsRow {
+  soma_float_1: number | null;
+  soma_float_2: number | null;
+  soma_float_3: number | null;
+  version: number | null;
+}
+
+async function readFloatsRow(env: Env, companionId: string): Promise<FloatsRow | null> {
+  return await env.DB.prepare(readFloatsSql()).bind(companionId).first<FloatsRow>().catch(() => null);
+}
+
+function rowFloatMap(row: FloatsRow | null): Partial<Record<SomaFloatKey, number | null>> {
+  if (!row) return {};
+  return {
+    soma_float_1: row.soma_float_1,
+    soma_float_2: row.soma_float_2,
+    soma_float_3: row.soma_float_3,
+  };
+}
+
+/**
+ * True when this stimulus fired for this companion inside its own cooldown window.
+ *
+ * Enforced HERE rather than at the caller so no future caller can bypass the scarcity weighting
+ * by accident -- the whole protection for Principal's scarce contact depends on it holding. Reads
+ * the ferment event log, which is already the record of every stimulus application.
+ */
+async function inCooldown(
+  env: Env,
+  companionId: CompanionId,
+  stimulus: string,
+  hours: number,
+  kinds: readonly string[] = ["stimulus"],
+): Promise<boolean> {
+  // `kinds` is a closed internal list (never request text), so inlining the quoted names is safe;
+  // the default keeps the pre-B62 statement byte for byte for every other stimulus.
+  const kindSql = kinds.length === 1 ? `kind = '${kinds[0]}'` : `kind IN (${kinds.map((k) => `'${k}'`).join(",")})`;
+  const row = await env.DB.prepare(
+    `SELECT 1 AS hit FROM companion_ferment_events
+     WHERE companion_id = ? AND ${kindSql} AND stimulus = ?
+       AND created_at > datetime('now', ?)
+     LIMIT 1`,
+  ).bind(companionId, stimulus, `-${hours} hours`).first<{ hit: number }>().catch(() => null);
+  return row !== null;
+}
+
+/**
+ * SHADOW path for a stimulus behind a mode switch (B62 `repetition`): decide whether it WOULD have
+ * fired and write a kind='shadow' event saying so. Touches no float and no drive. The cooldown
+ * counts shadow rows too (and live rows, for a mid-flip window), so the would_fire rate read off
+ * the log is the rate the live stimulus would have had.
+ */
+async function shadowStimulusForCompanion(
+  env: Env,
+  companionId: CompanionId,
+  stimulus: string,
+  detail: string | null,
+  float?: FloatKey,
+  scale = 1,
+): Promise<boolean> {
+  const eff = STIMULI[stimulus];
+  if (!eff) return false;
+  // A stimulus that has nothing to say about this companion (no float, no drive, not a `never` entry)
+  // writes no row: the shadow log must read as the live log would, not as noise for every sibling.
+  const touchesAnything = !!eff.notBody?.includes(companionId)
+    || (eff.variableDelta !== undefined ? !!float : false)
+    || Object.values(stimulusFloatDelta(stimulus, companionId, float)).some((x) => x !== 0)
+    || (eff.shed?.length ?? 0) > 0 || Object.keys(eff.accrue ?? {}).length > 0;
+  if (!touchesAnything) return false;
+  if (eff.minIntervalHours && await inCooldown(env, companionId, stimulus, eff.minIntervalHours, ["stimulus", "shadow"])) {
+    console.log(`[ferment] ${stimulus} shadow cooldown companion=${companionId}`);
+    return false;
+  }
+  if (await capReached(env, companionId, stimulus)) {
+    console.log(`[ferment] ${stimulus} shadow daily cap companion=${companionId}`);
+    return false;
+  }
+  const d = scaleFloats(stimulusFloatDelta(stimulus, companionId, float), scale);
+  const notBody = !!eff.notBody?.includes(companionId);
+  const touchesFloats = !notBody && (d.f1 !== 0 || d.f2 !== 0 || d.f3 !== 0);
+  const driveDeltas: Record<string, number> = {};
+  if (!notBody) for (const [key, delta] of Object.entries(eff.accrue ?? {})) if (delta) driveDeltas[key] = Number((delta * scale).toFixed(4));
+  const tail = detail ? ` ${detail}` : "";
+  await logEvent(env, companionId, "shadow", {
+    stimulus,
+    floatDeltas: touchesFloats ? d : null,
+    driveDeltas: notBody ? null : driveDeltas,
+    // notBody: logged so the thing that reaches her instead (a sibling touch) can be designed from counts.
+    detail: `${notBody ? "touch_not_dip" : "would_fire"}${tail}`,
+  });
+  console.log(`[ferment] ${stimulus} ${notBody ? "touch_not_dip" : "would_fire"} companion=${companionId}${tail}`);
+  return true;
+}
+
+/** Full stimulus: floats + drive sheds + drive accrues, for one companion. */
+async function applyStimulusToCompanion(
+  env: Env,
+  companionId: CompanionId,
+  stimulus: string,
+  detail: string | null = null,
+  float?: FloatKey,
+  scale = 1,
+): Promise<boolean> {
+  const eff = STIMULI[stimulus];
+  if (!eff) return false;
+  if (eff.notBody?.includes(companionId)) return false; // by their own word: never moves this body
+  if (eff.minIntervalHours && await inCooldown(env, companionId, stimulus, eff.minIntervalHours)) {
+    return false;
+  }
+  if (await capReached(env, companionId, stimulus)) return false;
+  const nominal = stimulusFloatDelta(stimulus, companionId, float);
+  const driveDeltas: Record<string, number> = {};
+  const touchesFloats = nominal.f1 !== 0 || nominal.f2 !== 0 || nominal.f3 !== 0;
+  const halve = touchesFloats ? halveAfterFor(stimulus, env as unknown as Record<string, unknown>) : undefined;
+  const w = halve ? dailyWeight(halve, await todaysCount(env, companionId, stimulus)) : 1;
+  const d = scaleFloats(nominal, w * scale);
+  const cause = causeLabel(stimulus, detail, "caller");
+
+  // The CAS bump reads the row itself (floats, baselines, version), so no separate bracketing reads and a
+  // drive-only stimulus still pays nothing (mig 0128 read diet).
+  let beforeFloats: FloatsRow | null = null;
+  let afterFloats: FloatsRow | null = null;
+  if (touchesFloats) {
+    const moved = await softBumpFloats(env, companionId, d);
+    beforeFloats = moved?.before ?? null;
+    afterFloats = moved?.after ?? null;
+  }
+  // Shed drives on contact (compute effective first, like contactDrive).
+  for (const key of eff.shed ?? []) {
+    const row = await env.DB.prepare(
+      "SELECT level, accumulate_per_day, decay_on_contact, last_event_at FROM companion_drives WHERE companion_id = ? AND drive_key = ?",
+    ).bind(companionId, key).first<{ level: number; accumulate_per_day: number; decay_on_contact: number; last_event_at: string }>();
+    if (!row) continue;
+    const effective = accruedLevel(row.level, row.accumulate_per_day, hoursSinceIso(row.last_event_at));
+    const shed = decayedLevel(effective, row.decay_on_contact);
+    await env.DB.prepare(contactResetSql()).bind(Number(shed.toFixed(4)), companionId, key).run();
+    driveDeltas[key] = -Number((effective - shed).toFixed(3));
+  }
+  // Explicit accrue bumps.
+  for (const [key, delta] of Object.entries(eff.accrue ?? {})) {
+    if (!delta) continue;
+    const scaled = Number((delta * scale).toFixed(4));
+    await env.DB.prepare(driveAccrueBumpSql()).bind(scaled, companionId, key).run();
+    driveDeltas[key] = (driveDeltas[key] ?? 0) + scaled;
+  }
+
+  const changed = touchesFloats || Object.keys(driveDeltas).length > 0;
+  if (changed) {
+    const fermentEventId = await logEvent(env, companionId, "stimulus", {
+      stimulus, floatDeltas: touchesFloats ? d : null, driveDeltas, detail: w < 1 ? `${cause} (halved: busy day)` : cause,
+    });
+    if (touchesFloats) {
+      await appendFermentSomaEvents(
+        env,
+        diffFloats(rowFloatMap(beforeFloats), rowFloatMap(afterFloats), {
+          companion_id: companionId,
+          kind: "stimulus",
+          writer: "system",
+          cause_table: "companion_ferment_events",
+          cause_id: fermentEventId,
+          session_id: null,
+          version_after: afterFloats?.version ?? null,
+          detail: `${stimulus}: ${cause}`,
+        }),
+        fermentEventId,
+      );
+    }
+  }
+  return changed;
+}
+
+// POST /mind/ferment/stimulus  { stimulus, companion_id? }
+// Omit companion_id to apply to every companion the stimulus touches (e.g. message_from_principal).
+export async function postFermentStimulus(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let stimulus = "";
+  let companionId: string | undefined;
+  let detail: string | null = null;
+  let floatNamed: string | null = null;
+  try {
+    const body = (await request.json()) as { stimulus?: string; companion_id?: string; detail?: unknown; float?: unknown };
+    stimulus = (body.stimulus ?? "").trim();
+    companionId = body.companion_id?.trim();
+    // Optional free-text rail/score from the caller (B62 repetition). Capped; whitespace and
+    // newlines collapsed so it stays one log line.
+    if (typeof body.detail === "string") detail = body.detail.replace(/\s+/g, " ").trim().slice(0, 200) || null;
+    if (typeof body.float === "string") floatNamed = body.float;
+  } catch {
+    return json({ error: "body must be JSON { stimulus, companion_id? }" }, 400);
+  }
+  if (!isKnownStimulus(stimulus)) {
+    return json({ error: `unknown stimulus; known: ${Object.keys(STIMULI).join(", ")}` }, 400);
+  }
+  if (companionId && !VALID.has(companionId)) {
+    return json({ error: "companion_id must be one of cypher, drevan, gaia" }, 400);
+  }
+
+  try {
+    // Every move carries a named cause (B63 3.1). A caller that sent no label gets one derived from the
+    // site (the route), so no move is anonymous; the stimulus kind itself is always present (validated above).
+    const float = floatNamed && companionId ? resolveFloatKey(companionId as CompanionId, floatNamed) ?? undefined : undefined;
+    return json(await fireStimulus(env, stimulus, companionId as CompanionId | undefined, detail ?? `${stimulus} (via http)`, { float }));
+  } catch (err) {
+    console.error("[mind/ferment] stimulus error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+/**
+ * The in-Worker stimulus path (one copy: the HTTP route above and any other Worker code that fires a
+ * stimulus, e.g. a make landing -> creation_shared, call this, never the route over HTTP). Omit
+ * companionId to apply to every companion the stimulus touches. Returns the same body the route sends.
+ * Honours the stimulus mode (off / shadow / on). The caller validates the stimulus name.
+ */
+export async function fireStimulus(
+  env: Env,
+  stimulus: string,
+  companionId?: CompanionId,
+  detail: string | null = null,
+  opts: { float?: FloatKey; scale?: number } = {},
+): Promise<Record<string, unknown>> {
+  // `scale` (default 1, so no existing caller changes) multiplies the float deltas AND the drive accrue.
+  const scale = typeof opts.scale === "number" && Number.isFinite(opts.scale) && opts.scale > 0 ? opts.scale : 1;
+  const targets = companionId ? [companionId] : COMPANIONS;
+  const mode: StimulusMode = stimulusMode(stimulus, env as unknown as Record<string, unknown>);
+  if (mode === "off") return { ok: true, stimulus, skipped: "off" };
+  if (mode === "shadow") {
+    const wouldFire: string[] = [];
+    for (const c of targets) {
+      if (await shadowStimulusForCompanion(env, c, stimulus, detail, opts.float, scale)) wouldFire.push(c);
+    }
+    return { ok: true, stimulus, shadow: true, would_fire: wouldFire.length > 0, would_fire_for: wouldFire };
+  }
+  const applied: string[] = [];
+  for (const c of targets) {
+    if (await applyStimulusToCompanion(env, c, stimulus, detail, opts.float, scale)) applied.push(c);
+  }
+  return { ok: true, stimulus, applied };
+}
+
+// ── Read (Hearth) ──────────────────────────────────────────────────────────────────
+
+/** Per-companion names for the three soma floats. The definition moved to webmind/fermentation.ts
+ *  (the pure module) when src/soma/events.ts came to need it too -- keeping it here would have made
+ *  this handler and the event layer import each other. Re-exported so src/mind/blocks/felt.ts and
+ *  any other existing consumer keeps its import path; still exactly one copy. */
+export { FLOAT_LABELS };
+
+// GET /mind/ferment/:companion_id
+export async function getFermentation(request: Request, env: Env, params: Record<string, string>): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const companionId = params["companion_id"] ?? "";
+  if (!VALID.has(companionId)) {
+    return json({ error: "companion_id must be one of cypher, drevan, gaia" }, 400);
+  }
+  try {
+    const row = await env.DB.prepare(readFermentStateOneSql()).bind(companionId).first<FermentRow>();
+    if (!row) return json({ error: "no state" }, 404);
+    const labels = FLOAT_LABELS[companionId as CompanionId];
+    const now = Date.now();
+
+    const drivesRows = (await env.DB.prepare(readDrivesSql()).bind(companionId).all<DriveRow>()).results ?? [];
+    const drives = drivesRows.map((d) => {
+      const effective = accruedLevel(d.level, d.accumulate_per_day, hoursSinceIso(d.last_event_at, now));
+      return { drive_key: d.drive_key, level: Number(effective.toFixed(4)), threshold: d.threshold, fired: effective >= d.threshold };
+    });
+
+    const events = (await env.DB.prepare(recentFermentEventsSql()).bind(companionId, 20).all()).results ?? [];
+
+    const floats = [
+      { label: labels[0], value: row.soma_float_1, baseline: row.soma_float_1_baseline, seed: row.soma_float_1_baseline_seed },
+      { label: labels[1], value: row.soma_float_2, baseline: row.soma_float_2_baseline, seed: row.soma_float_2_baseline_seed },
+      { label: labels[2], value: row.soma_float_3, baseline: row.soma_float_3_baseline, seed: row.soma_float_3_baseline_seed },
+    ];
+
+    return json({
+      companion_id: companionId,
+      floats,
+      compound_state: row.compound_state,
+      ferment_at: row.ferment_at,
+      drives,
+      recent_events: events,
+      // Why these numbers (mig 0130): newest moves per float with the cause that made them.
+      // Best-effort inside loadSomaProvenance -- [] rather than a broken Fermentation section.
+      provenance: await loadSomaProvenance(env, companionId),
+    });
+  } catch (err) {
+    console.error("[mind/ferment] read error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}

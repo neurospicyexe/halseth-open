@@ -1,0 +1,140 @@
+// src/__tests__/creatures-handler.test.ts
+import { describe, test, expect } from "vitest";
+// Validation is pure; exported for testability.
+import { validateInteract } from "../handlers/creatures.js";
+import { tenderName } from "../webmind/sol-care.js";
+
+describe("validateInteract", () => {
+  test("companion may feed", () => {
+    expect(validateInteract("cypher", "feed")).toBeNull();
+  });
+  test("sol may only appear", () => {
+    expect(validateInteract("sol", "appear")).toBeNull();
+    expect(validateInteract("sol", "feed")).toMatch(/sol/i);
+  });
+  test("companion may not 'appear'", () => {
+    expect(validateInteract("cypher", "appear")).toMatch(/action/i);
+  });
+  test("unknown actor rejected", () => {
+    expect(validateInteract("stranger", "feed")).toMatch(/actor/i);
+  });
+});
+
+// ── performTend (0100): the ONE shared write path for tends ──────────────────
+import { performTend } from "../webmind/creature-interact.js";
+
+/** Minimal fake D1: records every statement; scripted first()/run() results. */
+function fakeDb() {
+  const executed: Array<{ sql: string; binds: unknown[] }> = [];
+  let trustAfter = 0.82;
+  const db = {
+    executed,
+    setTrustAfter(t: number) { trustAfter = t; },
+    prepare(sql: string) {
+      return {
+        // listPeople / pk_roster read with no bind (B62 step 6 guard on give notes)
+        async all() { executed.push({ sql, binds: [] }); return { results: [] }; },
+        bind(...binds: unknown[]) {
+          return {
+            sql, binds,
+            async run() {
+              executed.push({ sql, binds });
+              // INSERT OR IGNORE reports a landed row (changes=1) unless a
+              // duplicate marker is present in the milestone id.
+              const dup = sql.includes("INSERT OR IGNORE") && String(binds[1]).startsWith("dup_");
+              return { meta: { changes: dup ? 0 : 1 } };
+            },
+            async first() {
+              executed.push({ sql, binds });
+              if (sql.includes("SELECT trust, state_json")) return { trust: trustAfter, state_json: '{"mood":"delighted"}' };
+              if (sql.includes("COUNT(*)")) return { n: 0 };
+              return null;
+            },
+            async all() { executed.push({ sql, binds }); return { results: [] }; },
+          };
+        },
+      };
+    },
+    async batch(stmts: Array<{ sql: string; binds: unknown[] }>) {
+      for (const s of stmts) executed.push({ sql: s.sql, binds: s.binds });
+      return [];
+    },
+  };
+  return db;
+}
+
+describe("performTend", () => {
+  test("fires exactly the crossed milestone and reports it", async () => {
+    const db = fakeDb();
+    db.setTrustAfter(0.82); // 0.78 + give(0.06) crosses 0.80
+    const out = await performTend(db as never, { id: "sol1", kind: "companion_pet", trust: 0.78 }, "drevan", "give", null);
+    expect(out.trust).toBe(0.82);
+    expect(out.milestones_fired.map(m => m.id)).toEqual(["shoulder_perch"]);
+    expect(out.milestones_fired[0]!.text).toContain("shoulder");
+  });
+  test("no crossing, no milestone", async () => {
+    const db = fakeDb();
+    db.setTrustAfter(0.79);
+    const out = await performTend(db as never, { id: "sol1", kind: "companion_pet", trust: 0.78 }, "cypher", "talk", null);
+    expect(out.milestones_fired).toEqual([]);
+  });
+  test("give with words lands in the nest with the giver's name", async () => {
+    const db = fakeDb();
+    db.setTrustAfter(0.5);
+    await performTend(db as never, { id: "sol1", kind: "companion_pet", trust: 0.45 }, "principal", "give", "a smooth stone from the river");
+    const nestInsert = db.executed.find(e => e.sql.includes("INSERT INTO creature_nest"));
+    expect(nestInsert).toBeDefined();
+    expect(nestInsert!.binds).toContain("a smooth stone from the river");
+    expect(nestInsert!.binds).toContain("principal");
+  });
+  test("a give whose words name Principal or a care word is a give, but the words are not kept (B62 step 6)", async () => {
+    for (const note of ["Principal's lucky pebble", "the pill bottle cap"]) {
+      const db = fakeDb();
+      db.setTrustAfter(0.5);
+      const out = await performTend(db as never, { id: "sol1", kind: "companion_pet", trust: 0.45 }, "cypher", "give", note);
+      expect(out.trust).toBe(0.5);
+      expect(db.executed.some(e => e.sql.includes("INSERT INTO creature_nest"))).toBe(false);
+    }
+  });
+  test("Sol answers the care: a reaction comes back and the gain is scaled by need (2026-11-02)", async () => {
+    const db = fakeDb();
+    db.setTrustAfter(0.5);
+    // fake returns no created_at/ledger rows -> created now -> not hungry -> feed lands "full"
+    const noon = Date.parse("2026-11-02T17:00:00Z");
+    const out = await performTend(db as never, { id: "sol1", kind: "companion_pet", trust: 0.45 }, "principal", "feed", null, noon);
+    expect(out.care?.fit).toBe("full");
+    expect(out.care?.reaction).not.toContain("{who}");
+    const bump = db.executed.find(e => e.sql.startsWith("UPDATE creatures SET trust"));
+    expect(bump!.binds[0]).toBeCloseTo(0.04 * 0.5);
+    expect(bump!.binds[0] as number).toBeGreaterThan(0);
+    expect(bump!.binds[1]).toBe("content");
+  });
+  test("real animals keep the flat delta and get no Sol reaction", async () => {
+    const db = fakeDb();
+    db.setTrustAfter(0.2);
+    const out = await performTend(db as never, { id: "cat1", kind: "real_animal", trust: 0.1 }, "principal", "feed", null);
+    expect(out.care).toBeNull();
+    const bump = db.executed.find(e => e.sql.startsWith("UPDATE creatures SET trust"));
+    expect(bump!.binds[0]).toBe(0.04);
+  });
+  test("real animals get neither milestones nor nest rows (texts are Sol's)", async () => {
+    const db = fakeDb();
+    db.setTrustAfter(0.9);
+    const out = await performTend(db as never, { id: "cat1", kind: "real_animal", trust: 0.1 }, "principal", "give", "a ribbon");
+    expect(out.milestones_fired).toEqual([]);
+    expect(db.executed.some(e => e.sql.includes("creature_nest"))).toBe(false);
+  });
+  test("an imp may feed, play or talk as itself", () => {
+    expect(validateInteract("imp", "feed")).toBeNull();
+    expect(validateInteract("imp", "play")).toBeNull();
+    expect(validateInteract("imp", "talk")).toBeNull();
+  });
+  test("an imp never gives (a give carries words; an imp authors nothing)", () => {
+    expect(validateInteract("imp", "give")).toMatch(/imp/i);
+    expect(validateInteract("imp", "appear")).toMatch(/imp/i);
+  });
+  test("an imp is never named on the record", () => {
+    expect(tenderName("imp")).toBe("an imp");
+    for (const n of ["mossling", "iris", "Mossling"]) expect(validateInteract(n, "feed")).toMatch(/actor/i);
+  });
+});

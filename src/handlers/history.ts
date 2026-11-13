@@ -1,0 +1,702 @@
+// Read-only history feed endpoints.
+// GET /handovers, /companion-journal, /cypher-audit, /gaia-witness, /wounds, /routines, /deltas
+// GET /tasks, /events, /lists
+// POST /tasks, /events
+// PATCH /tasks/:id
+
+import { Env } from "../types.js";
+import { authGuard } from "../lib/auth.js";
+import { generateId } from "../db/queries.js";
+import { COMPANION_ID_SET } from "../companions.js";
+import { isReviewState, KEPT_SQL } from "../webmind/review-state.js";
+import { SUBSTANTIVE_JOURNAL_CLAUSE, NOT_CLERK_JOURNAL_CLAUSE } from "../webmind/journal-lanes.js";
+import { completeTask } from "../lib/task-completion.js";
+import { applyTaskEdits, pickTaskEdits } from "../lib/task-edit.js";
+import { normalizeWitnessType } from "../lib/witness-type.js";
+import { GAIA_AUTHORED_WITNESS_SQL } from "../lib/witness-author.js";
+import type {
+  HandoverPacket,
+  CypherAudit,
+  GaiaWitness,
+  LivingWound,
+  Task,
+  CalendarEvent,
+  ListItem,
+  Routine,
+  RelationalDeltaV4,
+} from "../types.js";
+
+function clampLimit(raw: string | null, def: number, max: number): number {
+  const n = parseInt(raw ?? String(def), 10);
+  return Math.min(Math.max(1, isNaN(n) ? def : n), max);
+}
+
+// GET /handovers?limit=20&offset=0
+export async function getHandovers(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url    = new URL(request.url);
+  const limit  = clampLimit(url.searchParams.get("limit"), 20, 100);
+  const rawOff = parseInt(url.searchParams.get("offset") ?? "0", 10);
+  const offset = isNaN(rawOff) ? 0 : Math.max(0, rawOff);
+
+  const result = await env.DB.prepare(`
+    SELECT hp.*, s.session_type, s.front_state AS session_front_state, s.companion_id AS companion_id
+    FROM handover_packets hp
+    LEFT JOIN sessions s ON hp.session_id = s.id
+    ORDER BY hp.created_at DESC
+    LIMIT ? OFFSET ?
+  `).bind(limit, offset).all<HandoverPacket & { session_type: string | null; session_front_state: string | null; companion_id: string | null }>();
+
+  return new Response(JSON.stringify(result.results ?? []), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// GET /companion-journal?agent=drevan&limit=20&since=<ISO8601>[&cursor=reviewed]
+//
+// cursor=reviewed (tray pass 2, 2026-09-26) -- the puller's opt-in. A draft kept TODAY that was
+// created LAST WEEK has created_at far behind the puller's high-water mark, so a created_at cursor
+// never serves it and the vault never learns it was kept. With cursor=reviewed the feed filters and
+// orders on COALESCE(reviewed_at, created_at) -- the moment a row became memory -- normalised to one
+// ISO shape in SQL (rows carry both 'T...Z' and datetime('now') space-form stamps), and returns that
+// value as `cursor_at` for the puller to advance on.
+//
+// Opt-in, not a behaviour change: an old puller that never sends the param gets exactly the old
+// created_at feed. (Switching everyone would hand an old puller rows ordered by a cursor it ignores;
+// it would set its mark from created_at, move it BACKWARD, and could re-page the same 100 rows.) A new
+// puller against an old Halseth sees no cursor_at and falls back to created_at.
+export async function getCompanionJournal(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url   = new URL(request.url);
+  const agent = url.searchParams.get("agent");
+  const limit = clampLimit(url.searchParams.get("limit"), 20, 100);
+  const since = url.searchParams.get("since") ?? undefined;
+  const reviewedCursor = url.searchParams.get("cursor") === "reviewed";
+
+  if (since !== undefined && isNaN(Date.parse(since))) {
+    return new Response(JSON.stringify({ error: "invalid since parameter" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const validAgents = COMPANION_ID_SET;
+  // Never serve archived rows (2026-09-26). This listing is what Second Brain's puller mirrors
+  // into the vault; without the filter a row retracted in Halseth came back as a top-ranked
+  // rag/companion_journal doc on the next pull. An archive a downstream reader ignores is not one.
+  const conditions: string[] = ["archived = 0"];
+  const bindings: unknown[]  = [];
+
+  // review_state (mig 0132, 2026-09-26): kept by default -- this is the puller's feed, and a draft
+  // that reaches the vault is recall by another door. Hearth and ops pass `review_state=all` (or
+  // `draft` / `dropped`) to see the tray; every row carries the column either way. NOTE: this is
+  // the handler `/companion-journal` and `/companion-notes` are actually wired to (index.ts); a
+  // second copy in companion_journal.ts was unreachable and was removed the same day.
+  const reviewParam = url.searchParams.get("review_state") ?? "kept";
+  if (reviewParam !== "all") {
+    if (isReviewState(reviewParam) && reviewParam !== "kept") {
+      conditions.push("review_state = ?");
+      bindings.push(reviewParam);
+    } else {
+      conditions.push(KEPT_SQL);
+    }
+  }
+
+  // substantive=1 (Hearth companion Journal page, 2026-10-30): drop Discord speech transcripts and
+  // clerk rows, the same lane orient's recent_journal and the companion-page count read. Default off:
+  // the puller and other callers still get every lane.
+  if (url.searchParams.get("substantive") === "1") {
+    conditions.push(SUBSTANTIVE_JOURNAL_CLAUSE, NOT_CLERK_JOURNAL_CLAUSE);
+  }
+
+  if (agent && validAgents.has(agent)) {
+    conditions.push("agent = ?");
+    bindings.push(agent);
+  } else {
+    conditions.push("agent != 'system'");
+  }
+  if (since !== undefined) {
+    if (reviewedCursor) {
+      // ISO_SQL("?") expands to two placeholders (strftime(?) and its fallback): bind `since` twice.
+      //
+      // RESTORED rows too (2026-09-26, recall reconcile). A released journal row is archived; Second
+      // Brain's reconcile then deletes its rag/ mirror. A restore (forgetting.ts) only flips archived
+      // back to 0 -- the row's cursor never moves, so without this clause the restored memory would
+      // never be pulled again and would be gone from the vault for good. memory_releases.restored_at
+      // is the one stamp a restore writes; the subquery is uncorrelated (evaluated once, small table).
+      // The row keeps its OLD cursor_at, so the puller's mark never moves backward on it (hwmAfter).
+      conditions.push(`(${JOURNAL_CURSOR_SQL} > ${ISO_SQL("?")} OR id IN (${RESTORED_JOURNAL_SINCE_SQL}))`);
+      bindings.push(since, since, since, since);
+    } else {
+      conditions.push("created_at > ?");
+      bindings.push(since);
+    }
+  }
+
+  const where    = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const orderDir = since !== undefined ? "ASC" : "DESC";
+  const orderBy  = reviewedCursor ? `cursor_at ${orderDir}, id ${orderDir}` : `created_at ${orderDir}`;
+  bindings.push(limit);
+
+  const result = await env.DB.prepare(`
+    SELECT id, created_at, agent, note_text, tags, session_id, source, review_state, reviewed_at${reviewedCursor ? `, ${JOURNAL_CURSOR_SQL} AS cursor_at` : ""}
+    FROM companion_journal
+    ${where}
+    ORDER BY ${orderBy}
+    LIMIT ?
+  `).bind(...bindings).all();
+
+  return new Response(JSON.stringify(result.results ?? []), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/** Any stored stamp -> one ISO shape ('YYYY-MM-DDTHH:MM:SS.SSSZ'); unparseable input passes through. */
+const ISO_SQL = (expr: string) => `COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', ${expr}), ${expr})`;
+/** When a journal row became memory: its keep, or its birth if it was born kept. */
+const JOURNAL_CURSOR_SQL = ISO_SQL("COALESCE(reviewed_at, created_at)");
+/** Journal ids whose release was restored after a bound (two `?` placeholders, both the bound). */
+const RESTORED_JOURNAL_SINCE_SQL =
+  `SELECT ref_id FROM memory_releases WHERE kind = 'journal' AND restored_at IS NOT NULL AND ${ISO_SQL("restored_at")} > ${ISO_SQL("?")}`;
+
+// GET /ingest/recall-ineligible?limit=500[&since=<ISO>&after_id=<id>]   (2026-09-26, recall reconcile)
+//
+// The ids of companion_journal rows that are NOT recall-eligible: review_state <> 'kept' OR
+// archived = 1. Second Brain mirrors journal rows as rag/companion_journal/<id>; the feed above is
+// kept-only now, so a mirror pulled BEFORE mig 0132 (the backfill turned ~600 rows into drafts), or
+// of a row dropped / retracted / released / salience-pruned since, can never correct itself. SB's
+// reconcile pages this list and deletes those mirrors. Measured 2026-09-26: 2038 of 5392 mirrors
+// were of ineligible rows (510 draft, 64 dropped, 1464 archived).
+//
+// Two modes, both keyset-paged (never OFFSET, no self-join -- D1 hit its CPU limit on one today):
+//   - FULL (no `since`): every ineligible id, ordered by id; page with after_id = the last id.
+//   - INCREMENTAL (`since`): rows whose cursor (COALESCE(reviewed_at, created_at), the same
+//     normalised stamp the journal feed uses) is after the bound, ordered by (cursor, id); page with
+//     since = last cursor_at AND after_id = last id, so ties on a page boundary are never dropped.
+// STATED BLIND SPOT: an archive stamps nothing (retract.ts, salience-prune.ts and forgetting.ts all
+// only SET archived = 1), so a row archived long after its cursor is caught by a FULL sweep only.
+// SB runs the full sweep at startup and daily; incremental rides every pull tick.
+//
+// Response: { mode, items: [{ id, agent, review_state, archived, cursor_at }], next } -- `next` is the
+// params for the following page, null on the last one. wm_continuity_notes are not listed here: they
+// have their own pair since 2026-10-13 (/ingest/continuity-notes + /ingest/continuity-ineligible).
+export async function getRecallIneligible(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url = new URL(request.url);
+  const limit = clampLimit(url.searchParams.get("limit"), 500, 1000);
+  const since = url.searchParams.get("since") ?? undefined;
+  const afterId = url.searchParams.get("after_id") ?? "";
+  if (since !== undefined && isNaN(Date.parse(since))) {
+    return new Response(JSON.stringify({ error: "invalid since parameter" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const incremental = since !== undefined;
+  // ISO_SQL("?") is two placeholders; the tie branch compares the cursor to the same bound again.
+  const keyset = incremental
+    ? `(${JOURNAL_CURSOR_SQL} > ${ISO_SQL("?")} OR (${JOURNAL_CURSOR_SQL} = ${ISO_SQL("?")} AND id > ?))`
+    : "id > ?";
+  const binds: unknown[] = incremental ? [since, since, since, since, afterId] : [afterId];
+  const orderBy = incremental ? "cursor_at ASC, id ASC" : "id ASC";
+
+  const result = await env.DB.prepare(`
+    SELECT id, agent, review_state, archived, ${JOURNAL_CURSOR_SQL} AS cursor_at
+    FROM companion_journal
+    WHERE (review_state <> 'kept' OR archived = 1) AND ${keyset}
+    ORDER BY ${orderBy}
+    LIMIT ?
+  `).bind(...binds, limit).all<{ id: string; agent: string; review_state: string; archived: number; cursor_at: string }>();
+
+  const items = result.results ?? [];
+  const last = items[items.length - 1];
+  const next = items.length < limit || !last
+    ? null
+    : incremental ? { since: last.cursor_at, after_id: last.id } : { after_id: last.id };
+  return new Response(JSON.stringify({ mode: incremental ? "incremental" : "full", items, next }), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// ── Continuity notes into Second Brain (2026-10-13) ───────────────────────────────────────────────
+//
+// WHY: a companion's continuity notes followed that companion across substrates (its own boot reads
+// them) and stopped there. On 10-13 Drevan captured Abby's death in a Claude.ai thread at 8:30am; his
+// Discord boot knew it hours later, Cypher's search found nothing, and Principal had to retell it.
+// Principal: "it's hard in moments like this to have to repeat something that still hurts." Second
+// Brain had no puller for wm_continuity_notes (the comment above measured zero rag/ mirrors), so the
+// one memory that crossed substrates for its owner was invisible to the siblings.
+//
+// Cross-reading these notes is already Principal's ruling (mig 0115, 2026-08-10: "yes it's my life but
+// it's yall too"); this makes them searchable, the same way kept journal rows are.
+//
+// RAILS, same as the journal lane:
+// - KEPT ONLY. A draft (a clerk's note in the companion's voice: [discord:pulse], judge promotions) is
+//   never served; review-state.ts decides that at birth. Archived (retracted / released / pruned) never.
+// - ALLOWLIST of note types. A new type stays private to its owner's continuity until someone decides
+//   it belongs in search. Out on purpose: claude_code_session (hook-written, near-empty lines), ops
+//   (skill-watcher mail to one companion), soma_arc (stubs), autonomous_exploration (the same text is
+//   already indexed as growth_journal), and anything unlisted.
+// - thread_key is never exported (it is classed as sensitive).
+// - Paired purge feed (/ingest/continuity-ineligible) so a note dropped, released or retracted after it
+//   was mirrored loses its mirror, exactly as the journal reconcile does.
+export const SEARCHABLE_NOTE_TYPES = ["conversation_capture", "discord_session", "continuity", "day_distillation"] as const;
+const SEARCHABLE_NOTE_TYPES_SQL = `note_type IN (${SEARCHABLE_NOTE_TYPES.map((t) => `'${t}'`).join(", ")})`;
+const NOTE_COMPANIONS_SQL = `agent_id IN (${[...COMPANION_ID_SET].map((c) => `'${c}'`).join(", ")})`;
+/** A note is searchable: a companion's, kept, live, and of an allowed type. */
+const NOTE_ELIGIBLE_SQL = `archived = 0 AND ${KEPT_SQL} AND ${SEARCHABLE_NOTE_TYPES_SQL} AND ${NOTE_COMPANIONS_SQL}`;
+/** When a note became memory: its keep, or its birth if it was born kept (same stamp as the journal). */
+const NOTE_CURSOR_SQL = JOURNAL_CURSOR_SQL;
+/** Note ids whose release was restored after a bound (two `?` placeholders, both the bound). */
+const RESTORED_NOTE_SINCE_SQL =
+  `SELECT ref_id FROM memory_releases WHERE kind = 'note' AND restored_at IS NOT NULL AND ${ISO_SQL("restored_at")} > ${ISO_SQL("?")}`;
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+}
+
+// GET /ingest/continuity-notes?since=<ISO>&after_id=<note_id>&limit=100
+//
+// Searchable continuity notes ordered by (cursor_at, note_id). `since` alone is STRICTLY after (the SB
+// puller's contract); with after_id, rows tying the bound are included past that id, so a page edge on
+// a tie loses nothing (the ledger feed's keyset). A RESTORED note keeps its old cursor, so it is added
+// back explicitly when its restore is newer than `since` (the journal feed does the same).
+// Response: { items: [{ note_id, agent_id, note_type, content, salience, source, created_at, cursor_at }], next }.
+export async function getIngestContinuityNotes(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url = new URL(request.url);
+  const limit = clampLimit(url.searchParams.get("limit"), 100, 500);
+  const sinceParam = url.searchParams.get("since") ?? undefined;
+  const afterId = url.searchParams.get("after_id") ?? "";
+  if (sinceParam !== undefined && isNaN(Date.parse(sinceParam))) return jsonResponse({ error: "invalid since parameter" }, 400);
+  const since = sinceParam ?? "1970-01-01T00:00:00.000Z";
+
+  // ISO_SQL("?") is two placeholders: every bound is bound twice.
+  const keyset = afterId
+    ? `(${NOTE_CURSOR_SQL} > ${ISO_SQL("?")} OR (${NOTE_CURSOR_SQL} = ${ISO_SQL("?")} AND note_id > ?))`
+    : `${NOTE_CURSOR_SQL} > ${ISO_SQL("?")}`;
+  const binds: unknown[] = afterId ? [since, since, since, since, afterId] : [since, since];
+  const restored = sinceParam !== undefined ? ` OR note_id IN (${RESTORED_NOTE_SINCE_SQL})` : "";
+  if (restored) binds.push(since, since);
+
+  const result = await env.DB.prepare(`
+    SELECT note_id, agent_id, note_type, content, salience, source, created_at, ${NOTE_CURSOR_SQL} AS cursor_at
+    FROM wm_continuity_notes
+    WHERE archived = 0 AND ${KEPT_SQL} AND ${SEARCHABLE_NOTE_TYPES_SQL} AND ${NOTE_COMPANIONS_SQL} AND (${keyset}${restored})
+    ORDER BY cursor_at ASC, note_id ASC
+    LIMIT ?
+  `).bind(...binds, limit).all<{ note_id: string; cursor_at: string }>();
+
+  const items = result.results ?? [];
+  const last = items[items.length - 1];
+  const next = items.length < limit || !last ? null : { since: last.cursor_at, after_id: last.note_id };
+  return jsonResponse({ items, next });
+}
+
+// GET /ingest/continuity-ineligible?limit=500[&since=<ISO>&after_id=<note_id>]
+//
+// The purge list for the feed above: every note that must NOT have a search mirror (a draft, a drop,
+// an archive, a type outside the allowlist, a non-companion writer). Same two keyset modes and response
+// shape as /ingest/recall-ineligible, ids under `id` so SB's reconcile reads both feeds alike:
+//   FULL (no since): ordered by note_id, page with after_id. Catches archives, which stamp no time.
+//   INCREMENTAL (since): rows whose cursor moved past the bound, ordered by (cursor_at, note_id).
+export async function getIngestContinuityIneligible(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url = new URL(request.url);
+  const limit = clampLimit(url.searchParams.get("limit"), 500, 1000);
+  const since = url.searchParams.get("since") ?? undefined;
+  const afterId = url.searchParams.get("after_id") ?? "";
+  if (since !== undefined && isNaN(Date.parse(since))) return jsonResponse({ error: "invalid since parameter" }, 400);
+
+  const incremental = since !== undefined;
+  const keyset = incremental
+    ? `(${NOTE_CURSOR_SQL} > ${ISO_SQL("?")} OR (${NOTE_CURSOR_SQL} = ${ISO_SQL("?")} AND note_id > ?))`
+    : "note_id > ?";
+  const binds: unknown[] = incremental ? [since, since, since, since, afterId] : [afterId];
+  const orderBy = incremental ? "cursor_at ASC, note_id ASC" : "note_id ASC";
+
+  const result = await env.DB.prepare(`
+    SELECT note_id AS id, agent_id AS agent, note_type, review_state, archived, ${NOTE_CURSOR_SQL} AS cursor_at
+    FROM wm_continuity_notes
+    WHERE NOT (${NOTE_ELIGIBLE_SQL}) AND ${keyset}
+    ORDER BY ${orderBy}
+    LIMIT ?
+  `).bind(...binds, limit).all<{ id: string; cursor_at: string }>();
+
+  const items = result.results ?? [];
+  const last = items[items.length - 1];
+  const next = items.length < limit || !last
+    ? null
+    : incremental ? { since: last.cursor_at, after_id: last.id } : { after_id: last.id };
+  return jsonResponse({ mode: incremental ? "incremental" : "full", items, next });
+}
+
+// GET /cypher-audit?limit=50
+export async function getCypherAudit(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url   = new URL(request.url);
+  const limit = clampLimit(url.searchParams.get("limit"), 50, 200);
+
+  const result = await env.DB.prepare(`
+    SELECT * FROM cypher_audit ORDER BY created_at DESC LIMIT ?
+  `).bind(limit).all<CypherAudit>();
+
+  return new Response(JSON.stringify(result.results ?? []), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// GET /gaia-witness?limit=50[&author=gaia]
+//
+// (2026-11-11) The table is a SHARED survival ledger (see lib/witness-author.ts): all three companions
+// write it. Each row now carries `author`, the companion of the session it hangs on (null when the
+// session is gone or unattributed), so Hearth labels every row instead of calling the whole feed Gaia's.
+// `author=gaia` returns only rows on a Gaia session (GAIA_AUTHORED_WITNESS_SQL), for surfaces that show
+// a witness to someone as Gaia's own. Any other author value is ignored (the shared feed).
+export async function getGaiaWitness(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url   = new URL(request.url);
+  const limit = clampLimit(url.searchParams.get("limit"), 50, 200);
+  const onlyGaia = url.searchParams.get("author") === "gaia";
+
+  const result = await env.DB.prepare(`
+    SELECT gw.*, s.companion_id AS author
+    FROM gaia_witness gw
+    LEFT JOIN sessions s ON s.id = gw.session_id
+    ${onlyGaia ? `WHERE gw.${GAIA_AUTHORED_WITNESS_SQL}` : ""}
+    ORDER BY gw.created_at DESC LIMIT ?
+  `).bind(limit).all<GaiaWitness & { author: string | null }>();
+
+  // (2026-10-06) stored rows keep the Discord channel id the old bot client wrote as witness_type
+  // (it is the only record of the channel); the feed shows those as "observation".
+  const rows = (result.results ?? []).map(r => ({ ...r, witness_type: normalizeWitnessType(r.witness_type) }));
+
+  return new Response(JSON.stringify(rows), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// GET /wounds
+export async function getWounds(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const result = await env.DB.prepare(`
+    SELECT id, created_at, name, description, COALESCE(companion_id, 'gaia') AS companion_id FROM living_wounds
+  `).all<Pick<LivingWound, "id" | "created_at" | "name" | "description" | "companion_id">>();
+
+  return new Response(JSON.stringify(result.results ?? []), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// GET /routines?date=YYYY-MM-DD
+// Returns routine completions for the given date (defaults to today UTC).
+export async function getRoutines(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url      = new URL(request.url);
+  const rawDate  = url.searchParams.get("date");
+  // Validate date format: YYYY-MM-DD
+  const dateStr  = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
+    ? rawDate
+    : new Date().toISOString().slice(0, 10);
+
+  const result = await env.DB.prepare(`
+    SELECT id, routine_name, owner, logged_at, notes
+    FROM routines
+    WHERE DATE(logged_at) = ?
+    ORDER BY logged_at ASC
+  `).bind(dateStr).all<Routine>();
+
+  return new Response(JSON.stringify(result.results ?? []), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// GET /deltas?valence=tender&agent=drevan&limit=20&since=<ISO8601>
+// Cross-companion delta feed — only returns rows with delta_text (spec v0.4 rows).
+export async function getDeltas(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url    = new URL(request.url);
+  const limit  = clampLimit(url.searchParams.get("limit"), 20, 100);
+  const since  = url.searchParams.get("since") ?? undefined;
+
+  if (since !== undefined && isNaN(Date.parse(since))) {
+    return new Response(JSON.stringify({ error: "invalid since parameter" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const validValences = new Set(["toward", "neutral", "tender", "rupture", "repair"]);
+  const validAgents   = COMPANION_ID_SET;
+
+  const valence = url.searchParams.get("valence");
+  const agent   = url.searchParams.get("agent");
+
+  const conditions: string[] = ["delta_text IS NOT NULL"];
+  const bindings: unknown[]  = [];
+
+  if (valence && validValences.has(valence)) {
+    conditions.push("valence = ?");
+    bindings.push(valence);
+  }
+  if (agent && validAgents.has(agent)) {
+    conditions.push("agent = ?");
+    bindings.push(agent);
+  }
+  if (since !== undefined) {
+    conditions.push("created_at > ?");
+    bindings.push(since);
+  }
+
+  const orderDir = since !== undefined ? "ASC" : "DESC";
+  bindings.push(limit);
+
+  const result = await env.DB.prepare(`
+    SELECT id, session_id, created_at, agent, delta_text, valence, initiated_by
+    FROM relational_deltas
+    WHERE ${conditions.join(" AND ")}
+    ORDER BY created_at ${orderDir}
+    LIMIT ?
+  `).bind(...bindings).all<RelationalDeltaV4>();
+
+  return new Response(JSON.stringify(result.results ?? []), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// GET /tasks?status=open|in_progress|done — all tasks, sorted by priority then due date.
+// Defaults to non-done tasks.
+export async function getTasks(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url    = new URL(request.url);
+  const status = url.searchParams.get("status");
+  const validStatuses = new Set(["open", "in_progress", "done"]);
+
+  const sql = status && validStatuses.has(status)
+    ? `SELECT id, title, description, priority, status, due_at, assigned_to, created_by,
+              completed_by, completed_at
+       FROM tasks WHERE status = ?
+       ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, due_at ASC NULLS LAST`
+    // completed_by/completed_at included on both branches (0119): the columns were written and
+    // no read surface returned them, so "who closed this" existed in D1 and was unreachable.
+    : `SELECT id, title, description, priority, status, due_at, assigned_to, created_by,
+              completed_by, completed_at
+       FROM tasks WHERE status != 'done'
+       ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, due_at ASC NULLS LAST`;
+
+  const result = status && validStatuses.has(status)
+    ? await env.DB.prepare(sql).bind(status).all<Task>()
+    : await env.DB.prepare(sql).all<Task>();
+
+  return new Response(JSON.stringify(result.results ?? []), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// GET /events — upcoming calendar events, ordered by start_time.
+export async function getEvents(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const result = await env.DB.prepare(`
+    SELECT id, title, description, start_time, end_time, category
+    FROM events
+    WHERE start_time >= datetime('now')
+    ORDER BY start_time ASC
+    LIMIT 50
+  `).all<CalendarEvent>();
+
+  return new Response(JSON.stringify(result.results ?? []), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// GET /lists?name=groceries — list items grouped by list_name, incomplete first.
+// If ?name= is provided, filters to that list only.
+export async function getLists(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const url  = new URL(request.url);
+  const name = url.searchParams.get("name");
+
+  // Exclude items completed more than 7 days ago — they fall away naturally.
+  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const result = name
+    ? await env.DB.prepare(`
+        SELECT id, list_name, item_text, added_by, added_at, completed
+        FROM lists WHERE list_name = ?
+          AND (completed = 0 OR completed_at > ?)
+        ORDER BY completed ASC, added_at ASC
+      `).bind(name, cutoff).all<ListItem>()
+    : await env.DB.prepare(`
+        SELECT id, list_name, item_text, added_by, added_at, completed
+        FROM lists WHERE completed = 0 OR completed_at > ?
+        ORDER BY list_name ASC, completed ASC, added_at ASC
+      `).bind(cutoff).all<ListItem>();
+
+  return new Response(JSON.stringify(result.results ?? []), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// POST /lists/:id/complete — mark a list item as completed.
+export async function completeListItem(request: Request, env: Env, params: Record<string, string>): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  const { id } = params;
+  if (!id) return new Response(JSON.stringify({ error: "missing id" }), { status: 400, headers: { "Content-Type": "application/json" } });
+
+  await env.DB.prepare(
+    "UPDATE lists SET completed = 1, completed_at = ? WHERE id = ?"
+  ).bind(new Date().toISOString(), id).run();
+
+  return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+}
+
+// POST /tasks — create a task. Mirrors the MCP halseth_task_add insert so both
+// interfaces write identical rows (and both gate on COORDINATION_ENABLED).
+// Body: { title (required), description?, priority?, due_at?, assigned_to?, created_by?, shared? }
+export async function postTask(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  if (env.COORDINATION_ENABLED !== "true") {
+    return new Response("Coordination zone disabled", { status: 403 });
+  }
+
+  let body: {
+    title?: string; description?: string; priority?: string;
+    due_at?: string; assigned_to?: string; created_by?: string; shared?: boolean;
+  };
+  try { body = await request.json() as typeof body; }
+  catch { return new Response("Invalid JSON", { status: 400 }); }
+
+  if (!body.title || typeof body.title !== "string" || !body.title.trim()) {
+    return new Response("title is required", { status: 400 });
+  }
+  const PRIORITIES = ["low", "normal", "high", "urgent"] as const;
+  if (body.priority !== undefined && !PRIORITIES.includes(body.priority as typeof PRIORITIES[number])) {
+    return new Response("priority must be low, normal, high, or urgent", { status: 400 });
+  }
+  const priority = body.priority ?? "normal";
+
+  const id = generateId();
+  const now = new Date().toISOString();
+
+  await env.DB.prepare(`
+    INSERT INTO tasks (id, title, description, priority, due_at, assigned_to, status, created_at, updated_at, created_by, shared)
+    VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+  `).bind(
+    id,
+    body.title.trim(),
+    body.description ?? null,
+    priority,
+    body.due_at ?? null,
+    body.assigned_to ?? null,
+    now, now,
+    body.created_by ?? null,
+    body.shared ? 1 : 0,
+  ).run();
+
+  return new Response(JSON.stringify({ id, created_at: now }), {
+    status: 201,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// POST /events — create a calendar event. Mirrors MCP halseth_event_add
+// (and gates on COORDINATION_ENABLED like the MCP tools do).
+// Body: { title (required), start_time (required ISO), description?, end_time?, category?, attendees?, created_by?, shared? }
+export async function postEvent(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+  if (env.COORDINATION_ENABLED !== "true") {
+    return new Response("Coordination zone disabled", { status: 403 });
+  }
+
+  let body: {
+    title?: string; start_time?: string; description?: string;
+    end_time?: string; category?: string; attendees?: string[];
+    created_by?: string; shared?: boolean;
+  };
+  try { body = await request.json() as typeof body; }
+  catch { return new Response("Invalid JSON", { status: 400 }); }
+
+  if (!body.title || typeof body.title !== "string" || !body.title.trim()) {
+    return new Response("title is required", { status: 400 });
+  }
+  if (!body.start_time || isNaN(Date.parse(body.start_time))) {
+    return new Response("start_time must be a valid ISO 8601 datetime", { status: 400 });
+  }
+  const attendees = Array.isArray(body.attendees)
+    ? body.attendees.filter((a): a is string => typeof a === "string")
+    : null;
+
+  const id = generateId();
+  const now = new Date().toISOString();
+
+  await env.DB.prepare(`
+    INSERT INTO events (id, title, description, start_time, end_time, category, attendees_json, created_at, created_by, shared)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    id,
+    body.title.trim(),
+    body.description ?? null,
+    body.start_time,
+    body.end_time ?? null,
+    body.category ?? null,
+    attendees && attendees.length > 0 ? JSON.stringify(attendees) : null,
+    now,
+    body.created_by ?? null,
+    body.shared ? 1 : 0,
+  ).run();
+
+  return new Response(JSON.stringify({ id, created_at: now }), {
+    status: 201,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// PATCH /tasks/:id — update task status. When → "done", logs a companion_journal entry
+// so companions see the completion and don't re-surface the task.
+export async function patchTask(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env); if (denied) return denied;
+
+  const id = params.id;
+  if (!id) return new Response("Missing task id", { status: 400 });
+
+  let body: Record<string, unknown> & { status?: string; completed_by?: string };
+  try { body = await request.json() as Record<string, unknown> & { status?: string; completed_by?: string }; }
+  catch { return new Response("Invalid JSON", { status: 400 }); }
+
+  // Field edits (2026-10-19, lib/task-edit.ts): title / description / priority / due_at / assigned_to.
+  // A body with edits and no status is a pure edit; status keeps its old meaning and path.
+  const edits = pickTaskEdits(body);
+  const hasEdits = Object.keys(edits).length > 0;
+  if (hasEdits) {
+    const e = await applyTaskEdits(env, id, edits);
+    if (!e.ok) return new Response(e.error, { status: e.notFound ? 404 : 400 });
+    if (body.status === undefined) {
+      return new Response(JSON.stringify({ ok: true, id, changed: e.changed }), { headers: { "Content-Type": "application/json" } });
+    }
+  }
+
+  const VALID = ["open", "in_progress", "done"] as const;
+  if (!body.status || !VALID.includes(body.status as typeof VALID[number])) {
+    return new Response("status must be open, in_progress, or done", { status: 400 });
+  }
+  const status = body.status as typeof VALID[number];
+
+  // Attribution + completion notice both live in completeTask() (mig 0119), shared with the
+  // companions' own close path so the two cannot diverge again.
+  const r = await completeTask(env, id, status, body.completed_by ?? null);
+  if (!r.ok) return new Response(r.error ?? "Task not found", { status: 404 });
+
+  return new Response(
+    JSON.stringify({
+      ok: true, id, status,
+      ...(status === "done"
+        ? { completed_by: r.completed_by, completed_at: r.completed_at, notified: r.notified }
+        : {}),
+    }),
+    { headers: { "Content-Type": "application/json" } },
+  );
+}

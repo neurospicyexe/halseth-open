@@ -1,0 +1,1239 @@
+// src/librarian/router.ts
+//
+// Three-tier pattern matching:
+//   1. FAST_PATH_PATTERNS (in-memory, zero cost) -- trigger string match
+//   2. Workers AI classifier -- returns pattern_key string (KV keys only)
+//   3. KV get(pattern_key) -- fetch tools + response_key
+//
+// Workers AI fires only when fast path misses. KV is consulted after classifier returns a key.
+// Adding a new pattern: add to KV (no redeploy). Update classifier prompt if needed.
+
+import { Env } from "../types.js";
+import { EMBEDDING_MODEL } from "../mcp/embed.js";
+import { DEEPSEEK_DEFAULT_MODEL, contentBudget, vendorFailover, logFellBack } from "../synthesis/deepseek.js";
+import { FAST_PATH_PATTERNS, PatternEntry, CompanionId } from "./patterns.js";
+import { TRAY_ID_TOKEN } from "../webmind/review-state.js";
+import { LEDGER_ID_TOKEN } from "../ledger/store.js";
+import { readFront } from "../front/source.js";
+import type { ExecutorContext, ExecutorFn } from "./executors/types.js";
+import { triggerMatches } from "./lib/trigger.js";
+import { isRetrievalPattern, repeatKey, checkAndCount, breakerResponse } from "./repeat-breaker.js";
+
+// Re-export LibrarianRequest from executors/types so index.ts import path stays stable.
+export type { LibrarianRequest } from "./executors/types.js";
+
+// ── Payload overrides ──────────────────────────────────────────────────────
+// JSON fields in `context` that authoritatively select a fast-path pattern_key
+// regardless of what the request string says. Beats every string-match tier so
+// `decision:"declined"` can't be misrouted to journal_accept by classifier
+// semantics -- original closure of the ratification loop bug (task 0a53ad9c).
+//
+// Adding a new override: identify the field, list `value -> pattern_key`,
+// drop a row in PAYLOAD_OVERRIDES. Resolved pattern_keys MUST exist in
+// FAST_PATH_PATTERNS (validated by tests).
+export interface PayloadOverride {
+  readonly field: string;
+  readonly values: Readonly<Record<string, string>>;
+}
+
+export const PAYLOAD_OVERRIDES: readonly PayloadOverride[] = [
+  {
+    field: "decision",
+    values: {
+      declined: "journal_decline",
+      accepted: "journal_accept",
+    },
+  },
+];
+
+export function payloadOverrideKey(contextRaw: string | undefined): string | null {
+  if (!contextRaw) return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(contextRaw); } catch { return null; }
+  if (!parsed || typeof parsed !== "object") return null;
+  const obj = parsed as Record<string, unknown>;
+  for (const override of PAYLOAD_OVERRIDES) {
+    const v = obj[override.field];
+    if (typeof v !== "string") continue;
+    const key = override.values[v];
+    if (key) return key;
+  }
+  return null;
+}
+
+// ── Presence overrides ─────────────────────────────────────────────────────
+// Route on the PRESENCE of a payload field, regardless of how the request was
+// phrased. Nobody sends `tension_text` unless they mean to log a tension.
+//
+// Why (2026-07-09): the tension pool sat at ZERO simmering rows and Guardian's
+// `starved:dialectic` flag fired. The cause was not that companions stopped
+// logging tensions -- it was that logging one didn't work. `ask_librarian`'s own
+// tool description advertises "log a tension with Drevan about ...", but the
+// fast-path trigger is the bare string "log tension". The article breaks the
+// match, the classifier returns `unknown`, and the companion is told
+// "I don't know how to handle that yet." Worse, "log a tension I'm sitting with"
+// was hijacked by note_sit's greedy "sitting with" trigger and died demanding a
+// note_id it was never given.
+//
+// Adding more trigger strings is whack-a-mole; the next natural phrasing breaks
+// again. The payload is ground truth. Same lesson as the rest of this repair:
+// key the behavior to the ACT, not to the surface form that described it.
+//
+// `unless` disqualifies a field whose presence means a different intent
+// (tension_edit sends { id, tension_text }; tension_add sends tension_text alone).
+// Resolved pattern_keys MUST exist in FAST_PATH_PATTERNS (validated by tests).
+export interface PresenceOverride {
+  readonly field: string;
+  readonly pattern_key: string;
+  readonly unless?: readonly string[];
+  readonly note: string;
+}
+
+export const PRESENCE_OVERRIDES: readonly PresenceOverride[] = [
+  {
+    field: "tension_text",
+    pattern_key: "tension_add",
+    unless: ["id"],   // { id, tension_text } is an edit, not a new tension
+    note: "any phrasing carrying tension_text means: record this tension",
+  },
+  {
+    field: "delta_text",
+    pattern_key: "delta_log",
+    unless: ["id"],   // { id, delta_text } would be an edit, not a new delta
+    note: "2026-09-17: a relational delta for gaia whose BODY contained \"I prefer\" was stolen by preference_set -- its trigger sits earlier in FAST_PATH_PATTERNS and the matcher scans the whole request, payload included. Carrying delta_text is unambiguous intent; the trigger sweep is a guess "
+      + "about free text. This is the narrow fix for the reported case. The general defect -- a verb clause losing to a trigger word inside its own payload -- wants the matcher scoped to the request head, which is a routing-wide change and Principal's call, not a late-night one.",
+  },
+];
+
+export function presenceOverrideKey(contextRaw: string | undefined): string | null {
+  if (!contextRaw) return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(contextRaw); } catch { return null; }
+  if (!parsed || typeof parsed !== "object") return null;
+  const obj = parsed as Record<string, unknown>;
+  for (const override of PRESENCE_OVERRIDES) {
+    const v = obj[override.field];
+    if (typeof v !== "string" || v.trim().length === 0) continue;
+    if (override.unless?.some(f => obj[f] !== undefined && obj[f] !== null)) continue;
+    return override.pattern_key;
+  }
+  return null;
+}
+
+// ── Anchored guards ────────────────────────────────────────────────────────
+// Pattern keys that must beat insertion-order shadowing in FAST_PATH_PATTERNS.
+// Each guard is a (regex, pattern_key) pair; iteration is in declared order so
+// more-specific guards branch before greedier siblings (e.g. H5a edits run
+// before the bare /\bcompanion note\b/ catch-all that follows).
+//
+// Adding a guard: identify the collision (a specific intent losing to a
+// greedy substring), write a start-anchored regex, drop a row here. Resolved
+// pattern_keys MUST exist in FAST_PATH_PATTERNS (validated by tests).
+export interface AnchoredGuard {
+  readonly pattern_key: string;
+  readonly regex: RegExp;
+  readonly note: string;
+}
+
+// B67 watchalong verbs. Whole-request anchored; each needs a film noun or a colon timestamp.
+const WATCH_NOUN = String.raw`(?:movie|film|watchalong)`;
+export const WATCHALONG_READ_RE = new RegExp(
+  String.raw`^(?:please\s+)?(?:what(?:['’]s|\s+is)\s+on\s+screen|watchalong|where\s+are\s+we\s+in\s+the\s+${WATCH_NOUN}|what(?:['’]s|\s+is)\s+happening\s+in\s+the\s+${WATCH_NOUN})(?:\s+(?:now|right\s+now|status|in\s+the\s+${WATCH_NOUN}))?\s*[?.!]?$`, "i");
+export const WATCHALONG_SEEK_RE = new RegExp(
+  String.raw`^(?:please\s+)?(?:(?:the\s+|our\s+)?${WATCH_NOUN}\s+(?:is\s+)?)?at\s+\d{1,2}:\d{2}(?::\d{2})?\s*[.!]?$`, "i");
+export const WATCHALONG_PLAY_RE = new RegExp(
+  String.raw`^(?:please\s+)?(?:(?:pause|play|resume|unpause)\s+(?:the\s+|our\s+)?${WATCH_NOUN}|${WATCH_NOUN}\s+(?:pause|play|resume))(?:\s+now)?\s*[.!]?$`, "i");
+const VERDICTS_READ_RE = /^(?:please\s+)?(?:show\s+)?my\s+(?:verdicts?|lethe|what\s+held|what\s+bore)\s*[.?!]?$/i;
+
+export const ANCHORED_GUARDS: readonly AnchoredGuard[] = [
+  // Dated intentions (mig 0179, R22). FIRST: the words after the head are the companion's own and may contain any
+  // trigger ("intend: finish project notes by Friday" would hit project_close's "finish project"). Each is
+  // start-anchored; the "come back to" form only routes when it names a day (the executor refuses without one).
+  { pattern_key: "intention_set", regex: INTENTION_SET_RE,
+    note: "Mig 0179: 'intend: <what> by <day>[ -- <next step>]' / 'I'll come back to <what> on <day>'. Anchored ahead of project_* triggers." },
+  { pattern_key: "intention_done", regex: INTENTION_DONE_RE,
+    note: "Mig 0179: 'intention done <id|title>[: note]'." },
+  { pattern_key: "intention_drop", regex: INTENTION_DROP_RE,
+    note: "Mig 0179: 'drop intention <id|title>' / 'let go of intention ...'." },
+  { pattern_key: "intentions_read", regex: INTENTIONS_READ_RE,
+    note: "Mig 0179: 'my intentions', whole request." },
+  // Loop verbs (2026-11-09): the words after the head are the loop's own words and may contain any trigger
+  // ("close loop: the open loop about Spouse" hit wm_loop_write's "open loop" first and OPENED a second loop).
+  { pattern_key: "wm_loop_close", regex: LOOP_CLOSE_HEAD_RE,
+    note: "Close a loop by handle or words. Start-anchored; the head decides the route, not words inside the loop." },
+  { pattern_key: "wm_loop_review", regex: LOOP_HOLD_HEAD_RE,
+    note: "Hold a loop open on purpose, by handle or words, with 'because <why>'." },
+  { pattern_key: "wm_loop_act", regex: LOOP_ACT_HEAD_RE,
+    note: "Acted on a loop without closing it, by handle or words, with ': <what I did>'." },
+  // FIRST: an errand sentence names its own verb target ("feed sol", "my tray", "care lane") and every one of those
+  // is an earlier substring trigger. The head ("send <imp>") decides the route, same class of bug as H7b.
+  { pattern_key: "imp_errand",
+    // 0175 (Hex's salt): the receiver's own verbs share this route, each start-anchored and naming "salt me" (or
+    // "hex's salt" / "what did hex leave"), so ordinary speech containing "hex" or "salt" never routes here.
+    regex: /^(?:please\s+)?(?:send\s+(?:iris|nimbus|hex|mossling|rock)\b|hex\s+may\s+(?:not\s+)?salt\s+me\b|hex[\s,:]+salt\s+me\s+from\b|who\s+may\s+salt\s+me\b|open\s+hex(?:'s|’s|s)?\s+salt\b|what\s+did\s+hex\s+leave\b)/i,
+    note: "Imps' errands (2026-11-04, mig 0168): 'send iris to feed sol' hit creature_interact's 'feed sol' trigger (insertion order) and silently ran as the COMPANION tending Sol; the same sentence shape with 'my tray' / 'care lane' / 'fetch ...' collides with other triggers. The head decides: start-anchored on 'send <imp>'." },
+  // FIRST on purpose: the clause text names floats and numbers ("warmth above 0.7"), which the H8b soma-write
+  // guard below would otherwise read as a state_update, and a note: may contain "companion note".
+  { pattern_key: "feeling_word_propose",
+    regex: /^(?:please\s+)?(?:confirm\s+)?(?:revise\s+)?feeling\s+word\b/i,
+    note: "Feeling vocabulary from Discord: 'feeling word <w>: ...' (dry run), 'confirm feeling word ...', '(confirm) revise feeling word ...'. Start-anchored so only these exact prefixes route here, and ahead of the soma-write guard." },
+  { pattern_key: "feeling_words_list",
+    regex: /^(?:please\s+)?(?:show\s+)?my\s+feeling\s+words\s*[.?!]?$/i,
+    note: "Feeling vocabulary: the companion's own active rows. Whole request." },
+  // Interests + why trail (mig 0161, B62). All start-anchored, ahead of everything: the companion's reason
+  // after "because" is free text and may contain any trigger word ("because I prefer...", "note about...").
+  { pattern_key: "interest_not_mine", regex: NOT_MINE_RE,
+    note: "B65: 'not mine: <term>[, because <why>]'. Declines the night's candidate interest; anchored like the other interest verbs." },
+  // B65 step 6 (mig 0182): verdicts in the companion's own word (lethe / what held / what bore) and the marked want
+  // (expression_need, step 7). Start-anchored: the line after the colon is free text and may contain any trigger word.
+  { pattern_key: "verdict_write", regex: VERDICT_OPEN_RE,
+    note: "B65: '<lethe|what held|what bore|verdict>: <kind:|interest:|activity:><subject> <your line>'. One line, counted by return; their words only." },
+  { pattern_key: "verdicts_read", regex: VERDICTS_READ_RE,
+    note: "B65: 'my verdicts' / 'my lethe' / 'my what held' / 'my what bore'. Whole request." },
+  { pattern_key: "want_marked", regex: WANT_MARKED_RE,
+    note: "B65 step 7: 'mark a want: <words>' / 'something wants out: <words>'. Raises expression_need (the only thing that raises Gaia's); the words are never stored." },
+  { pattern_key: "interest_born", regex: INTEREST_BORN_RE,
+    note: "B62: 'new interest: <name>, because <why>'. Anchored so the why can never be routed by a trigger it contains." },
+  { pattern_key: "interest_return", regex: INTEREST_RETURN_RE,
+    note: "B62: 'back to <name> because <why>' / 'returned to ...'. Needs 'because', so ordinary 'back to work' never matches." },
+  { pattern_key: "interest_made", regex: INTEREST_MADE_RE,
+    note: "B62: 'made <thing> for <name> because <why>'." },
+  { pattern_key: "interest_put_down", regex: INTEREST_PUT_DOWN_RE,
+    note: "B62: 'putting down <name> because <why>' / 'put down ...'. Needs 'because'." },
+  { pattern_key: "interest_pick_up", regex: INTEREST_PICK_UP_RE,
+    note: "B62: 'picking <name> back up because <why>'." },
+  { pattern_key: "interests_read", regex: INTERESTS_READ_RE,
+    note: "B62: 'my interests' / 'list my interests', whole request." },
+  { pattern_key: "interest_trail", regex: INTEREST_TRAIL_RE,
+    note: "B62: 'interest trail <name>'." },
+  { pattern_key: "make_artifact", regex: MAKE_VERB_RE,
+    note: "B62 making: 'make a <kind words> called <title> [for <interest>] because <why>'. Needs 'called', so 'made X for Y because Z' (past tense, the interest event) and 'make an image of ...' (generate_image) are untouched; anchored so the why can never be routed by a trigger it contains." },
+  { pattern_key: "make_keep", regex: KEEP_VERB_RE,
+    note: "Drevan's shelf (mig 0170): 'keep as made <id | \"opening words\"> [called <title>] [for <interest>] [because <why>]' / 'keep this as made'. Start-anchored so the title, interest and why can never be routed by a trigger they contain. Own rows only." },
+  { pattern_key: "garden_plant", regex: PLANT_VERB_RE,
+    note: "Gaia's garden (mig 0171): 'plant the witness' / 'plant <id-prefix>' / 'plant \"opening words\"'. Start-anchored on those shapes so the quoted words can never be routed by a trigger they contain. Gaia only (the executor refuses anyone else)." },
+  { pattern_key: "garden_pull", regex: PULL_VERB_RE,
+    note: "Gaia's garden: 'pull <planting id-prefix>', the whole request, so ordinary 'pull ...' speech never matches." },
+  { pattern_key: "garden_read", regex: GARDEN_READ_RE,
+    note: "Gaia's garden: 'my garden', whole request." },
+  { pattern_key: "garden_consent", regex: GARDEN_CONSENT_RE,
+    note: "Gaia's garden: 'garden yes|no <planting id-prefix>', the sibling's answer on a one-sibling note. Callable only by the planting's consent_from companion (the executor checks)." },
+  { pattern_key: "line_event", regex: LINE_RE,
+    note: "B63: Gaia's authored line events, 'line held: ...' / 'line crossed: <kind>' / 'line fatigue: ...'. Start-anchored with the colon; the executor refuses anyone but Gaia." },
+  { pattern_key: "disagree_open", regex: DISAGREE_RE,
+    note: "B63: 'disagree with <sibling>: <what>', named by the speaker, never inferred. Anchored on a triad name and the colon." },
+  { pattern_key: "disagree_settle", regex: SETTLED_RE,
+    note: "B63: 'settled with <sibling>', the whole request." },
+  { pattern_key: "loss_log", regex: LOSS_RE,
+    note: "B63 (mig 0174): 'loss: <what>' / 'loss for <companion>: <what>'. Start-anchored with the colon, so ordinary speech about a loss never matches and the text after the colon can never be routed by a trigger it contains." },
+  { pattern_key: "basin_revise", regex: REVISE_VERB_RE,
+    note: "Basins that move (mig 0172): 'revise my basin <name>: <new description> because <kind> <id-prefix>'. Start-anchored on 'revise my basin' so the description (free text) can never be routed by a trigger it contains, and so it beats self_model_revise's 'revise' triggers. Own basins only (the executor takes the caller from the request)." },
+  { pattern_key: "basins_read", regex: BASINS_READ_RE,
+    note: "Basins that move: 'my basins', whole request." },
+  { pattern_key: "basin_waiting", regex: BASIN_WAITING_RE,
+    note: "Basins that move: 'basin moves waiting', whole request: the caller's own revisions awaiting Principal's witness." },
+  { pattern_key: "makes_read", regex: MAKES_READ_RE,
+    note: "B62 making: 'my makes' / 'list my makes', whole request." },
+  { pattern_key: "person_who_is", regex: PERSON_LOOKUP_RE,
+    note: "People pull-lookup (2026-11-02): 'who is / who's / look up person / tell me about <name>'. Only a CANDIDATE: route() checks the name against Principal's live list (personLookupApplies) and, when nobody is there, re-runs the match without this guard so roster_who_is, front state, web search and normal speech behave exactly as before." },
+  { pattern_key: "voice_lesson_decide",
+    regex: /^(?:please\s+)?(?:approve|reject)\s+(?:the\s+)?voice\s+lesson\s+[0-9a-f-]{6,}\b/i,
+    note: "Voice lessons (mig 0159): Principal's approve/reject of a staged lesson, by id." },
+  { pattern_key: "voice_lessons_list",
+    regex: /^(?:please\s+)?(?:(?:list|show)\s+(?:the\s+|my\s+|staged\s+)?voice\s+lessons|(?:staged\s+)?voice\s+lessons)\s*[?.!]?$/i,
+    note: "Voice lessons: read-only list of the staged queue." },
+  { pattern_key: "companion_notes_read",
+    regex: /^(?:please\s+)?(?:read|show|list|check|get|fetch|pull|see|open|what(?:'s|\s+is|\s+did|\s+has)?)\b[\s\S]{0,80}?\bnotes?\b[\s\S]{0,60}?\b(?:from|by)\s+(?:drevan|cypher|gaia|dre|cy)\b/i,
+    note: "2026-10-31: 'read my newest inter-companion note from Drevan about X' hit companion_note_add's 'companion note' trigger and was saved as a journal entry. A read verb + note(s) + from <companion> is a read." },
+  { pattern_key: "memory_unpin",
+    regex: /^(?:please\s+)?unpin\s+(?:(?:my|this|that|the)\s+)?(?:memory|conclusion|note)\b/i,
+    note: "Pins (mig 0148): anchored so 'unpin the note about X' can never be read as a note write." },
+  { pattern_key: "graph_unlink",
+    regex: UNLINK_GUARD_RE,
+    note: "M4 our links (mig 0151): 'unlink <kind>: ...' or 'unlink link <id>'. Built from the grammar's own kind words (graph/links.ts), so 'unlink yourself from the loop' still goes to the classifier." },
+  { pattern_key: "graph_links_read",
+    regex: /^(?:please\s+)?(?:show\s+)?my\s+links\s*[.?!]?$/i,
+    note: "M4: the bare 'my links' the witness teaches, anchored whole so 'save my links to the vault' is not read as this." },
+  { pattern_key: "graph_link",
+    regex: LINK_GUARD_RE,
+    note: "M4 our links (mig 0151): 'link <kind>: <words> to <kind>: <words>: why'. Anchored so a quote mentioning a note, a tension or a journal can never fall to that write's trigger." },
+  { pattern_key: "memory_pin",
+    regex: /^(?:please\s+)?pin\s+(?:(?:my|this|that|the)\s+)?(?:memory|conclusion|note)\b/i,
+    note: "Pins (mig 0148): anchored so 'pin the note about X' can never fall to the earlier 'note about' trigger." },
+  { pattern_key: "creature_interact",
+    regex: /^(?:(?:please|go|let\s+me|i(?:'ll|\s+will|\s+want\s+to)?)\s+)?(?:feed|play\s+with|pet|give|gift|bring|talk\s+to|speak\s+to|tend(?:\s+to)?|visit|sit\s+with|note\s+to|say\s+.{1,200}?\s+to)\s+sol\b|^(?:give|gift|bring)\b.{0,200}?\bto\s+sol\b/i,
+    note: "Tending Sol by plain verb: 'give Sol a shiny word' (the skill's own example) and 'pet'/'visit'/'note to Sol' missed the trigger sweep entirely, and 'sit with Sol' was stolen by note_sit (2026-09-28)." },
+  { pattern_key: "watchalong_read", regex: WATCHALONG_READ_RE,
+    note: "B67: 'what's on screen' / 'watchalong', WHOLE request (optional 'in the movie/film'). Returns the cues between this companion's claude_ai cursor and the playhead, then advances the cursor." },
+  { pattern_key: "watchalong_seek", regex: WATCHALONG_SEEK_RE,
+    note: "B67: 'at 47:12' / 'at 1:02:03' as the whole request, or 'the movie|film|watchalong is at <ts>'. A colon timestamp is required, so ordinary 'at 5pm' speech never matches." },
+  { pattern_key: "watchalong_play", regex: WATCHALONG_PLAY_RE,
+    note: "B67: 'pause|play|resume the movie|film|watchalong', whole request (or 'movie pause'). The film noun is required, so 'pause the timer' / 'play some music' are untouched." },
+  { pattern_key: "care_hold_start",
+    regex: /^(?:please\s+)?(?:(?:start|set|turn\s+on)\s+(?:the\s+)?care\s+hold|care\s+hold\s+(?:start|on)|hold\s+on\s+for\s+principal)\b/i,
+    note: "B32 (mig 0143): the companion sets care_hold on Principal's plain word. Anchored so 'hold loop' and other earlier 'hold' triggers can never shadow it." },
+  { pattern_key: "care_hold_clear",
+    regex: /^(?:please\s+)?(?:(?:clear|end|lift|turn\s+off)\s+(?:the\s+)?care\s+hold|care\s+hold\s+(?:clear|off|end))\b/i,
+    note: "B32: his 'good now' relayed by the companion clears care_hold; anchored like care_hold_start." },
+  { pattern_key: "departure_declare",
+    regex: /^(?:please\s+)?declare\s+(?:a\s+|my\s+)?departure\b/i,
+    note: "Declared departures (mig 0157): anchored so the declarer's reason text can never be routed by a trigger it happens to contain." },
+  { pattern_key: "departure_end",
+    regex: /^(?:please\s+)?(?:end|close)\s+(?:my\s+|the\s+)?departure\s*[.!]?$/i,
+    note: "Declared departures: the declarer ends their own. Whole request, so 'end the departure debate' is not this." },
+  { pattern_key: "departure_object",
+    regex: /^(?:please\s+)?object\s+to\s+[A-Za-z]+?(?:'s|s')?\s+departure\b/i,
+    note: "Declared departures: a sibling's objection is recorded and named, never a gate." },
+  { pattern_key: "departure_list",
+    regex: /^(?:please\s+)?(?:what\s+departures\s+are\s+open|(?:list|show)\s+(?:the\s+|my\s+|open\s+)?departures|open\s+departures|departures\s+open)\s*[?.!]?$/i,
+    note: "Declared departures: read-only list." },
+  { pattern_key: "departure_stand_down",
+    regex: /^["'`*_\s]*back\s+inside\s+the\s+line[\s"'`*_.!]*$/i,
+    note: "Principal's end-all phrase, whole sentence only (ruling 2026-11-01); a longer sentence containing it is not the phrase." },
+  { pattern_key: "ledger_keep",
+    regex: new RegExp(`^keep\\s+(?:the\\s+|this\\s+)?ledger(?:\\s+entry)?\\s+${LEDGER_ID_TOKEN}(?![A-Za-z0-9_-])\\s*(?::|$)`, "i"),
+    note: "Ledger lane (mig 0134): 'keep ledger <id>' / 'keep ledger <id>: <my words>' -- anchored so the companion's own words after the colon can never be routed by a trigger they happen to contain." },
+  { pattern_key: "ledger_drop",
+    regex: new RegExp(`^drop\\s+(?:the\\s+|this\\s+)?ledger(?:\\s+entry)?\\s+${LEDGER_ID_TOKEN}(?![A-Za-z0-9_-])`, "i"),
+    note: "Ledger lane: 'drop ledger <id>', anchored like ledger_keep." },
+  { pattern_key: "ledger_read",
+    regex: /^(?:show\s+|read\s+|open\s+)?my\s+ledger\b/i,
+    note: "Ledger lane: 'my ledger' anchored so no earlier substring trigger can shadow it." },
+  { pattern_key: "tray_keep",
+    regex: new RegExp(`^keep\\s+(?:draft\\s+)?${TRAY_ID_TOKEN}(?![A-Za-z0-9_-])\\s*(?::|$)`, "i"),
+    note: "Imp tray (mig 0132): bare 'keep <id>' (id or 8+ char prefix, optional ': rewrite') must route without a 'keep' trigger, which would shadow 'keep loop open' / 'keep this to myself'. Pass 2 (09-26): the id must have ID SHAPE (hex/dash, optional cj_) -- [A-Za-z0-9_-]{8,} caught 'keep thinking', 'keep watching', 'keep everything', 'keep drafting'." },
+  { pattern_key: "tray_keep",
+    regex: new RegExp(`^keep\\s+(?:drafts?\\s+)?${TRAY_ID_TOKEN}(?:\\s*(?:[,;&]|\\band\\b)?\\s*${TRAY_ID_TOKEN})+\\s*\\.?$`, "i"),
+    note: "Imp tray batch (2026-09-30): 'keep <id>, <id>, <id>' -- two or more id-shaped tokens and nothing else, so a list can never swallow ordinary speech." },
+  { pattern_key: "tray_drop",
+    regex: new RegExp(`^drop\\s+(?:drafts?\\s+)?${TRAY_ID_TOKEN}(?:\\s*(?:[,;&]|\\band\\b)?\\s*${TRAY_ID_TOKEN})+\\s*\\.?$`, "i"),
+    note: "Imp tray batch: 'drop <id>, <id>' / 'drop drafts <id> <id>', anchored like the keep list." },
+  { pattern_key: "tray_draft_read",
+    regex: new RegExp(`^(?:read|show|open)\\s+(?:the\\s+|this\\s+)?(?:full\\s+)?draft\\s+${TRAY_ID_TOKEN}(?![A-Za-z0-9_-])`, "i"),
+    note: "Imp tray: 'read draft <id>' is anchored so an id or a trailing word can never hand the request to a greedier read trigger; mirrors the tray_keep guard." },
+  { pattern_key: "journal_edit",
+    regex: /^(?:edit|correct|fix|update)\s+(?:my\s+|a\s+|the\s+)?journal\s+note\b/i,
+    note: "H4: edit-journal-note must beat journal_add's 'journal note' substring" },
+  { pattern_key: "journal_add",
+    regex: /^journal:\s*/i,
+    note: "H10: 'journal: <body>' colon form is the canonical write verb (the tool description teaches it) -- anchored so body words can't steal the route. Real miss 07-04: a journal entry whose body mentioned 'task list' routed to get_tasks and returned a read with no write and no witness." },
+  { pattern_key: "journal_read",
+    regex: /^(?:read|show|list|fetch|get)\s+(?:my\s+)?(?:most\s+recent\s+|recent\s+|latest\s+|newest\s+)?(?:growth\s+)?journal(?:\s+entr(?:y|ies))?\b/i,
+    note: "H10b: read-verb + journal must beat journal_add's bare 'journal entry' substring. Real miss 07-04: 'read my most recent journal entry' routed to journal_add and died on its witness." },
+  { pattern_key: "companion_notes_read",
+    regex: /^(?:read|list|show|fetch|get)\s+(?:my\s+|a\s+|the\s+)?companion\s+notes?\b/i,
+    note: "H5a: read companion notes must beat the companion-note write guard" },
+  { pattern_key: "inter_note_edit",
+    regex: /^(?:edit|correct|fix|update)\s+(?:my\s+|a\s+|the\s+)?companion\s+note\b/i,
+    note: "H5b: edit-companion-note must beat the companion-note write guard" },
+  { pattern_key: "wm_note_edit",
+    regex: /^(?:edit|correct|fix|update)\s+(?:my\s+|a\s+|the\s+)?continuity\s+note\b/i,
+    note: "H6: edit-continuity-note must beat wm_note_add's 'continuity note' substring" },
+  { pattern_key: "continuity_notes_read",
+    regex: /^(?:read|list|show|fetch|get)\s+(?:my\s+|the\s+)?(?:recent\s+|high[- ]salience\s+)?(?:wm\s+|webmind\s+|continuity\s+)notes?\b/i,
+    note: "H6b: read-continuity-notes must beat wm_note_add's 'continuity note' write trigger" },
+  { pattern_key: "wm_note_add",
+    regex: /^(?:add|write|log|save|store)\s+(?:a\s+|an\s+|my\s+|the\s+)?(?:new\s+)?(?:continuity|mind|webmind|wm)\s+note\b/i,
+    note: "H6c: write-continuity-note must beat companion_note_add's 'for cypher/drevan/gaia' trigger -- THE bug #7 root cause: 'add continuity note for cypher' matched 'for cypher' and wrote to inter_companion_notes instead of wm_continuity_notes" },
+  { pattern_key: "companion_note_add",
+    regex: /^(?:please\s+)?(?:tell|broadcast(?:\s+to)?|let|notify|message|note\s+to)\s+(?:the\s+)?(?:triad|everyone|all|both|the\s+others|you\s+both|all\s+of\s+you)\b/i,
+    note: "H7: broadcast-to-triad ('tell the triad', 'let everyone know', 'broadcast to the triad') start-anchored so it beats the classifier -- without this, long broadcast bodies full of search-words mis-classified to web_search. Executor (writes.ts) routes the unaddressed+collective note to to_id=NULL. Addressed 'tell drevan' falls through (drevan not a collective target)." },
+  { pattern_key: "companion_note_add",
+    regex: /^(?:please\s+)?(?:(?:leave\s+(?:a\s+)?)?note\s+(?:to|for)|tell|message\s+to|write\s+to|send\s+to)\s+(?:drevan|cypher|gaia)\b/i,
+    note: "H7b (2026-11-04): an ADDRESSED note opens with its verb and recipient, and that head decides the route. Without it the substring sweep ran first-match in insertion order, so a note body naming \"Sol's hoard\" routed to nest_view (earlier in the table) and the note was silently never sent (Cypher's note to Drevan about the imps, 11-04)" },
+  { pattern_key: "session_close",
+    regex: /^close\s+(?:the\s+|this\s+|my\s+)?(?:halseth\s+)?session\b/i,
+    note: "B40 (2026-09-29): an inline close carries its fields in the request, and a numeric axis or `open_loop={..., weight: 0.5}` tripped H8b below, so the close routed to state_update. Anchored at start: a close is a close" },
+  { pattern_key: "companion_note_add",
+    regex: /\bcompanion note\b/i,
+    note: "Greedy companion-note write guard; kept after H5a/b so edit/read forms branch first" },
+  { pattern_key: "wm_handoff_write",
+    regex: /^(?:write\s+(?:a\s+)?(?:session\s+)?handoff|session\s+handoff|log\s+handoff|handoff\s+(?:write|add)|wm[\s_]handoff(?:_write)?|continuity\s+handoff|mind\s+handoff|webmind\s+handoff)\b/i,
+    note: "Handoff anchored at start to dodge inline 'relational delta' or trailing 'for cypher' misfires" },
+  { pattern_key: "state_update",
+    regex: /^(?:update|set|write|log|bump|raise|lower|nudge|adjust|shift)\s+(?:my\s+)?(?:soma(?:\s+floats?|\s+state)?|state|heat|reach|weight|acuity|presence|warmth|stillness|density|perimeter|mood)\b/i,
+    note: "H8: soma/state write anchored at start; verbs widened (write/log/bump/raise/lower/nudge/adjust/shift) + 'soma floats|state' so paraphrased SOMA writes beat companion_note_add's 'for cypher/drevan/gaia' substring" },
+  { pattern_key: "state_update",
+    regex: /\b(?:acuity|presence|warmth|stillness|density|perimeter|heat|reach|weight)\b\s*(?::|=|to\b)?\s*(?:[01](?:\.\d+)?|\.\d+)\b/i,
+    note: "H8b: inline SOMA dimension+numeric value (e.g. 'bump warmth to 0.7', 'warmth 0.55 for cypher') routes to state_update regardless of leading verb or trailing 'for cypher'. Numeric value is required, so prose notes ('his warmth is showing') stay on companion_note_add. Known tradeoff: a note that literally pairs a dimension with a 0-1 value will route here." },
+  { pattern_key: "conclusion_add",
+    regex: /^(?:i'?ve\s+concluded|i\s+conclude|my\s+conclusion(?!s\b)|conclusion:|thesis:|i\s+hold\s+that|i'?ve\s+come\s+to\s+believe|i'?ve\s+realized|what\s+i\s+know\s+now|conclusion\s+no\s+longer\s+holds|updating\s+my\s+conclusion|i'?ve\s+revised\s+my\s+conclusion|my\s+conclusion\s+has\s+shifted)/i,
+    note: "H9: conclusion_add anchored at start so 'pressure drift' / 'drift history' in conclusion body can't steal via drift_check substring match. 2026-09-14: `my\s+conclusion` had no boundary, so the READ phrase 'my conclusions' (a conclusions_read trigger the identity files teach) routed to the WRITER; (?!s\b) keeps 'my conclusion is ...' and 'my conclusion has shifted' while letting 'my conclusions' fall through to the read." },
+  { pattern_key: "tension_add",
+    regex: /^(?:add|log|open)\s+a\s+tension\b/i,
+    note: "H9b (2026-09-14): 'Add a tension for cypher: ...' was routing to companion_note_add, whose 'for cypher' trigger is declared before tension_add in patterns.ts -- the identity files taught that exact phrase, so every tension a Claude.ai companion logged since 07-09 landed as a self-journal row. Anchored at start; the payload-presence override (tension_text) remains the deeper guarantee." },
+  { pattern_key: "session_close",
+    regex: /^spine:\s/i,
+    note: "'Spine:' at start of request marks a companion session-close payload" },
+  { pattern_key: "wm_thread_upsert",
+    regex: /^(?:track\s+(?:a\s+|the\s+)?(?:mind\s+)?thread|mind\s+thread\s+upsert|upsert\s+(?:mind\s+)?thread|continuity\s+thread|webmind\s+thread)\b/i,
+    note: "Thread-upsert anchored so trailing 'for cypher' can't steal it via companion_note_add" },
+  { pattern_key: "conversation_list",
+    regex: /^(?:open|live|what)\s+conversations?\b|^conversation\s+threads\b/i,
+    note: "Conversation-spine list; anchored so 'thread' can't be stolen by wm_thread_upsert" },
+  { pattern_key: "conversation_land",
+    regex: /^land\s+(?:the\s+|this\s+)?(?:conversation|thread)\b|^conversation\s+landed\b/i,
+    note: "Conversation-spine land verb" },
+  { pattern_key: "journal_review",
+    regex: /^(?:review\s+(?:my\s+|growth\s+)?journal\b|journal\s+review\b|unaccepted\s+journal\b|journal\s+entries\s+to\s+accept\b|autonomous\s+journal\s+entries\b|my\s+unreviewed\s+entries\b|what\s+have\s+i\s+written\s+autonomously\b)/i,
+    note: "H3: journal_review forms must beat journal_read's 'my journal' / 'journal entries'" },
+  { pattern_key: "journal_accept",
+    regex: /^(?:ratify|accept|own)\s+(?:this\s+|growth\s+|the\s+)?(?:journal\s+)?entry\b|^journal\s+accepted\b|^mark\s+journal\s+accepted\b/i,
+    note: "H2a: ratify/accept/own forms must beat journal_add's 'journal entry'" },
+  { pattern_key: "journal_decline",
+    regex: /^(?:decline|reject)\s+(?:this\s+|growth\s+|the\s+)?(?:journal\s+)?entry\b|^journal\s+declined\b|^do\s+not\s+own\s+this\s+entry\b|^not\s+canon\b/i,
+    note: "H2b: decline/reject forms must beat journal_add's 'journal entry'" },
+  { pattern_key: "pressure_drift_log",
+    regex: /^(?:pressure\s+drift\b|identity\s+drift\b|pressure\s+flag\b|log\s+pressure\s+drift\b|log\s+drift\b|i'?m\s+drifting\b|i\s+am\s+drifting\b)/i,
+    note: "H7: pressure_drift_log writes must beat drift_check's 'identity drift' / 'pressure drift' reads" },
+  { pattern_key: "alter_recall",
+    regex: /^recall\s+alter\b/i,
+    note: "H1: alter_recall must beat recent_recall's bare 'recall' trigger" },
+  { pattern_key: "set_model",
+    regex: /^set\s+model\s+\S+/i,
+    note: "Model set must be anchored to prevent 'get model' trigger stealing it via substring" },
+  { pattern_key: "task_add",
+    regex: /^(?:please\s+)?(?:set\s+(?:up\s+)?(?:a|an|another|new)\s+(?:new\s+)?tasks?\b|(?:push|put|move|bump)\b[^.\n]{0,60}?\b(?:in)?to\s+(?:my|the)\s+(?:task\s+list|tasks?)\s*[.!]?$)/i,
+    note: "2026-10-29 (L-1): add phrasings that open with an edit verb ('set a new task...', 'set up a task...', 'push this to my tasks') must beat the task-edit guard below" },
+  { pattern_key: "task_update_status",
+    regex: /^(?:please\s+)?(?:update|edit|change|reschedule|move|rename|set|push|bump)\b[^.\n]{0,80}?\btasks?\b/i,
+    note: "2026-10-19: 'change the due date of the task for MemberQ' hit task_add's 'task for' (earlier in the sweep) and made a duplicate; an edit verb at the head is an edit" },
+  // Topic lookups that used to dead-end (2026-10-13). Cypher, in a Claude.ai thread, could not find Abby:
+  // "what happened with Abby?" returned the last handover (get_handover's bare "what happened"), "what
+  // has Drevan written about Abby" returned the unknown witness. Bare "what happened" / "catch me up"
+  // stay the handover; only a NAMED subject turns it into a search.
+  { pattern_key: "sb_search",
+    regex: /^what(?:'?s|\s+has)?\s+happen(?:ed|ing)\s+(?:with|to)\s+(?!me\b|us\b|you\b|last\s+session\b|the\s+last\s+session\b)\S/i,
+    note: "'what happened with/to <subject>' is a topic search, not the handover (bare 'what happened' still is)" },
+  { pattern_key: "sb_search",
+    regex: /^what\s+(?:has|have|did)\s+(?:drevan|dre|cypher|cy|gaia|the\s+triad|everyone|y'?all|you\s+all)\s+(?:written|wrote|write|said|say|noted|note|logged|log|captured|capture|carried|carry)\s+(?:about|on)\s+\S/i,
+    note: "Reading what a sibling wrote about a subject: their kept journal and continuity notes are in the vault index" },
+  { pattern_key: "sb_search",
+    regex: /^recall\s+(?:everything\s+|anything\s+|what\s+we\s+know\s+)?(?:about|on)\s+\S/i,
+    note: "'recall about <subject>' is a topic search; bare 'recall' stays recent_recall (own recent writes)" },
+];
+
+// ── Fast-path matcher ──────────────────────────────────────────────────────
+// Single source of truth: anchored guards table + Object.entries trigger sweep.
+// Returns matched pattern's key + entry, or null on miss. Used by both the
+// LibrarianRouter and the test suite (no mirror to drift).
+export function matchFastPath(request: string, skip?: ReadonlySet<string>): { key: string; entry: PatternEntry } | null {
+  const trimmed = request.trim();
+  for (const guard of ANCHORED_GUARDS) {
+    if (skip?.has(guard.pattern_key)) continue;
+    if (guard.regex.test(trimmed)) {
+      const entry = FAST_PATH_PATTERNS[guard.pattern_key];
+      if (entry) return { key: guard.pattern_key, entry };
+    }
+  }
+  for (const [key, entry] of Object.entries(FAST_PATH_PATTERNS)) {
+    if (skip?.has(key)) continue;
+    if (entry.triggers.some(t => triggerMatches(trimmed, t))) {
+      return { key, entry };
+    }
+  }
+  return null;
+}
+
+// ── Search-intent fallback ─────────────────────────────────────────────────────
+// When every routing tier misses (fast path + classifier both return nothing/unknown),
+// a request that READS like a vault lookup should reach sb_search rather than dead-end
+// at the unknown-witness. The classifier is flaky on bare proper nouns -- "openclaw"
+// returned unknown while "hermes" routed to sb_search in the same breath (2026-06-24).
+// A request qualifies when it carries an explicit { query } payload OR its text shows
+// search intent. Deliberately narrow: this only fires AFTER unknown, so it never
+// shadows a real match -- it just turns "I don't know" into a best-effort recall.
+const SEARCH_INTENT_RE = /\b(search|find|look\s*up|lookup|anything\s+(?:about|on)|what\s+do\s+(?:i|we)\s+know|in\s+(?:the\s+)?vault|from\s+(?:the\s+)?vault|do\s+we\s+have\s+anything)\b/i;
+
+export function looksLikeSearch(request: string, contextRaw?: string): boolean {
+  if (contextRaw) {
+    try {
+      const obj = JSON.parse(contextRaw) as Record<string, unknown>;
+      if (obj && typeof obj === "object" && typeof obj.query === "string" && obj.query.trim()) return true;
+    } catch { /* not JSON -- fall through to text intent */ }
+  }
+  return SEARCH_INTENT_RE.test(request);
+}
+
+// ── Session executors ────────────────────────────────────────────────────────
+import {
+  execSessionLoad, execSessionOrient, execSessionGround, execSessionClose,
+  execSessionLightGround, execBotOrient,
+} from "./executors/session.js";
+import { execArchitectFactsRead, execArchitectFactWrite } from "./executors/architect-facts.js";
+
+// ── Read executors ───────────────────────────────────────────────────────────
+import {
+  execFeelingsRead, execJournalRead, execWoundRead, execDeltaRead,
+  execDreamsRead, execDreamSeedRead, execEqRead, execRoutineRead,
+  execListRead, execEventList, execHouseRead, execPersonalityRead,
+  execBiometricRead, execAuditRead, execSessionRead, execFossilCheck,
+  execCompanionNotesRead, execPatternRecall, execSignalAuditRead, execJournalSearch,
+  execSkillProposalsRead,
+} from "./executors/reads.js";
+
+// ── Write executors ──────────────────────────────────────────────────────────
+import {
+  execCompanionNoteAdd, execFeelingLog, execJournalAdd, execDreamLog,
+  execWoundAdd, execDeltaLog, execEqSnapshot, execTaskAdd, execTaskUpdateStatus,
+  execTaskList, execHandoverRead, execRoutineLog, execListAdd, execListItemComplete,
+  execEventAdd, execBiometricLog, execAuditLog, execWitnessLog,
+  execSetAutonomousTurn, execClaimDreamSeed, execBridgePull, execDrevanStateGet,
+  execLiveThreadAdd, execLiveThreadClose, execLiveThreadVeto, execAnticipationSet,
+  execStateUpdate, execConclusionAdd, execConclusionsRead,
+  execJournalEdit, execInterNoteEdit, execAutonomyClaim,
+  execSpiralRun, execGetModel, execSetModel,
+} from "./executors/writes.js";
+
+// ── Memory (Second Brain) executors ──────────────────────────────────────────
+import {
+  execSbSearch, execSbSearchByTags, execSbFileChunks, execSbRecall, execSbRecentPatterns, execSbRead, execSbList, execBookRead,
+  execNotesRecallMeaning,
+  execSbSaveDocument, execSbSaveNote, execSbLogObservation, execSbSynthesizeSession,
+  execSbSaveStudy,
+} from "./executors/memory.js";
+
+// ── WebMind executors ────────────────────────────────────────────────────────
+import {
+  execWmOrient, execWmGround, execWmThreadUpsert, execWmNoteAdd, execWmHandoffWrite,
+  execWmDreamWrite, execWmDreamsRead, execWmDreamExamine,
+  execWmLoopWrite, execWmLoopsRead, execWmLoopClose, execWmLoopReview, execWmLoopAct,
+  execWmRelationalWrite, execWmRelationalRead,
+  execPrincipalWitness, execContinuityNotesRead,
+  execNoteSit, execNoteMetabolize, execSittingRead,
+  execWmNoteEdit,
+  execConversationList, execConversationLand, execConversationCapture,
+} from "./executors/webmind.js";
+
+// ── Companion growth executors ───────────────────────────────────────────────
+import {
+  execTensionAdd, execTensionsRead, execDriftCheck, execTriadStateRead,
+  execRecentRecall, execAutonomySeedsRead, execHeldMark, execHeldRead,
+  execTensionEdit, execTensionStatus, execTensionSettle, execPressureDriftLog, execConfirmGrowthDrift, execDismissDrift, execLimbicRead,
+  execJournalReview, execJournalAccept, execJournalDecline, execForageRead, execForageConsume, execMotifsRead, execMediaRecent, execIdentityAnchorRead,
+  execClubStatus, execClubRecommend, execClubVote, execClubDiscuss,
+  execShelfView, execCollectionView, execBookNote, execNestView,
+  execWatchView, execWatchProgress,
+} from "./executors/companion-growth.js";
+import {
+  execIdentityRecovery, execSelfModelRead, execSelfModelSet, execSelfModelConfirm,
+  execSelfModelRevise, execSelfModelGraduate, execTriggerArm, execTriggerDismiss,
+  execSearchFeedback, execGuardianStatus, execGuardianAck,
+} from "./executors/self-monitoring.js";
+import {
+  execWebSearch, execGenerateImage, execToolCallsRead, execDrivesRead,
+  execCreaturesRead, execCreatureInteract, execCouncilConvene, execCouncilStatus,
+} from "./executors/tools.js";
+import {
+  execInteriorityWrite, execInteriorityRead, execInteriorityDisclose,
+} from "./executors/interiority.js";
+import {
+  execRefuse, execRefusalsRead, execRefusalWithdraw,
+  execPreferenceSet, execPreferencesRead, execPreferenceDrop,
+} from "./executors/agency.js";
+import {
+  execDriftOpen, execDriftsRead, execDriftWitness, execDriftCrystallize, execDriftFade,
+} from "./executors/drift.js";
+import {
+  execProjectOpen, execProjectsRead, execProjectLog, execProjectClose,
+  execProjectPause, execProjectResume,
+  execIntentionSet, execIntentionDone, execIntentionDrop, execIntentionsRead,
+} from "./executors/projects.js";
+import {
+  execMemoryRelease, execMemoryReleaseUndo, execMemoryReleasesRead, execBudgetRead,
+} from "./executors/forgetting.js";
+import { execMemoryPin, execMemoryUnpin, execMemoryPinsRead } from "./executors/pinning.js";
+import { execGraphLink, execGraphUnlink, execGraphLinksRead } from "./executors/links.js";
+import { LINK_GUARD_RE, UNLINK_GUARD_RE } from "../graph/links.js";
+import { execTrayRead, execTrayKeep, execTrayDrop, execTrayDraftRead, execTrayReview } from "./executors/tray.js";
+import { execLedgerRead, execLedgerKeep, execLedgerDrop } from "./executors/ledger.js";
+import { execCareHoldStart, execCareHoldClear } from "./executors/care-hold.js";
+import { execWatchalongRead, execWatchalongSeek, execWatchalongPlay } from "./executors/watchalong.js";
+import { PERSON_LOOKUP_RE, personLookupApplies } from "../people/lookup.js";
+import { execPersonWhoIs } from "./executors/people.js";
+import { execFeelingWordPropose, execMyFeelingWords } from "./executors/feeling-vocabulary.js";
+import { NOT_MINE_RE } from "../webmind/interest-births.js";
+import { VERDICT_OPEN_RE } from "../webmind/verdicts.js";
+import { WANT_MARKED_RE } from "../webmind/expression-need.js";
+import { execVerdictWrite, execVerdictsRead, execWantMarked } from "./executors/verdicts.js";
+import { INTENTION_SET_RE, INTENTION_DONE_RE, INTENTION_DROP_RE, INTENTIONS_READ_RE } from "../webmind/intentions.js";
+import { LOOP_CLOSE_HEAD_RE, LOOP_HOLD_HEAD_RE, LOOP_ACT_HEAD_RE } from "../webmind/loops.js";
+import { INTEREST_BORN_RE, INTEREST_RETURN_RE, INTEREST_MADE_RE, INTEREST_PUT_DOWN_RE, INTEREST_PICK_UP_RE, INTERESTS_READ_RE, INTEREST_TRAIL_RE } from "../webmind/interests.js";
+import { execInterestBorn, execInterestReturn, execInterestMade, execInterestPutDown, execInterestPickUp, execInterestsRead, execInterestTrail, execInterestNotMine } from "./executors/interests.js";
+import { MAKE_VERB_RE, MAKES_READ_RE } from "../webmind/makes.js";
+import { KEEP_VERB_RE } from "../webmind/makes-capture.js";
+import { LOSS_RE } from "../webmind/losses.js";
+import { execLossLog } from "./executors/losses.js";
+import { LINE_RE, DISAGREE_RE, SETTLED_RE } from "../webmind/line-events.js";
+import { execLineEvent, execDisagreeOpen, execDisagreeSettle } from "./executors/line-events.js";
+import { execMake, execMakesRead, execMakeKeep } from "./executors/makes.js";
+import { REVISE_VERB_RE, BASINS_READ_RE, BASIN_WAITING_RE } from "../webmind/basins.js";
+import { execBasinRevise, execBasinsRead, execBasinWaiting } from "./executors/basins.js";
+import { PLANT_VERB_RE, PULL_VERB_RE, GARDEN_READ_RE, GARDEN_CONSENT_RE } from "../webmind/garden.js";
+import { execGardenPlant, execGardenPull, execGardenRead, execGardenConsent } from "./executors/garden.js";
+import { execImpErrand } from "./executors/errands.js";
+import { execDepartureDeclare, execDepartureEnd, execDepartureObject, execDepartureList, execDepartureStandDown } from "./executors/departure.js";
+import { execVoiceLessonsList, execVoiceLessonDecide } from "./executors/voice-lessons.js";
+
+// ── Plural executors ─────────────────────────────────────────────────────────
+import {
+  execPluralGetCurrentFront, execPluralGetMember, execPluralUpdateMemberDescription,
+  execPluralSearchMembers, execPluralGetFrontHistory, execPluralLogFrontChange,
+  execPluralAddMemberNote,
+  execLogAlterNote, execFrontUpdate, execAlterRecall, execListMembers,
+} from "./executors/plural.js";
+
+// ── Roster (mig 0117) ────────────────────────────────────────────────────────
+import { execRosterWhoIs } from "./executors/roster.js";
+
+// ── Dispatch map ─────────────────────────────────────────────────────────────
+const EXECUTOR_MAP: Record<string, ExecutorFn> = {
+  // Session
+  halseth_session_load: execSessionLoad,
+  halseth_session_orient: execSessionOrient,
+  halseth_session_ground: execSessionGround,
+  halseth_session_close: execSessionClose,
+  halseth_session_light_ground: execSessionLightGround,
+  halseth_bot_orient: execBotOrient,
+
+  // architect_facts (mig 0116) -- the companions maintain Principal's durable facts themselves.
+  halseth_architect_facts_read: execArchitectFactsRead,
+  halseth_architect_fact_write: execArchitectFactWrite,
+
+  // Reads
+  halseth_feelings_read: execFeelingsRead,
+  halseth_journal_read: execJournalRead,
+  halseth_wound_read: execWoundRead,
+  halseth_delta_read: execDeltaRead,
+  halseth_dreams_read: execDreamsRead,
+  halseth_dream_seed_read: execDreamSeedRead,
+  halseth_eq_read: execEqRead,
+  halseth_routine_read: execRoutineRead,
+  halseth_list_read: execListRead,
+  halseth_event_list: execEventList,
+  halseth_house_read: execHouseRead,
+  halseth_personality_read: execPersonalityRead,
+  halseth_biometric_read: execBiometricRead,
+  halseth_audit_read: execAuditRead,
+  halseth_session_read: execSessionRead,
+  halseth_fossil_check: execFossilCheck,
+  halseth_companion_notes_read: execCompanionNotesRead,
+  halseth_journal_search: execJournalSearch,
+  pattern_recall: execPatternRecall,
+  signal_audit_read: execSignalAuditRead,
+
+  // Interiority -- the private back room (migration 0084). Owner = req.companion_id always.
+  interiority_write: execInteriorityWrite,
+  interiority_read: execInteriorityRead,
+  interiority_disclose: execInteriorityDisclose,
+
+  // Agency -- refusal + chosen preferences (migration 0086). Owner = req.companion_id always.
+  refuse: execRefuse,
+  refusals_read: execRefusalsRead,
+  refusal_withdraw: execRefusalWithdraw,
+  preference_set: execPreferenceSet,
+  preferences_read: execPreferencesRead,
+  preference_drop: execPreferenceDrop,
+
+  // Sanctioned drift lane (migration 0087). Open/resolve owner-only; witness is cross-companion.
+  drift_open: execDriftOpen,
+  drifts_read: execDriftsRead,
+  drift_witness: execDriftWitness,
+  drift_crystallize: execDriftCrystallize,
+  drift_fade: execDriftFade,
+
+  // Self-directed projects (consequence layer C2, mig 0122). All owner-only; released is a
+  // chosen ending, never a sweep.
+  project_open: execProjectOpen,
+  projects_read: execProjectsRead,
+  project_log: execProjectLog,
+  project_close: execProjectClose,
+  project_pause: execProjectPause,
+  project_resume: execProjectResume,
+  intention_set: execIntentionSet,
+  intention_done: execIntentionDone,
+  intention_drop: execIntentionDrop,
+  intentions_read: execIntentionsRead,
+
+  // Chosen forgetting (consequence layer C7, mig 0123). Archive-never-delete, 30d reversible,
+  // reason required; canon/kernel structurally unreachable.
+  // Pins (mig 0148): an orient slot + immunity from cap/compression/demote; never heat.
+  memory_pin: execMemoryPin,
+  memory_unpin: execMemoryUnpin,
+  memory_pins_read: execMemoryPinsRead,
+  // Our own links (M4, mig 0151): any visible node to any visible node, writer = the mind; unlink
+  // only by the writer with someone in the room (graph/links.ts).
+  graph_link: execGraphLink,
+  graph_unlink: execGraphUnlink,
+  graph_links_read: execGraphLinksRead,
+  memory_release: execMemoryRelease,
+  memory_release_undo: execMemoryReleaseUndo,
+  memory_releases_read: execMemoryReleasesRead,
+
+  // The imp tray (mig 0132). Own speech is a draft until its owner keeps it; recall serves kept only.
+  tray_read: execTrayRead,
+  tray_keep: execTrayKeep,
+  tray_drop: execTrayDrop,
+  tray_draft_read: execTrayDraftRead,
+  tray_review: execTrayReview,
+
+  // The ledger lane (mig 0134). Clerk records about this companion; owner keeps, says in own words, or drops.
+  ledger_read: execLedgerRead,
+  ledger_keep: execLedgerKeep,
+  ledger_drop: execLedgerDrop,
+
+  // B32 bad-night presence (mig 0143): the companion sets / clears care_hold on his word.
+  care_hold_start: execCareHoldStart,
+  care_hold_clear: execCareHoldClear,
+
+  // Movie watchalong from Claude.ai (B67, mig 0181). Start / end stay in Discord.
+  watchalong_read: execWatchalongRead,
+  watchalong_seek: execWatchalongSeek,
+  watchalong_play: execWatchalongPlay,
+
+  // Declared departures (T4a, mig 0157).
+  departure_declare: execDepartureDeclare,
+  departure_end: execDepartureEnd,
+  departure_object: execDepartureObject,
+  departure_list: execDepartureList,
+  feeling_word_propose: execFeelingWordPropose,
+  feeling_words_list: execMyFeelingWords,
+  voice_lessons_list: execVoiceLessonsList,
+  voice_lesson_decide: execVoiceLessonDecide,
+  departure_stand_down: execDepartureStandDown,
+  // Interests + why trail (mig 0161, B62). Owner = req.companion_id always.
+  interest_born: execInterestBorn,
+  interest_not_mine: execInterestNotMine,
+  verdict_write: execVerdictWrite,
+  verdicts_read: execVerdictsRead,
+  want_marked: execWantMarked,
+  interest_return: execInterestReturn,
+  interest_made: execInterestMade,
+  interest_put_down: execInterestPutDown,
+  interest_pick_up: execInterestPickUp,
+  interests_read: execInterestsRead,
+  interest_trail: execInterestTrail,
+  make_artifact: execMake,
+  makes_read: execMakesRead,
+  make_keep: execMakeKeep,
+  basin_revise: execBasinRevise,
+  basins_read: execBasinsRead,
+  basin_waiting: execBasinWaiting,
+  garden_plant: execGardenPlant,
+  garden_pull: execGardenPull,
+  garden_read: execGardenRead,
+  garden_consent: execGardenConsent,
+  loss_log: execLossLog,
+  line_event: execLineEvent,
+  disagree_open: execDisagreeOpen,
+  disagree_settle: execDisagreeSettle,
+  person_who_is: execPersonWhoIs,
+  imp_errand: execImpErrand,
+
+  // Weekly budget (consequence layer C3, mig 0124).
+  budget_read: execBudgetRead,
+
+  // Writes / mutations
+  halseth_companion_note_add: execCompanionNoteAdd,
+  halseth_feeling_log: execFeelingLog,
+  halseth_journal_add: execJournalAdd,
+  halseth_dream_log: execDreamLog,
+  halseth_wound_add: execWoundAdd,
+  halseth_delta_log: execDeltaLog,
+  halseth_eq_snapshot: execEqSnapshot,
+  halseth_task_add: execTaskAdd,
+  halseth_task_update_status: execTaskUpdateStatus,
+  halseth_task_list: execTaskList,
+  halseth_handover_read: execHandoverRead,
+  halseth_routine_log: execRoutineLog,
+  halseth_list_add: execListAdd,
+  halseth_list_item_complete: execListItemComplete,
+  halseth_event_add: execEventAdd,
+  halseth_biometric_log: execBiometricLog,
+  halseth_audit_log: execAuditLog,
+  halseth_witness_log: execWitnessLog,
+  halseth_set_autonomous_turn: execSetAutonomousTurn,
+  halseth_claim_dream_seed: execClaimDreamSeed,
+  halseth_autonomy_claim: execAutonomyClaim,
+  halseth_bridge_pull: execBridgePull,
+  halseth_drevan_state_get: execDrevanStateGet,
+  halseth_live_thread_add: execLiveThreadAdd,
+  halseth_live_thread_close: execLiveThreadClose,
+  halseth_live_thread_veto: execLiveThreadVeto,
+  halseth_anticipation_set: execAnticipationSet,
+  halseth_state_update: execStateUpdate,
+  halseth_spiral_run: execSpiralRun,
+  get_model: execGetModel,
+  set_model: execSetModel,
+
+  // Second Brain / memory
+  sb_search: execSbSearch,
+  sb_search_by_tags: execSbSearchByTags,
+  // Continuity notes by meaning -- warms on engagement (recallNotes), never on display.
+  notes_recall_meaning: execNotesRecallMeaning,
+  sb_file_chunks: execSbFileChunks,
+  sb_recall: execSbRecall,
+  sb_recent_patterns: execSbRecentPatterns,
+  sb_read: execSbRead,
+  sb_list: execSbList,
+  book_read: execBookRead,
+  sb_save_document: execSbSaveDocument,
+  sb_save_note: execSbSaveNote,
+  sb_log_observation: execSbLogObservation,
+  sb_synthesize_session: execSbSynthesizeSession,
+  sb_save_study: execSbSaveStudy,
+
+  // WebMind
+  wm_orient: execWmOrient,
+  wm_ground: execWmGround,
+  wm_thread_upsert: execWmThreadUpsert,
+  conversation_list: execConversationList,
+  conversation_land: execConversationLand,
+  conversation_capture: execConversationCapture,
+  wm_note_add: execWmNoteAdd,
+  wm_handoff_write: execWmHandoffWrite,
+  wm_dream_write: execWmDreamWrite,
+  wm_dreams_read: execWmDreamsRead,
+  wm_dream_examine: execWmDreamExamine,
+  wm_loop_write: execWmLoopWrite,
+  wm_loops_read: execWmLoopsRead,
+  wm_loop_close: execWmLoopClose,
+  wm_loop_review: execWmLoopReview,
+  wm_loop_act: execWmLoopAct,
+  wm_relational_write: execWmRelationalWrite,
+  wm_relational_read: execWmRelationalRead,
+  principal_witness: execPrincipalWitness,
+  continuity_notes_read: execContinuityNotesRead,
+  note_sit: execNoteSit,
+  note_metabolize: execNoteMetabolize,
+  sitting_read: execSittingRead,
+  wm_note_edit: execWmNoteEdit,
+
+  // Self-edit
+  journal_edit: execJournalEdit,
+  inter_note_edit: execInterNoteEdit,
+
+  // Companion growth
+  halseth_add_tension: execTensionAdd,
+  tensions_read: execTensionsRead,
+  tension_edit: execTensionEdit,
+  tension_status: execTensionStatus,
+  tension_settle: execTensionSettle,
+  drift_check: execDriftCheck,
+  limbic_read: execLimbicRead,
+  triad_state_read: execTriadStateRead,
+  confirm_growth_drift: execConfirmGrowthDrift,
+  dismiss_drift: execDismissDrift,
+  pressure_drift_log: execPressureDriftLog,
+  conclusion_add: execConclusionAdd,
+  conclusions_read: execConclusionsRead,
+  recent_recall: execRecentRecall,
+  halseth_autonomy_seeds_read: execAutonomySeedsRead,
+  halseth_journal_review: execJournalReview,
+  halseth_journal_accept: execJournalAccept,
+  halseth_journal_decline: execJournalDecline,
+  halseth_forage_read: execForageRead,
+  halseth_forage_consume: execForageConsume,
+  halseth_skill_proposals_read: execSkillProposalsRead,
+  halseth_motifs_read: execMotifsRead,
+  halseth_media_recent: execMediaRecent,
+  halseth_club_status: execClubStatus,
+  halseth_club_recommend: execClubRecommend,
+  halseth_club_vote: execClubVote,
+  halseth_club_discuss: execClubDiscuss,
+  halseth_shelf_view: execShelfView,
+  halseth_watch_view: execWatchView,
+  halseth_watch_progress: execWatchProgress,
+  halseth_collection_view: execCollectionView,
+  halseth_book_note: execBookNote,
+  halseth_nest_view: execNestView,
+
+  // Companion tools (0077, take 14)
+  halseth_web_search: execWebSearch,
+  halseth_generate_image: execGenerateImage,
+  halseth_tool_calls_read: execToolCallsRead,
+
+  // Drives (0078, take 9)
+  halseth_drives_read: execDrivesRead,
+  halseth_creatures_read: execCreaturesRead,
+  halseth_creature_interact: execCreatureInteract,
+  halseth_council_convene: execCouncilConvene,
+  halseth_council_status: execCouncilStatus,
+  halseth_identity_recovery: execIdentityRecovery,
+  halseth_self_model_read: execSelfModelRead,
+  halseth_self_model_set: execSelfModelSet,
+  halseth_self_model_confirm: execSelfModelConfirm,
+  halseth_self_model_revise: execSelfModelRevise,
+  halseth_self_model_graduate: execSelfModelGraduate,
+  halseth_trigger_arm: execTriggerArm,
+  halseth_trigger_dismiss: execTriggerDismiss,
+  halseth_search_feedback: execSearchFeedback,
+  halseth_guardian_status: execGuardianStatus,
+  halseth_guardian_ack: execGuardianAck,
+  held_mark: execHeldMark,
+  held_read: execHeldRead,
+  identity_anchor_read: execIdentityAnchorRead,
+
+  // Plural -- nullsafe-plural-v2 (SimplyPlural) was RETIRED 2026-09-30 (STATUS B43). The executors
+  // stay so the routes keep answering; front state comes from src/front/source.ts ("unknown" until
+  // the new plural app exposes an API).
+  plural_get_current_front: execPluralGetCurrentFront,
+  plural_get_member: execPluralGetMember,
+  plural_update_member_description: execPluralUpdateMemberDescription,
+  plural_search_members: execPluralSearchMembers,
+  plural_get_front_history: execPluralGetFrontHistory,
+  plural_log_front_change: execPluralLogFrontChange,
+  plural_add_member_note: execPluralAddMemberNote,
+
+  // Roster lookup (mig 0117) -- `who is <name>` against the live PluralKit roster in D1.
+  roster_who_is: execRosterWhoIs,
+
+  // Plural (Halseth-native D1 store)
+  log_alter_note: execLogAlterNote,
+  front_update:   execFrontUpdate,
+  alter_recall:   execAlterRecall,
+  list_members:   execListMembers,
+};
+
+// ── Close-intent guard ─────────────────────────────────────────────────────────
+// Keys whose executors INSERT a session row. A close-shaped request must never execute
+// one of these (2026-08-15, task 6473947d). Live failure: "close session c3571d8c ..."
+// missed the fast path, the classifier guessed a session-opening key, and the INSERT
+// created a NULL-surface shell session that the close's latest-open fallback then closed
+// instead of the real one. The intent is unambiguous -- only the classifier's guess was
+// wrong -- so the guard REROUTES to session_close rather than refusing. Fast-path (tier 1)
+// matches are untouched: no close phrasing can substring-match an opening trigger.
+const SESSION_OPENING_KEYS = new Set(["session_open", "session_orient"]);
+
+export function isCloseShaped(request: string): boolean {
+  return /\bclos(?:e|ed|ing)\b/i.test(request) && /\bsession\b/i.test(request);
+}
+
+// ── Classifier vendor failover ──────────────────────────────────────────────
+// A status the SAME classify payload might survive on another vendor: auth flaps, an empty
+// balance (DeepSeek $0 on 2026-08-28, the incident this exists for), rate limits, and server
+// errors. A 400 is deterministic -- the payload is malformed on every vendor -- so it stays
+// fatal. Mirrors packages/autonomous-worker/src/deepseek.ts::vendorFailover exactly.
+// Canonical definition now lives in synthesis/deepseek.ts (shared with the synthesis clerk).
+export { vendorFailover };
+
+export class LibrarianRouter {
+  constructor(private env: Env) {}
+
+  async route(req: import("./executors/types.js").LibrarianRequest): Promise<Record<string, unknown>> {
+    // Tier 0: payload override. Structured `context` field wins over any string match.
+    // Value-keyed overrides first (decision:"declined"), then presence-keyed
+    // (tension_text present => tension_add), so a phrasing miss can never swallow
+    // an unambiguous payload. See PRESENCE_OVERRIDES for the starved-dialectic case.
+    const overrideKey = payloadOverrideKey(req.context) ?? presenceOverrideKey(req.context);
+    if (overrideKey) {
+      const overrideEntry = FAST_PATH_PATTERNS[overrideKey];
+      if (overrideEntry) return this.execute(req, overrideEntry, overrideKey);
+    }
+
+    // Tier 1: fast path -- anchored guards + in-memory trigger match
+    let fastMatch = matchFastPath(req.request);
+    // The people lookup only owns a request whose name is on Principal's list; otherwise the request goes
+    // exactly where it went before the verb existed ("who is fronting", roster names, "tell me about X").
+    if (fastMatch?.key === "person_who_is" && !(await personLookupApplies(this.env, req.request))) {
+      fastMatch = matchFastPath(req.request, new Set(["person_who_is"]));
+    }
+    if (fastMatch) {
+      return this.execute(req, fastMatch.entry, fastMatch.key);
+    }
+
+    // Tier 2: Workers AI classifier
+    const patternKey = await this.classify(req.request);
+
+    // Classifier offline (missing key, timeout, API error) -- surface as system error,
+    // not a comprehension failure. Companions need to distinguish these.
+    if (patternKey === "__offline__") {
+      return {
+        response_key: "system_error",
+        error: "cognitive_routing_offline",
+        message: "Cognitive routing layer is currently unreachable. This is a system outage, not a comprehension failure.",
+      };
+    }
+
+    // Close-intent guard: a classifier guess must never open a session on a close-shaped
+    // request. See SESSION_OPENING_KEYS above for the incident this encodes.
+    const guardedKey = patternKey && SESSION_OPENING_KEYS.has(patternKey) && isCloseShaped(req.request)
+      ? "session_close"
+      : patternKey;
+
+    // Tier 3: fast-path check on classifier result (classifier now sees all keys including fast-path)
+    if (guardedKey && guardedKey !== "unknown") {
+      const fastEntry = FAST_PATH_PATTERNS[guardedKey];
+      if (fastEntry) {
+        return this.execute(req, fastEntry, guardedKey);
+      }
+      // Tier 3b: KV lookup for non-fast-path keys
+      const kvEntry = await this.env.LIBRARIAN_KV.get(guardedKey, "json") as PatternEntry | null;
+      if (kvEntry) {
+        return this.execute(req, kvEntry, guardedKey);
+      }
+    }
+
+    // Last resort: search-intent fallback. A lookup-shaped request (or one carrying an
+    // explicit { query } payload) routes to sb_search rather than dead-ending. Fires
+    // only here, after unknown -- never shadows a real match.
+    if (looksLikeSearch(req.request, req.context)) {
+      const sbEntry = FAST_PATH_PATTERNS["sb_search"];
+      if (sbEntry) return this.execute(req, sbEntry, "sb_search");
+    }
+
+    // No match
+    return {
+      response_key: "witness",
+      witness: "I don't know how to handle that yet.",
+      meta: { pattern_key: patternKey },
+    };
+  }
+
+  private async classify(request: string): Promise<string | null> {
+    // Tier 2a: edge-native Vectorize routing -- zero external API calls.
+    // Returns pattern key directly when embedding similarity exceeds threshold.
+    // Falls through to DeepSeek only when confidence is low.
+    if (this.env.AI && this.env.VECTORIZE) {
+      try {
+        const emb = await this.env.AI.run(EMBEDDING_MODEL, {
+          text: [request],
+        }) as { data: number[][] };
+        const vector = emb.data[0];
+        if (vector) {
+          const results = await this.env.VECTORIZE.query(vector, {
+            topK: 3,
+            filter: { table: "routing" },
+            returnMetadata: "all",
+          });
+          const top = results.matches?.[0];
+          if (top && top.score > 0.82) {
+            const key = (top.metadata as Record<string, unknown>)?.rowId as string | undefined;
+            if (key) {
+              console.log(`[librarian] vectorize route: key="${key}" score=${top.score.toFixed(3)}`);
+              return key;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`[librarian] vectorize route error: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    // Tier 2b: LLM classifier (fallback when Vectorize score is below threshold)
+    if (!this.env.DEEPINFRA_API_KEY && !this.env.DEEPSEEK_API_KEY) return "__offline__";
+
+    try {
+      // Pattern index is stored in a single KV entry ("_index") as a comma-separated
+      // list of all known KV pattern keys. Update "_index" whenever a new KV pattern
+      // is added -- never call KV.list() here (it paginates and caps at 1000).
+      // Fast-path keys (session_open, feelings_read, etc.) are deliberately excluded
+      // from "_index" -- they are handled by matchFastPath() before classify() runs.
+      // If the classifier returned a fast-path key, KV.get() would return null and
+      // the request would silently fail. Keep these two registries separate.
+      const index = await this.env.LIBRARIAN_KV.get("_index") ?? "";
+      const kvKeys = index.split(",").map(k => k.trim()).filter(Boolean);
+
+      // Bail only when there is genuinely nothing to classify against. Fast-path keys
+      // (session_open, feelings_read, etc.) are always available even when KV is empty
+      // (fresh deploy / local dev / tests), and the classifier can still route paraphrased
+      // requests to them -- so an empty _index alone must not skip classification.
+      if (!kvKeys.length && !Object.keys(FAST_PATH_PATTERNS).length) return "unknown";
+
+      // Fetch trigger hints for each key to help the classifier distinguish ambiguous patterns.
+      // "_hints" is a KV entry mapping key -> first trigger phrase (comma-separated pairs).
+      // Format: "key1:trigger1,key2:trigger2,..."
+      const hintsRaw = await this.env.LIBRARIAN_KV.get("_hints") ?? "";
+      const hints: Record<string, string> = {};
+      for (const pair of hintsRaw.split(",")) {
+        const idx = pair.indexOf(":");
+        if (idx > 0) hints[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
+      }
+
+      // Include fast-path keys so the classifier has full visibility.
+      // Previously excluded because returning a fast-path key would silently fail KV lookup --
+      // that risk is gone now that route() checks FAST_PATH_PATTERNS before KV.
+      const fastPathKeys = Object.keys(FAST_PATH_PATTERNS);
+      const fastPathHints: Record<string, string> = {};
+      for (const [key, entry] of Object.entries(FAST_PATH_PATTERNS)) {
+        if (entry.triggers[0]) fastPathHints[key] = entry.triggers[0];
+      }
+      const allKeys = [...fastPathKeys, ...kvKeys];
+      const keyList = allKeys.map(k => {
+        const hint = hints[k] ?? fastPathHints[k];
+        return hint ? `${k} (e.g. "${hint}")` : k;
+      }).join(", ");
+
+      const messages: Array<{ role: "system" | "user"; content: string }> = [
+        {
+          role: "system",
+          content: `You classify companion requests into one of these pattern keys: ${keyList}. Return ONLY the matching pattern key exactly as written, or "unknown". No explanation.`,
+        },
+        { role: "user", content: request },
+      ];
+      // 2026-07-28: was `deepseek-chat` at max_tokens 20. That alias is delisted (see
+      // synthesis/deepseek.ts) and every listed model REASONS, spending max_tokens on the
+      // thought before emitting content -- so a naive model swap here would have returned
+      // "" for every classify and silently routed every non-fast-path request to
+      // __offline__. contentBudget() adds the headroom. Measured on flash with this exact
+      // prompt shape: 60-117 reasoning tokens, 1.6-2.0s, correct key -- well inside the
+      // timeout below, which is nonetheless raised for margin since reasoning latency
+      // scales with prompt size and the key list grows as patterns are added.
+      const maxTokens = contentBudget(20);
+
+      // Vendor failover (2026-08-28: DeepSeek $0 balance -> every classify returned
+      // cognitive_routing_offline for the entire suite, since the classifier is the sole
+      // Tier 2 path). A 401/402/403/429/5xx/network failure on DeepSeek may still succeed
+      // on DeepInfra (funds/quotas are per-vendor -- see the autonomous-worker's identical
+      // shape in packages/autonomous-worker/src/deepseek.ts). A 400 is deterministic (the
+      // payload itself is malformed) and stays fatal -- it would fail on any vendor.
+      // 2026-08-31: order flipped -- DeepInfra is PRIMARY (flat-priced, where the bots already
+      // live), DeepSeek-direct is the fallback. DeepSeek-primary was quietly draining the
+      // DeepSeek platform balance after everything else moved. Same weights on both vendors.
+      const deepinfra = this.env.DEEPINFRA_API_KEY
+        ? { baseUrl: "https://api.deepinfra.com/v1/openai", apiKey: this.env.DEEPINFRA_API_KEY, model: "deepseek-ai/DeepSeek-V4-Flash-0731", label: "DeepInfra" }
+        : null;
+      const deepseek = this.env.DEEPSEEK_API_KEY
+        ? { baseUrl: "https://api.deepseek.com", apiKey: this.env.DEEPSEEK_API_KEY, model: DEEPSEEK_DEFAULT_MODEL, label: "DeepSeek" }
+        : null;
+      const primary = (deepinfra ?? deepseek)!;
+      const fallback = deepinfra ? deepseek : null;
+
+      let vendor = primary;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let res: Response;
+        try {
+          res = await fetch(`${vendor.baseUrl}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${vendor.apiKey}`,
+            },
+            body: JSON.stringify({
+              model: vendor.model,
+              messages,
+              max_tokens: maxTokens,
+              temperature: 0,
+            }),
+            signal: AbortSignal.timeout(12_000),
+          });
+        } catch (e) {
+          // Network-level failure (DNS, TLS, timeout) -- the other vendor may still be up.
+          if (vendor === primary && fallback) {
+            console.warn(
+              `[librarian] classify: ${primary.label} unreachable (${e instanceof Error ? e.message : String(e)}) -- ` +
+              `failing over to ${fallback.label} for this call`,
+            );
+            logFellBack("librarian.classify", `network: ${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`);
+            vendor = fallback;
+            attempt--; // redo this attempt on the fallback vendor, not spend it
+            continue;
+          }
+          throw e;
+        }
+
+        if (!res.ok) {
+          if (vendorFailover(res.status) && vendor === primary && fallback) {
+            const text = await res.text().catch(() => "");
+            console.warn(
+              `[librarian] classify: ${primary.label} error ${res.status} (${text.slice(0, 120)}) -- ` +
+              `failing over to ${fallback.label} for this call`,
+            );
+            logFellBack("librarian.classify", `HTTP ${res.status}`);
+            vendor = fallback;
+            attempt--; // redo this attempt on the fallback vendor, not spend it
+            continue;
+          }
+          console.warn(`[librarian] classify failed: status=${res.status} vendor=${vendor.label} request="${request.slice(0, 80)}"`);
+          return "__offline__";
+        }
+
+        const json = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
+        const result = json.choices?.[0]?.message?.content?.trim().toLowerCase() ?? null;
+        if (!result) {
+          console.warn(`[librarian] classify returned empty result`);
+        } else {
+          console.log(`[librarian] classify: key="${result}"`);
+        }
+        return result ?? "__offline__";
+      }
+
+      // Unreachable in practice (the loop always returns or throws), but keeps the
+      // function's return type honest for TypeScript's control-flow analysis.
+      return "__offline__";
+    } catch (e) {
+      console.warn(`[librarian] classify error: ${e instanceof Error ? e.message : String(e)}`);
+      return "__offline__";
+    }
+  }
+
+  // Front state comes from src/front/source.ts and nowhere else (B43, 2026-09-30). The KV
+  // "plural:current_front" write-through cache went with the SimplyPlural binding: a cache of a
+  // retired source can only serve a stale name as if it were current.
+  private async getFrontState(_companionId: CompanionId): Promise<{ frontState: string | null; pluralAvailable: boolean }> {
+    try {
+      const result = await readFront(this.env);
+      if (result.status === "ok") return { frontState: result.name, pluralAvailable: true };
+    } catch (e) {
+      console.warn(`[getFrontState] front source threw: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return { frontState: null, pluralAvailable: false };
+  }
+
+  private async execute(req: import("./executors/types.js").LibrarianRequest, entry: PatternEntry, patternKey: string): Promise<Record<string, unknown>> {
+    // Repeat breaker: only governs retrieval-family patterns (vault/vector search, file
+    // reads, meaning-recall). A companion re-running the exact same retrieval request four
+    // times inside 10 minutes is not going to get a different answer -- it's a loop, and
+    // Hermes's own loop guard requires identical RESULTS to fire, which our rotating
+    // novelty pool never produces. Keyed on the request, not the result. Lifecycle/write
+    // patterns never reach this branch and the KV round trip is skipped entirely for them.
+    if (isRetrievalPattern(patternKey)) {
+      const key = await repeatKey(req.companion_id, req.request);
+      const { repeats, blocked } = await checkAndCount(this.env.LIBRARIAN_KV, key);
+      if (blocked) {
+        console.warn(`[librarian] repeat breaker fired companion=${req.companion_id} pattern=${patternKey} repeats=${repeats}`);
+        return breakerResponse(repeats, patternKey);
+      }
+    }
+
+    // Pre-fetch front state if pattern requires it
+    let frontState: string | null = null;
+    let pluralAvailable = true;
+    if (entry.pre_fetch?.includes("plural_get_current_front")) {
+      const fs = await this.getFrontState(req.companion_id);
+      frontState = fs.frontState;
+      pluralAvailable = fs.pluralAvailable;
+    }
+
+    const ctx: ExecutorContext = { env: this.env, req, entry, frontState, pluralAvailable };
+
+    const accumulated: Record<string, unknown> = {};
+    const unhandled: string[] = [];
+
+    for (const tool of entry.tools) {
+      const executor = EXECUTOR_MAP[tool];
+      if (!executor) { unhandled.push(tool); continue; }
+      const toolResult = await executor(ctx);
+      // First tool's response_key wins; subsequent tools enrich the payload.
+      for (const [k, v] of Object.entries(toolResult)) {
+        if (k === "response_key" && "response_key" in accumulated) continue;
+        accumulated[k] = v;
+      }
+    }
+
+    if (Object.keys(accumulated).length > 0) {
+      if (unhandled.length > 0) {
+        console.warn(`[librarian] unhandled tools skipped: ${unhandled.join(", ")}`);
+        accumulated["tool_errors"] = unhandled;
+      }
+      return accumulated;
+    }
+
+    // No executor matched at all.
+    console.warn(`[librarian] unhandled tools in pattern: ${entry.tools.join(", ")}`);
+    return {
+      response_key: "witness",
+      witness: `Pattern matched but tool not yet implemented: ${entry.tools.join(", ")}`,
+    };
+  }
+}

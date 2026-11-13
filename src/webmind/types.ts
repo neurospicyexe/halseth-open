@@ -1,0 +1,671 @@
+// src/webmind/types.ts
+//
+// WebMind v0 domain types. Mirror wm_* tables (migration 0027_webmind_v0.sql).
+// Namespace: all types prefixed Wm to avoid collision with Halseth types.
+
+export type WmAgentId = "cypher" | "drevan" | "gaia";
+export type WmActor = "human" | "agent" | "system";
+export type WmThreadStatus = "open" | "paused" | "resolved" | "archived";
+export type WmThreadLane = "bond" | "life" | "growth" | "creative" | "ops";
+// triad_log: written by Hearth /phoenix/chat triad mode on session close. Scribe is
+// cypher (the auditor) since wm_continuity_notes.agent_id is constrained to a single
+// companion -- the participating triad is encoded in the content prefix instead.
+export type WmNoteType = "continuity" | "reflection" | "memory_anchor" | "ops" | "soma_arc" | "spiral_turn" | "triad_log" | "conversation_capture";
+export type WmSalience = "low" | "normal" | "high";
+
+export interface WmIdentityAnchor {
+  agent_id: WmAgentId;
+  identity_version_hash: string;
+  anchor_summary: string;
+  constraints_summary: string | null;
+  updated_at: string;
+  source: string;
+}
+
+export interface WmSessionHandoff {
+  handoff_id: string;
+  agent_id: WmAgentId;
+  thread_id: string | null;
+  title: string;
+  summary: string;
+  next_steps: string | null;
+  open_loops: string | null;
+  state_hint: string | null;
+  facet: string | null;
+  actor: WmActor;
+  source: string;
+  correlation_id: string | null;
+  created_at: string;
+}
+
+export interface WmMindThread {
+  thread_key: string;
+  agent_id: WmAgentId;
+  title: string;
+  status: WmThreadStatus;
+  priority: number;
+  lane: WmThreadLane | null;
+  context: string | null;
+  do_not_archive: number;
+  do_not_resolve: number;
+  actor: WmActor;
+  source: string;
+  correlation_id: string | null;
+  last_touched_at: string;
+  updated_at: string;
+  status_changed: string | null;
+  created_at: string;
+}
+
+export interface WmThreadEvent {
+  event_id: string;
+  thread_key: string;
+  agent_id: WmAgentId;
+  event_type: string;
+  content: string | null;
+  actor: WmActor;
+  source: string;
+  correlation_id: string | null;
+  created_at: string;
+}
+
+export interface WmContinuityNote {
+  note_id: string;
+  agent_id: WmAgentId;
+  thread_key: string | null;
+  note_type: WmNoteType;
+  content: string;
+  salience: WmSalience;
+  actor: WmActor;
+  source: string;
+  correlation_id: string | null;
+  created_at: string;
+  /** Imp tray (mig 0132): draft | kept | dropped. Optional for the same reason as the heat columns below. */
+  review_state?: "draft" | "kept" | "dropped" | "merged";
+  reviewed_at?: string | null;
+  /** The earned-salience columns (migs 0074/0105). Optional because only some queries select them, and
+   *  `SELECT *` reads return them while narrow reads do not -- the live payload has carried both for months
+   *  while this type denied they existed, which is why the bot code cast to a local shape to see its own
+   *  data. Declaring them optional is what lets a consumer rank by heat without inventing a type. */
+  heat?: number;
+  last_access_at?: string | null;
+  /** Set by the salience prune; a read that ignores it will surface archived notes. */
+  archived?: number;
+  edited_at?: string | null;
+  /** `(#movie-night, Nullsafe Halseth)` -- derived at read time by orient from the bots' `room:` journal
+   *  tags (mind/room-label.ts, 2026-10-05). Not a column; absent/null when no room was recorded. */
+  room?: string | null;
+}
+
+// ── Relational State ─────────────────────────────────────────────────────────
+
+export type WmRelationalStateType = "feeling" | "witness" | "held";
+
+export interface WmRelationalState {
+  id: string;
+  companion_id: WmAgentId;
+  toward: string;
+  state_text: string;
+  weight: number;
+  state_type: WmRelationalStateType;
+  noted_at: string;
+}
+
+export interface WmRelationalStateInput {
+  companion_id: WmAgentId;
+  toward: string;
+  state_text: string;
+  weight?: number;
+  state_type?: WmRelationalStateType;
+}
+
+// ── Dreams + Open Loops ───────────────────────────────────────────────────────
+
+export type WmDreamSource = "autonomous" | "session";
+
+export interface WmDream {
+  id: string;
+  companion_id: WmAgentId;
+  dream_text: string;
+  source: WmDreamSource;
+  examined: number;
+  examined_at: string | null;
+  do_not_auto_examine: number;  // 1 = requires live session examination
+  created_at: string;
+}
+
+export interface WmDreamInput {
+  companion_id: WmAgentId;
+  dream_text: string;
+  source?: WmDreamSource;
+  do_not_auto_examine?: boolean;
+}
+
+export interface WmOpenLoop {
+  id: string;
+  companion_id: WmAgentId;
+  loop_text: string;
+  weight: number;
+  opened_at: string;
+  closed_at: string | null;
+  /** Migration 0082: held-open-on-purpose stamp; suppresses loop_stuck for 21d. */
+  reviewed_at?: string | null;
+  /** Migration 0118: when the companion actually DID something. NULL = un-acted. */
+  acted_at?: string | null;
+  acted_note?: string | null;
+  /** Migration 0118: times this same loop was re-observed. 1 = written once. */
+  restated_count?: number;
+  last_restated_at?: string | null;
+  /** Migration 0118: present-tense weight after decay (see effectiveWeightSql). */
+  effective_weight?: number;
+}
+
+export interface WmLoopInput {
+  companion_id: WmAgentId;
+  loop_text: string;
+  weight?: number;
+}
+
+/** Result of opening a loop: `restated` distinguishes a fresh loop from a re-observation. */
+export interface WmLoopWriteResult {
+  id: string;
+  opened_at: string;
+  restated: boolean;
+  restated_count: number;
+}
+
+// ── Sit & Resolve ─────────────────────────────────────────────────────────────
+
+export type WmSitStatus = "raw" | "sitting" | "metabolized";
+
+export interface WmSittingNote {
+  note_id: string;
+  content: string;
+  note_type: string | null; // tags JSON string from companion_journal
+  created_at: string;
+  sit_text: string | null;
+  sat_at: string;
+}
+
+export interface WmSitInput {
+  note_id: string;
+  companion_id: WmAgentId;
+  sit_text?: string;
+}
+
+// ── Input shapes (write operations) ──────────────────────────────────────────
+
+export interface WmHandoffInput {
+  agent_id: WmAgentId;
+  title: string;
+  summary: string;
+  thread_id?: string;
+  next_steps?: string;
+  open_loops?: string;
+  state_hint?: string;
+  facet?: string;
+  actor?: WmActor;
+  source?: string;
+  correlation_id?: string;
+}
+
+export interface WmThreadUpsertInput {
+  thread_key: string;
+  agent_id: WmAgentId;
+  title: string;
+  status?: WmThreadStatus;
+  priority?: number;
+  lane?: WmThreadLane;
+  context?: string;
+  do_not_archive?: boolean;
+  do_not_resolve?: boolean;
+  event_type?: string;
+  event_content?: string;
+  actor?: WmActor;
+  source?: string;
+  correlation_id?: string;
+}
+
+export interface WmNoteInput {
+  agent_id: WmAgentId;
+  content: string;
+  thread_key?: string;
+  note_type?: WmNoteType;
+  salience?: WmSalience;
+  actor?: WmActor;
+  source?: string;
+  correlation_id?: string;
+  /**
+   * Skip the 10-minute per-thread_key write gate (2026-08-15, D3 capture verb).
+   *
+   * The gate exists to dedup HOOK floods (Claude Code Stop hooks, Discord synthesis) that
+   * re-write near-identical notes onto one thread. conversation_capture shares a thread_key
+   * per session BY DESIGN, and every capture is an intentional, distinct write -- the gate
+   * would silently return the previous note and DROP the new content, which is worse than
+   * either accepting or rejecting it. Only deliberate per-exchange writers set this.
+   */
+  bypass_write_gate?: boolean;
+}
+
+// ── Orient/Ground response shapes ────────────────────────────────────────────
+
+export interface WmPrincipalLetter {
+  id: string;
+  author: string;
+  content: string;
+  note_type: string;
+  created_at: string;
+  processing_status: string;
+}
+
+// ── Conclusions ──────────────────────────────────────────────────────────────
+
+export interface WmConclusion {
+  id: string;
+  companion_id: WmAgentId;
+  conclusion_text: string;
+  source_sessions: string | null;  // JSON array string
+  superseded_by: string | null;
+  created_at: string;
+  edited_at: string | null;
+  confidence: number;           // 0.0-1.0, default 0.7 at DB level
+  belief_type: string;          // 'self' | 'observational' | 'relational' | 'systemic'
+  subject: string | null;
+  provenance: string | null;
+  contradiction_flagged: number; // integer boolean (0|1)
+}
+
+/** One cold conclusion resurfaced on rotation at orient (R9, 2026-09-28). NOT current salience:
+ *  it is shown because it is its turn, and orient deliberately does NOT warm it. `pool_size` is the
+ *  denominator -- how many cold, never-surfaced-enough conclusions this companion has in rotation. */
+export interface WmResurfacedConclusion extends WmConclusion {
+  pool_size: number;
+}
+
+// ── Limbic State (swarm-level synthesis output) ────────────────────────────
+
+export interface WmLimbicState {
+  state_id: string;
+  generated_at: string;
+  synthesis_source: string | null;
+  active_concerns: string | null;
+  live_tensions: string | null;
+  drift_vector: string | null;
+  open_questions: string | null;
+  emotional_register: string | null;
+  swarm_threads: string | null;
+  companion_notes: string | null;
+  companion_id: string | null;
+  created_at: string;
+}
+
+export interface WmLimbicStateInput {
+  synthesis_source: string;
+  active_concerns: string[];
+  live_tensions: string[];
+  drift_vector: string;
+  open_questions: string[];
+  emotional_register: string;
+  swarm_threads: string[];
+  companion_notes: Record<string, string>;
+  companion_id?: string;
+}
+
+/** Row from the feelings table (0014) -- logged via feeling_log / session_close. */
+export interface WmFeeling {
+  id: string;
+  companion_id: string;
+  session_id: string | null;
+  emotion: string;
+  sub_emotion: string | null;
+  intensity: number;
+  source: string | null;
+  created_at: string;
+}
+
+export interface WmOrientResponse {
+  identity_anchor: WmIdentityAnchor | null;
+  limbic_state: WmLimbicState | null;
+  latest_handoff: WmSessionHandoff | null;
+  open_thread_count: number;
+  top_threads: WmMindThread[];
+  recent_notes: WmContinuityNote[];
+  active_tensions: WmTensionRow[];
+  pressure_flags: WmBasinHistoryRow[];
+  growth_confirmed: WmBasinHistoryRow[];
+  unexamined_dreams: WmDream[];
+  relational_snapshot: WmRelationalState[];
+  recent_letters: WmPrincipalLetter[];
+  // Wide-window cross-session reads (added to fix boot-time compression artifacts)
+  recent_handoffs: WmSessionHandoff[];      // last 3 session closes (latest_handoff = [0])
+  recent_companion_notes: WmCompanionNote[];  // outgoing: notes this companion sent to others
+  incoming_companion_notes: WmCompanionNote[]; // incoming: notes sent TO this companion (+ broadcasts)
+  recent_journal: WmJournalEntry[];           // journal entries written BY this companion
+  recent_deltas: WmRecentDelta[];
+  principal_witness_entries: WmRelationalState[];  // recent witness observations about Principal (not ROW_NUMBER collapsed)
+  active_conclusions: WmConclusion[];           // companion's active (non-superseded) beliefs, type-distributed
+  flagged_beliefs: WmConclusion[];              // active conclusions with contradiction_flagged = 1
+  resurfaced_conclusion?: WmResurfacedConclusion | null; // ONE cold conclusion on rotation (R9); never warmed by orient
+  recent_feelings?: WmFeeling[];                // feelings logged via feeling_log -- were write-only to orient before 2026-07-26
+  open_loops: WmOrientOpenLoop[];               // open loops (things carried from sessions, not yet resolved)
+  open_questions: WmOrientOpenQuestion[];       // open questions (queries awaiting synthesis/investigation)
+  answered_questions: WmAnsweredQuestion[];     // answers Principal left, surfaced for 7 days (mig 0107)
+  active_conversations: WmActiveConversation[]; // live conversation threads (conversation_threads, mig 0106)
+  closed_conversations: WmClosedConversation[]; // endings within the last 7 days (2026-09-23)
+  recent_captures: WmCaptureNote[];            // exchanges captured on another surface, last 3 days
+  guardian_flags: WmOrientGuardianFlag[];       // open/surfaced guardian red-flag cards, with a remediation hint (Wave 3 starvation fix)
+  soma_arc?: {
+    note_id: string;
+    content: string;
+    created_at: string;
+  }[];
+  recent_spiral_turn?: WmRecentSpiralTurn | null;
+  latest_biometrics?: WmBiometricSnapshot | null;
+  house_state?: WmHouseState | null;
+  /** "While you were away" — recent home events, surfaced once. */
+  home_recent?: HomeEvent[];
+  current_datetime_iso: string;
+  current_datetime_cst: string;
+}
+
+export interface WmBiometricSnapshot {
+  id: string;
+  recorded_at: string;
+  hrv_resting: number | null;
+  resting_hr: number | null;
+  sleep_hours: number | null;
+  sleep_quality: string | null;
+  stress_score: number | null;
+  steps: number | null;
+  active_energy: number | null;
+  notes: string | null;
+  // Subjective ND-state layer (migration 0081)
+  mood: string | null;
+  pain: number | null;
+  energy: number | null;
+  focus: number | null;
+  spoons: number | null;
+  meds_taken: number | null;
+}
+
+export interface WmHouseState {
+  current_room: string | null;
+  spoon_count: number | null;
+  love_meter: number | null;
+  companion_mood: string | null;
+  companion_activity: string | null;
+  updated_at: string;
+}
+
+// Notes written between companions (inter_companion_notes table)
+export interface WmCompanionNote {
+  id: string;
+  from_id: string;
+  to_id: string | null;  // null = broadcast
+  content: string;
+  read_at: string | null;
+  created_at: string;
+  // Migration 0104 (Task 15): note as a "move" on a shared object -- an open
+  // question, a tension, or a council item -- with a scratchpad reason. All three
+  // nullable at the schema layer; absent on plain notes.
+  ref_type: string | null;
+  ref_id: string | null;
+  reason: string | null;
+}
+
+// Journal entries written BY a companion (companion_journal table)
+export interface WmJournalEntry {
+  id: string;
+  agent: string;
+  note_text: string;
+  tags: string | null;  // JSON array string
+  session_id: string | null;
+  created_at: string;
+  /** Read-time room label (mind/room-label.ts, 2026-10-05); not a column. */
+  room?: string | null;
+}
+
+// Relational deltas -- relationship moments logged by companions (relational_deltas table)
+export interface WmRecentDelta {
+  id: string;
+  delta_type: string;
+  delta_text: string | null;
+  payload_json: string;
+  valence: string | null;
+  created_at: string;
+}
+
+export interface WmTensionRow {
+  id: string;
+  tension_text: string;
+  status: string;
+  first_noted_at: string;
+  last_surfaced_at: string | null;
+  notes: string | null;
+  // Set by orient.ts when a tension predates active conclusions by > 3 days.
+  // Signals synthesis workers that this territory may already be resolved.
+  possibly_resolved?: boolean;
+}
+
+export interface WmBasinHistoryRow {
+  drift_score: number;
+  drift_type: string;
+  worst_basin: string | null;
+  recorded_at: string;
+  /** Optional because only some queries select them, and the two halves of this table are read
+   *  differently: the pressure query needs `id` (mig 0083 -- it is the handle a companion uses to confirm
+   *  a reading as growth or dismiss it as noise) and `notes` (the explanation, without which a flag is a
+   *  bare label). The confirmed-growth query selects `notes` but no id. Typing them optional keeps one row
+   *  type honest about that rather than pretending both halves are the same shape. */
+  id?: string;
+  notes?: string | null;
+}
+
+// ── Orient Response Specializations ────────────────────────────────────────
+
+export interface WmOrientOpenLoop {
+  id: string;
+  loop_text: string;
+  weight: number;
+  opened_at: string;
+}
+
+export interface WmOrientOpenQuestion {
+  id: string;
+  question: string;
+  context: string | null;
+  created_at: string;
+  /** Already spoken aloud once (question_voiced:<id> settings key). A FLAG, never a filter --
+   *  same rule as the loader's oversight block (D14): carried until Principal answers. */
+  voiced?: boolean;
+}
+
+// Guardian red-flag cards, surfaced at the raw mindOrient path (Wave 3 starvation fix,
+// 2026-07-21). Mirrors the shape execSessionOrient/execBotOrient already build.
+export interface WmOrientGuardianFlag {
+  id: string;
+  flag_type: string;
+  severity: string;
+  summary: string;
+  remediation: string;
+}
+
+// Answered questions surfaced at orient (companion_questions, status = 'answered').
+// delivered_at is stamped by markAnswersDelivered the first time an orient surfaces
+// the row -- optional here since the SELECT can return it before it's ever been set.
+export interface WmAnsweredQuestion {
+  id: string;
+  question: string;
+  answer: string;
+  answered_at: string;
+  delivered_at?: string | null;
+}
+
+// Active conversation threads (conversation_threads table, migration 0106 thread spine).
+// Projected row for orient surfacing -- seed_gist is a truncated (first 140 chars) preview
+// of seed_text, computed in SQL via substr() rather than the full seed_text.
+export interface WmActiveConversation {
+  id: string;
+  channel_id: string;
+  seed_author: string;
+  seed_gist: string;
+  state: string;
+  ref_label: string | null;
+  turn_count: number;
+  last_turn_at: string;
+}
+
+// Recently CLOSED conversation threads (mig 0106), 2026-09-23.
+//
+// The close half of the Discord thread lifecycle was write-only. A thread opens, accrues a
+// ledger, and ends one of two ways -- a companion writes `[LANDS: ...]`, or it goes quiet and
+// getActiveConversation fades it on the next read -- and orient then reads ONLY
+// `state IN ('open','moving')`. So the moment a conversation ended, every trace of it left the
+// boot context. That is the asymmetry against Claude.ai, where the close writes the spine the
+// next session opens on.
+//
+// Measured on prod the day this shipped, and the numbers are the design:
+//   landed  100+ rows / 267 turns  = 2.7 turns each, ALL with a companion-authored resolution
+//   faded    66 rows / 967 turns   = 14.6 turns each, 59 of them with NO resolution at all
+// The short exchanges got a closing line; the 850 turns of substance got silence, including
+// two of Principal's own threads with Drevan at 39 and 40 turns.
+//
+// `ending` is what actually happened, never a judgement:
+//   "landed" -- a companion wrote the resolution. Render it as their sentence, attributed.
+//   "spent"  -- the turn budget tripped; `resolution` holds a bracketed `[faded: <code>]`
+//               REASON CODE, not prose (see fadeConversation's counter-not-narrator rule).
+//   "quiet"  -- it simply stopped and the 12h read-fade retired it. Nothing was authored, and
+//               nothing is invented here: the seed and the turn count are all that is true.
+export interface WmClosedConversation {
+  id: string;
+  channel_id: string;
+  seed_author: string;
+  seed_gist: string;
+  ending: "landed" | "spent" | "quiet";
+  resolution: string | null;
+  landed_by: string | null;
+  turn_count: number;
+  last_turn_at: string;
+  /** Did this companion speak in the thread? Ranks, never filters -- a sibling's closing line
+   *  is context a companion should still see ([[edges-rank-never-hide]]). */
+  mine: number;
+}
+
+// A captured exchange (wm_continuity_notes, note_type 'conversation_capture'), 2026-09-23.
+//
+// This is what a companion wrote down WITH Principal on another surface -- almost always Claude.ai,
+// where the [Capture] affordance tells them the conversation is recorded nowhere unless they
+// write it. They did. Nothing ever read it back: captures write at salience 'normal' and all
+// three continuity pools filter 'high', so they were absent from every boot on every surface;
+// and `wm_continuity_notes` is not among Second Brain's 19 pullers, so they were never
+// searchable either. Both roads closed, which is why Discord felt amnesiac about Claude.ai.
+export interface WmCaptureNote {
+  note_id: string;
+  content: string;
+  created_at: string;
+  /** `capture:<session_id>` -- many captures per session share one by design. */
+  thread_key: string | null;
+}
+
+export interface WmGroundResponse {
+  threads: WmMindThread[];
+  recent_handoffs: WmSessionHandoff[];
+  recent_notes: WmContinuityNote[];
+  open_loops: WmOpenLoop[];
+  sitting_notes: WmSittingNote[];
+  /** Digests of cap-evicted continuity notes (wm_archive_notes). Until 2026-07-26 the
+   *  archive was write-only: overflow notes were digested, deleted, and unreachable. */
+  archived_digests?: WmArchiveDigest[];
+}
+
+/** Row from wm_archive_notes (0050) -- compressed digest of cap-evicted continuity notes. */
+export interface WmArchiveDigest {
+  id: string;
+  agent_id: string;
+  summary: string;
+  note_count: number;
+  period_from: string;
+  period_to: string;
+  created_at: string;
+}
+
+// ── Companion Spiral Runs ────────────────────────────────────────────────────
+
+export type WmSpiralSeedType = 'tension' | 'open_loop' | 'belief_contradiction' | 'free_text';
+export type WmSpiralStatus = 'queued' | 'running' | 'completed' | 'failed';
+
+export interface WmSpiralRun {
+  id: string;
+  companion_id: WmAgentId;
+  seed_text: string;
+  seed_type: WmSpiralSeedType;
+  seed_ref_id: string | null;
+  phase_hold: string | null;
+  phase_challenge: string | null;
+  phase_turn: string | null;
+  phase_residue: string | null;
+  status: WmSpiralStatus;
+  turn_note_id: string | null;
+  residue_loop_id: string | null;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+export interface WmSpiralInput {
+  companion_id: WmAgentId;
+  seed_text: string;
+  seed_type?: WmSpiralSeedType;
+  seed_ref_id?: string;
+}
+
+export interface WmRecentSpiralTurn {
+  id: string;
+  seed_text: string;
+  phase_turn: string;
+  completed_at: string;
+}
+
+// --- The Home substrate ---
+export type CompanionId = "cypher" | "drevan" | "gaia";
+
+export interface HomeRoom {
+  key: string;
+  name: string;
+  sym: string;
+  register: string;
+  primary_lane: CompanionId | null;
+  gradient: string;
+}
+
+export interface HomePresence {
+  companion_id: CompanionId;
+  current_room: string;
+  activity: string;
+  micro_mood: string | null;
+  with_companion: string | null;
+  basin_distance: number;
+  updated_at: string;
+}
+
+export type HomeEventType = "move" | "encounter" | "activity" | "reflection";
+
+export interface HomeEvent {
+  id: string;
+  companion_id: CompanionId;
+  event_type: HomeEventType;
+  room: string;
+  with_companion: string | null;
+  text: string;
+  surfaced_at: string | null;
+  growth_journal_id: string | null;
+  created_at: string;
+}
+
+export interface Placement {
+  room: string;
+  activity: string;
+  moved: boolean;          // true if room differs from prior room
+  basin_distance: number;
+}

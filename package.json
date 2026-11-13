@@ -1,0 +1,27 @@
+{
+  "name": "halseth",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev --config wrangler.prod.toml",
+    "deploy": "wrangler deploy --config wrangler.prod.toml",
+    "migrate:local": "wrangler d1 migrations apply halseth --local --config wrangler.prod.toml",
+    "migrate:remote": "wrangler d1 migrations apply halseth --remote --config wrangler.prod.toml",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "pack:skills": "node scripts/pack-skills.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261110.1",
+    "@types/node": "^26.1.0",
+    "typescript": "5.9.3",
+    "vitest": "^4.1.12",
+    "wrangler": "^4.160.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "fetch-to-node": "2.1.0",
+    "zod": "^4.6.7"
+  }
+}

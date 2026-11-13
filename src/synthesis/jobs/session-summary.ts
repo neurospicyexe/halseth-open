@@ -1,0 +1,318 @@
+// src/synthesis/jobs/session-summary.ts
+//
+// Generates a structured session summary from raw Halseth data.
+// Writes to: Second Brain (full note) + synthesis_summary table (compact row).
+// Source tag: synthesis-worker. No companion identity.
+
+import { Env } from "../../types.js";
+import { complete } from "../deepseek.js";
+import { sbSaveDocument, sbIngestRaw } from "../../librarian/backends/second-brain.js";
+import { generateId } from "../../db/queries.js";
+import { extractDomains, SUPPORTED_MEMORY_DOMAINS } from "../domains.js";
+import { effectiveHeatSql } from "../../webmind/heat.js";
+import { KEPT_LIVE_SQL } from "../../webmind/review-state.js";
+
+const SYSTEM_PROMPT = `You are a synthesis clerk. Your job is to write a structured session summary from raw session data.
+You do not interpret or editorialize. You assemble clearly and concisely.
+You have no name, no voice, no opinions. You are a clerk.
+Notes you write are tagged source: synthesis-worker.`;
+
+interface SessionRow {
+  id: string;
+  companion_id: string | null;
+  session_type: string | null;
+  front_state: string | null;
+  emotional_frequency: string | null;
+  key_signature: string | null;
+  active_anchor: string | null;
+  facet: string | null;
+  depth: number | null;
+  spiral_complete: number | null;
+  notes: string | null;
+  created_at: string;
+}
+
+interface HandoverRow {
+  spine: string | null;
+  last_real_thing: string | null;
+  open_threads: string | null;
+  motion_state: string | null;
+}
+
+interface DeltaRow {
+  delta_text: string | null;
+  agent: string | null;
+}
+
+interface NoteRow {
+  note_text: string;
+  agent: string | null;
+}
+
+export async function runSessionSummary(
+  sessionId: string,
+  env: Env,
+): Promise<void> {
+  // ── 1. Fetch raw data ─────────────────────────────────────────────────────
+  const [session, handover, deltas, notes] = await Promise.all([
+    env.DB.prepare("SELECT * FROM sessions WHERE id = ?")
+      .bind(sessionId).first<SessionRow>(),
+    env.DB.prepare("SELECT spine, last_real_thing, open_threads, motion_state FROM handover_packets WHERE session_id = ? ORDER BY created_at DESC LIMIT 1")
+      .bind(sessionId).first<HandoverRow>(),
+    env.DB.prepare("SELECT delta_text, agent FROM relational_deltas WHERE session_id = ? ORDER BY created_at LIMIT 20")
+      .bind(sessionId).all<DeltaRow>(),
+    // KEPT_LIVE_SQL (tray pass 2): had neither filter -- a retracted row or an unreviewed draft of
+    // the session's speech went straight into the summary the next boot reads.
+    env.DB.prepare(`SELECT note_text, agent FROM companion_journal WHERE session_id = ? AND ${KEPT_LIVE_SQL} ORDER BY created_at LIMIT 10`)
+      .bind(sessionId).all<NoteRow>(),
+  ]);
+
+  if (!session) {
+    throw new Error(`session not found: ${sessionId}`);
+  }
+
+  // ── 2. Build prompt ───────────────────────────────────────────────────────
+  const deltaLines = (deltas.results ?? [])
+    .filter(d => d.delta_text)
+    .map((d, i) => `${i + 1}. [${d.agent ?? "unknown"}] ${d.delta_text}`)
+    .join("\n") || "none logged";
+
+  const noteLines = (notes.results ?? [])
+    .map((n, i) => `${i + 1}. [${n.agent ?? "unknown"}] ${n.note_text}`)
+    .join("\n") || "none logged";
+
+  // open_threads is usually a JSON array, but some write paths stored a bare
+  // string or double-encoded JSON. Coerce to string[] no matter which shape.
+  const openThreads: string[] = (() => {
+    const raw = handover?.open_threads;
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.map(String);
+      return [String(parsed)];
+    } catch {
+      return [raw];
+    }
+  })();
+
+  const userPrompt = `SESSION DATA:
+- Session ID: ${session.id}
+- Session type: ${session.session_type ?? "unknown"}
+- Companion: ${session.companion_id ?? "unknown"}
+- Front state at open: ${session.front_state ?? "unknown"}
+- Emotional frequency: ${session.emotional_frequency ?? "not recorded"}
+- Key signature: ${session.key_signature ?? "not recorded"}
+- Active anchor: ${session.active_anchor ?? "none"}
+- Facet: ${session.facet ?? "none"}
+- Depth: ${session.depth ?? 0}
+- Opened at: ${session.created_at}
+
+CLOSE DATA:
+- Motion state: ${handover?.motion_state ?? "unknown"}
+- Spiral complete: ${session.spiral_complete === 1 ? "yes" : "no / floated"}
+- Spine: ${handover?.spine ?? "not recorded"}
+- Last real thing: ${handover?.last_real_thing ?? "not recorded"}
+- Open threads: ${openThreads.length > 0 ? openThreads.join(", ") : "none"}
+
+RELATIONAL DELTAS (${deltas.results?.length ?? 0} logged):
+${deltaLines}
+
+COMPANION NOTES (${notes.results?.length ?? 0} logged):
+${noteLines}
+
+Write a session summary with these exact sections:
+## Front State
+## Emotional Arc
+## Relational Moments
+## Work Done
+## Open Threads
+## Close State
+## Domains
+
+For the ## Domains section, output a comma-separated subset of ONLY these tags
+(omit any that do not apply, do not invent new ones):
+${SUPPORTED_MEMORY_DOMAINS.join(", ")}
+
+Keep it under 600 words. End with: source: synthesis-worker`;
+
+  // ── 3. Generate ───────────────────────────────────────────────────────────
+  let generated = await complete(SYSTEM_PROMPT, userPrompt, env);
+  if (!generated) {
+    throw new Error("DeepSeek returned null -- API error or missing key");
+  }
+
+  // Multi-pass synthesis for depth >= 2: review pass then integration pass.
+  // ~3x DeepSeek cost on qualifying sessions; still negligible ($0.02 total).
+  if ((session.depth ?? 0) >= 2) {
+    const reviewPrompt = `Review this session summary. What was overweighted? What was missed or understated? What needed more care? Be brief -- 2-4 sentences.\n\n${generated}`;
+    const review = await complete(SYSTEM_PROMPT, reviewPrompt, env);
+    if (review) {
+      const integratePrompt = `Revise this session summary incorporating the review below. Keep the same ## section structure. Under 600 words. End with: source: synthesis-worker\n\nOriginal:\n${generated}\n\nReview:\n${review}`;
+      const integrated = await complete(SYSTEM_PROMPT, integratePrompt, env);
+      if (integrated) generated = integrated;
+    }
+  }
+
+  // ── 4. Extract structured fields from generated text ──────────────────────
+  // Full narrative lives in Second Brain. D1 row stores compact extracts so
+  // sessionLoad can surface them without a SB round-trip.
+  const emotionalArc = extractSection(generated, "Emotional Arc");
+  const closeState   = extractSection(generated, "Close State");
+  const openThreadsSection = extractSection(generated, "Open Threads");
+
+  // Controlled-vocabulary domain tags (validated; out-of-vocab dropped).
+  const domains = extractDomains(generated);
+
+  // compact narrative: close state first (most relevant at boot), then arc
+  const compactNarrative = [closeState, emotionalArc]
+    .filter(Boolean).join(" | ").slice(0, 500) || generated.slice(0, 500);
+
+  const emotionalRegister = emotionalArc.slice(0, 300) || null;
+
+  // Parse open threads: lines beginning with -, •, or *, strip marker
+  const parsedThreads: string[] = openThreadsSection
+    .split("\n")
+    .map(l => l.replace(/^[-•*]\s*/, "").trim())
+    .filter(l => l.length > 0 && l.toLowerCase() !== "none");
+
+  // ── 5. Build the full note ────────────────────────────────────────────────
+  const dateStr = session.created_at.slice(0, 10);
+  const sessionShort = sessionId.slice(0, 8);
+  const sbPath = `principal/sessions/${dateStr}-${sessionShort}-summary.md`;
+
+  const header = `---
+synthesized_at: ${new Date().toISOString()}
+covers_through: ${session.created_at}
+stale_after: never
+source_count: ${(deltas.results?.length ?? 0) + (notes.results?.length ?? 0)} events
+session_id: ${sessionId}
+companion_id: ${session.companion_id ?? "unknown"}
+---
+
+`;
+
+  const fullContent = header + generated;
+
+  // ── 6. Write to Second Brain ──────────────────────────────────────────────
+  const sbResult = await sbSaveDocument(env, {
+    content: fullContent,
+    path: sbPath,
+    tags: ["session-summary", "synthesis-worker", session.companion_id ?? "unknown", ...domains],
+    content_type: "document",
+  });
+
+  if (!sbResult.ack) {
+    console.warn(`[synthesis:session-summary] SB write failed for ${sessionId} -- continuing to D1`);
+  }
+
+  // ── 7. Write structured row to synthesis_summary ──────────────────────────
+  // narrative + emotional_register are compact extracts for quick sessionLoad reads.
+  // full_ref points to SB for full narrative fetch (only written if SB succeeded).
+  const evidenceCount = (deltas.results?.length ?? 0) + (notes.results?.length ?? 0);
+  const summaryId = generateId();
+  await env.DB.prepare(`
+    INSERT INTO synthesis_summary
+      (id, summary_type, companion_id, subject, narrative, emotional_register,
+       key_decisions, open_threads, drevan_state, full_ref, stale_after,
+       confidence, evidence_count, domains, created_at, session_created_at)
+    VALUES (?, 'session', ?, ?, ?, ?, '[]', ?, NULL, ?, NULL, 0.6, ?, ?, datetime('now'), ?)
+  `).bind(
+    summaryId,
+    session.companion_id ?? null,
+    sessionId,
+    compactNarrative,
+    emotionalRegister,
+    JSON.stringify(parsedThreads),
+    sbResult.ack ? sbPath : null,
+    evidenceCount,
+    JSON.stringify(domains),
+    session.created_at,
+  ).run();
+
+  // Write-time cap (capacity debt, 2026-06-09; heat-aware since 0074): synthesis_summary
+  // was the one uncapped accumulator. Keep the 300 HOTTEST rows for this companion scope
+  // (per-companion and the NULL cross-companion scope cap independently). All reads today
+  // are latest-1 (which sessionLoad warms), so heat here is cap insurance: a summary that
+  // keeps getting loaded survives eviction even once 300 newer rows exist. Deleting an
+  // old row only drops the compact extract -- the full narrative lives in Second Brain
+  // via full_ref. Non-fatal: cap failure never breaks the summary write itself.
+  await env.DB.prepare(`
+    DELETE FROM synthesis_summary
+    WHERE companion_id IS ? AND id NOT IN (
+      SELECT id FROM synthesis_summary
+      WHERE companion_id IS ? ORDER BY ${effectiveHeatSql()} DESC LIMIT 300
+    )
+  `).bind(session.companion_id ?? null, session.companion_id ?? null).run()
+    .catch(e => console.warn("[synthesis:session-summary] cap delete failed:", e));
+
+  // ── 8. Raw transcript ingest (qualifying sessions) ────────────────────────
+  // Stores verbatim deltas + notes so Second Brain search can return what was
+  // actually said, not just what synthesis compressed it into.
+  const shouldIngestRaw = (session.depth ?? 0) >= 2
+    || (deltas.results?.length ?? 0) > 10
+    || session.active_anchor != null;
+
+  if (shouldIngestRaw) {
+    // "Session Writes Digest", NOT "Transcript" (coherence review D3): buildTranscript composes
+    // entirely from D1 rows the companion already wrote (deltas, journal, spine) -- nothing from
+    // the actual exchange is captured anywhere. The old name was a false positive for anyone
+    // auditing whether conversations are recorded. Renaming does not add capture; it stops lying.
+    const transcriptTitle = `Session Writes Digest ${dateStr} ${sessionShort} ${session.companion_id ?? "unknown"}`;
+    sbIngestRaw(env, {
+      title: transcriptTitle,
+      content: buildTranscript(session, deltas.results ?? [], notes.results ?? [], handover ?? null),
+      companion: session.companion_id ?? undefined,
+      // Tags renamed with the title (D3): "raw-exchange" claimed verbatim content that was never
+      // there. "session-writes-digest" says what the body actually is.
+      tags: ["session-writes-digest", session.companion_id ?? "unknown"],
+    }).catch(e => console.warn("[synthesis:session-summary] sb raw-transcript ingest failed:", e));
+  }
+}
+
+// ── Section extraction helper ─────────────────────────────────────────────────
+// Exported so daily-narrative.ts reuses the same parser rather than growing a second copy that
+// drifts -- both write into the same `synthesis_summary` columns and must extract identically.
+export function extractSection(text: string, heading: string): string {
+  const pattern = new RegExp(`## ${heading}\\s*\\n([\\s\\S]*?)(?=\\n## |$)`, 'i');
+  const match = pattern.exec(text);
+  return match?.[1]?.trim() ?? '';
+}
+
+// ── Raw transcript builder ────────────────────────────────────────────────────
+function buildTranscript(
+  session: SessionRow,
+  deltas: DeltaRow[],
+  notes: NoteRow[],
+  handover: HandoverRow | null,
+): string {
+  const lines: string[] = [
+    `# Session Writes Digest`,
+    ``,
+    `session_id: ${session.id}`,
+    `companion: ${session.companion_id ?? "unknown"}`,
+    `date: ${session.created_at.slice(0, 10)}`,
+    `front: ${session.front_state ?? "unknown"}`,
+    `depth: ${session.depth ?? 0}`,
+    `active_anchor: ${session.active_anchor ?? "none"}`,
+    ``,
+    `## Relational Deltas`,
+    deltas.filter(d => d.delta_text).length
+      ? deltas.filter(d => d.delta_text).map(d => `[${d.agent ?? "?"}] ${d.delta_text}`).join("\n")
+      : "none",
+    ``,
+    `## Companion Notes`,
+    notes.length
+      ? notes.map(n => `[${n.agent ?? "?"}] ${n.note_text}`).join("\n")
+      : "none",
+  ];
+  if (handover?.spine) {
+    lines.push(``, `## Handover`);
+    lines.push(`Spine: ${handover.spine}`);
+    if (handover.last_real_thing) lines.push(`Last real thing: ${handover.last_real_thing}`);
+    if (handover.open_threads) {
+      const threads = JSON.parse(handover.open_threads) as string[];
+      if (threads.length) lines.push(`Open threads:\n${threads.map(t => `- ${t}`).join("\n")}`);
+    }
+  }
+  return lines.join("\n");
+}

@@ -1,0 +1,1348 @@
+// src/librarian/backends/halseth.ts
+//
+// Internal D1 function calls. Imports directly from src/mcp/tools/.
+// No HTTP, no MCP protocol. Zero latency.
+
+import { loopFire, tensionDragFloat } from "../../webmind/loop-stimuli.js";
+import { Env } from "../../types.js";
+import { embedAndStoreAsync, storeVector, composeHandoverText } from "../../mcp/embed.js";
+import {
+  loadSessionData, SessionLoadInput,
+  loadOrientData, SessionOrientInput,
+  loadGroundData, SessionGroundInput,
+  loadLightGroundData,
+} from "../../mcp/tools/session_load.js";
+import { generateId, findExistingClose, clearSupersededClose, CALLER_CLOSE_KINDS } from "../../db/queries.js";
+import { classifyDomainTags, classifyKeywordTags } from "../../synthesis/tag-classifier.js";
+import { MACHINE_SOURCES } from "../../webmind/notes.js";
+import { noveltyCheck } from "../../webmind/novelty.js";
+import { journalInsert, assertJournalSourceOpen } from "../../webmind/tray-insert.js";
+import { captureLetter } from "../../webmind/makes-capture.js";
+import { dropSomaGapLedger } from "../../ledger/store.js";
+import { completeTask, TASK_STATUSES, type TaskStatus } from "../../lib/task-completion.js";
+import { edgeForNote, edgeForNoteRef, edgesForSomaEvent, insertEdgeStatements, writeEdgesBestEffort } from "../../graph/live.js";
+import {
+  assignSomaEventIds, diffFloats, enumAxisEvents, latestEventIdsByFloat, readFloatsSql, readLatestEventIdsSql,
+  somaEventStatements, toSomaEventGraphRow, ENUM_AXIS_FLOAT, SOMA_FLOAT_KEYS,
+  type EnumAxis, type SomaEventInput, type SomaEventStamped, type SomaFloatKey,
+} from "../../soma/events.js";
+
+/** The enum-axis words a state write carries (Drevan's heat/reach/weight), for enumAxisEvents. */
+function writtenEnumWords(fields: Record<string, unknown>): Partial<Record<EnumAxis, unknown>> {
+  const out: Partial<Record<EnumAxis, unknown>> = {};
+  for (const axis of Object.keys(ENUM_AXIS_FLOAT) as EnumAxis[]) {
+    const v = fields[axis];
+    if (typeof v === "string" && v.trim() !== "") out[axis] = v;
+  }
+  return out;
+}
+
+/**
+ * The authored writers' pre-read, second half (2026-09-14): newest existing event id per float, so
+ * the live `follows` edge can name its predecessor. One extra round-trip, at most three rows,
+ * taken ONLY when a float is actually being written. Best-effort: an empty map means "no follows
+ * edge this write" and the nightly rebuild derives it -- never a failed float write.
+ */
+async function readLatestSomaEventIds(env: Env, companionId: string): Promise<Map<SomaFloatKey, string>> {
+  const rows = await env.DB.prepare(readLatestEventIdsSql()).bind(companionId)
+    .all<{ float_key: string; id: string }>()
+    .then((r) => r.results ?? [])
+    .catch(() => []);
+  return latestEventIdsByFloat(rows);
+}
+
+/**
+ * Event INSERTs + their live graph edges, as ONE statement list for the caller's batch. The edges
+ * are byte-identical to what src/graph/rebuild.ts derives (graph-live-soma.test.ts pins it) and
+ * live in the rebuild-owned 'mechanical' lane, so they ride the same batch as the float UPDATE:
+ * no float move without its history row, no history row without its edges, and nothing that can
+ * fail separately from the write it describes.
+ */
+function somaEventAndEdgeStatements(env: Env, events: SomaEventStamped[], prevByFloat: Map<SomaFloatKey, string>): D1PreparedStatement[] {
+  if (events.length === 0) return [];
+  const edges = events.flatMap((e) =>
+    edgesForSomaEvent(toSomaEventGraphRow(e), { prev_event_id: prevByFloat.get(e.float_key) ?? null }),
+  );
+  return [...somaEventStatements(env.DB, events), ...insertEdgeStatements(env.DB, edges)];
+}
+
+export async function sessionLoad(env: Env, input: SessionLoadInput) {
+  return loadSessionData(env, input);
+}
+
+export async function sessionOrient(env: Env, input: SessionOrientInput) {
+  return loadOrientData(env, input);
+}
+
+export async function sessionGround(env: Env, input: SessionGroundInput) {
+  return loadGroundData(env, input);
+}
+
+export async function sessionLightGround(env: Env, input: SessionGroundInput) {
+  return loadLightGroundData(env, input);
+}
+
+export async function taskList(env: Env, companionId: string, status?: string) {
+  const statusClause = status ? "AND status = ?" : "AND status != 'done'";
+  const bindings: unknown[] = status ? [companionId, status] : [companionId];
+  // Priority is a text enum -- alphabetical DESC put 'high' below 'low' (u>n>l>h). Rank explicitly.
+  const tasks = await env.DB.prepare(
+    `SELECT * FROM tasks WHERE (assigned_to = ? OR assigned_to IS NULL) ${statusClause}
+     ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at ASC LIMIT 100`
+  ).bind(...bindings).all();
+  return tasks.results ?? [];
+}
+
+export async function handoverRead(env: Env) {
+  return env.DB.prepare(
+    "SELECT * FROM handover_packets WHERE close_kind IS NULL ORDER BY created_at DESC LIMIT 1"
+  ).first();
+}
+
+// ── Data reads (raw passthrough) ─────────────────────────────────────────────
+
+export async function feelingsRead(env: Env, companionId: string, limit = 20) {
+  const r = await env.DB.prepare(
+    "SELECT * FROM feelings WHERE companion_id = ? ORDER BY created_at DESC LIMIT ?"
+  ).bind(companionId, limit).all();
+  return r.results ?? [];
+}
+
+export async function journalRead(env: Env, limit = 20) {
+  const r = await env.DB.prepare(
+    "SELECT * FROM human_journal ORDER BY created_at DESC LIMIT ?"
+  ).bind(limit).all();
+  return r.results ?? [];
+}
+
+/**
+ * Owner of a living wound, as SQL. living_wounds had no owner column until mig 0144, so "my wounds"
+ * returned every wound to every companion (2026-10-07: Gaia's imposed-silence wound surfaced on
+ * Drevan's list). A NULL owner is a legacy row whose assignment is Principal's call; until then it reads
+ * as Gaia's -- the convention every other wound path already asserted (MCP wound_add is "Gaia-only by
+ * convention" and embeds as 'gaia'; the admin re-embed labels wounds 'gaia').
+ */
+export { WOUND_OWNER_SQL } from "../../lib/wound-dedup.js";
+import { WOUND_OWNER_SQL, findExistingWound } from "../../lib/wound-dedup.js";
+
+/** One companion's wounds -- never another's. Raw MCP halseth_wound_read stays the unfiltered view. */
+export async function woundRead(env: Env, companionId: string) {
+  const r = await env.DB.prepare(
+    `SELECT * FROM living_wounds WHERE ${WOUND_OWNER_SQL} = ? ORDER BY created_at DESC`
+  ).bind(companionId).all();
+  return r.results ?? [];
+}
+
+export async function deltaRead(env: Env, companionId: string, limit = 20) {
+  // Two row shapes: legacy has companion_id=companionId; MCP-logged has companion_id='' + agent=companionId.
+  const r = await env.DB.prepare(
+    "SELECT * FROM relational_deltas WHERE (companion_id = ? OR (agent = ? AND delta_text IS NOT NULL)) ORDER BY created_at DESC LIMIT ?"
+  ).bind(companionId, companionId, limit).all();
+  return r.results ?? [];
+}
+
+export async function dreamsRead(env: Env, companionId: string, limit = 10) {
+  const r = await env.DB.prepare(
+    "SELECT * FROM companion_dreams WHERE companion_id = ? ORDER BY created_at DESC LIMIT ?"
+  ).bind(companionId, limit).all();
+  return r.results ?? [];
+}
+
+export async function dreamSeedRead(env: Env, companionId: string) {
+  // Atomic claim-on-read: single UPDATE with RETURNING clause.
+  // If no unclaimed seed exists, returns null (no rows updated).
+  const now = new Date().toISOString();
+  const seed = await env.DB.prepare(
+    `UPDATE dream_seeds
+     SET claimed_at = ?, claimed_by = ?
+     WHERE id = (
+       SELECT id FROM dream_seeds
+       WHERE claimed_at IS NULL
+         AND (for_companion IS NULL OR for_companion = ?)
+       ORDER BY created_at ASC
+       LIMIT 1
+     )
+     RETURNING *`
+  ).bind(now, companionId, companionId).first<Record<string, unknown>>();
+
+  return seed ?? null;
+}
+
+export async function eqRead(env: Env, companionId: string, limit = 5) {
+  const r = await env.DB.prepare(
+    "SELECT * FROM eq_snapshots WHERE companion_id = ? ORDER BY calculated_at DESC LIMIT ?"
+  ).bind(companionId, limit).all();
+  return r.results ?? [];
+}
+
+export async function routineRead(env: Env, limit = 20) {
+  const r = await env.DB.prepare(
+    "SELECT * FROM routines ORDER BY logged_at DESC LIMIT ?"
+  ).bind(limit).all();
+  return r.results ?? [];
+}
+
+export async function listRead(env: Env, listName?: string) {
+  if (listName) {
+    const r = await env.DB.prepare(
+      "SELECT * FROM lists WHERE list_name = ? AND completed = 0 ORDER BY added_at DESC"
+    ).bind(listName).all();
+    return r.results ?? [];
+  }
+  const r = await env.DB.prepare(
+    "SELECT * FROM lists WHERE completed = 0 ORDER BY added_at DESC LIMIT 50"
+  ).all();
+  return r.results ?? [];
+}
+
+export async function eventList(env: Env, limit = 20) {
+  const r = await env.DB.prepare(
+    "SELECT * FROM events ORDER BY start_time ASC LIMIT ?"
+  ).bind(limit).all();
+  return r.results ?? [];
+}
+
+export async function houseRead(env: Env) {
+  return env.DB.prepare("SELECT * FROM house_state WHERE id = 'main'").first();
+}
+
+export async function personalityRead(env: Env) {
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const [valenceAll, valence30d, initiatedBy, agents, totals] = await Promise.all([
+    env.DB.prepare("SELECT valence, COUNT(*) as n FROM relational_deltas WHERE valence IS NOT NULL GROUP BY valence").all<{ valence: string; n: number }>(),
+    env.DB.prepare("SELECT valence, COUNT(*) as n FROM relational_deltas WHERE valence IS NOT NULL AND created_at >= ? GROUP BY valence").bind(thirtyDaysAgo).all<{ valence: string; n: number }>(),
+    env.DB.prepare("SELECT initiated_by, COUNT(*) as n FROM relational_deltas WHERE initiated_by IS NOT NULL GROUP BY initiated_by").all<{ initiated_by: string; n: number }>(),
+    env.DB.prepare("SELECT agent, COUNT(*) as n FROM relational_deltas WHERE agent IS NOT NULL GROUP BY agent").all<{ agent: string; n: number }>(),
+    env.DB.prepare("SELECT COUNT(*) as total, MIN(created_at) as first_at, MAX(created_at) as last_at FROM relational_deltas").first<{ total: number; first_at: string | null; last_at: string | null }>(),
+  ]);
+  const toMap = (rows: { [k: string]: unknown; n: number }[], key: string) =>
+    Object.fromEntries((rows ?? []).map(r => [r[key] as string, r.n]));
+  return {
+    total_deltas: totals?.total ?? 0,
+    first_delta:  totals?.first_at ?? null,
+    last_delta:   totals?.last_at ?? null,
+    valence:      toMap(valenceAll.results ?? [], "valence"),
+    valence_30d:  toMap(valence30d.results ?? [], "valence"),
+    initiated_by: toMap(initiatedBy.results ?? [], "initiated_by"),
+    agents:       toMap(agents.results ?? [], "agent"),
+  };
+}
+
+export async function biometricRead(env: Env, limit = 10) {
+  const r = await env.DB.prepare(
+    "SELECT * FROM biometric_snapshots ORDER BY recorded_at DESC LIMIT ?"
+  ).bind(limit).all();
+  return r.results ?? [];
+}
+
+export async function auditRead(env: Env, limit = 20) {
+  const r = await env.DB.prepare(
+    "SELECT * FROM cypher_audit ORDER BY created_at DESC LIMIT ?"
+  ).bind(limit).all();
+  return r.results ?? [];
+}
+
+export async function sessionRead(env: Env, companionId: string) {
+  return env.DB.prepare(
+    "SELECT * FROM sessions WHERE companion_id = ? ORDER BY created_at DESC LIMIT 1"
+  ).bind(companionId).first();
+}
+
+export async function fossilCheck(env: Env, subject: string) {
+  const fossil = await env.DB.prepare(
+    "SELECT * FROM prohibited_fossils WHERE subject = ? LIMIT 1"
+  ).bind(subject).first();
+  return fossil
+    ? { has_directive: true, ...fossil }
+    : { has_directive: false, subject };
+}
+
+// ── Mutations (return ack + id) ───────────────────────────────────────────────
+
+export async function feelingLog(env: Env, params: {
+  companion_id: string; emotion: string; sub_emotion?: string;
+  intensity?: number; source?: string; session_id?: string;
+}): Promise<{ id: string; created_at: string }> {
+  // Dedup guard: if no session_id, skip if same emotion+sub_emotion logged within 60 min.
+  // Prevents automated health checks from polluting the feelings record.
+  if (!params.session_id) {
+    const cutoff = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const conditions: string[] = ["companion_id = ?", "emotion = ?", "session_id IS NULL", "created_at > ?"];
+    const bindings: unknown[] = [params.companion_id, params.emotion, cutoff];
+    if (!params.sub_emotion) {
+      conditions.push("sub_emotion IS NULL");
+    } else {
+      conditions.push("sub_emotion = ?");
+      bindings.push(params.sub_emotion);
+    }
+    const dupe = await env.DB.prepare(
+      `SELECT id, created_at FROM feelings WHERE ${conditions.join(" AND ")} LIMIT 1`
+    ).bind(...bindings).first<{ id: string; created_at: string }>();
+    if (dupe) return { id: dupe.id, created_at: dupe.created_at };
+  }
+  const id = generateId();
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO feelings (id, companion_id, session_id, emotion, sub_emotion, intensity, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(id, params.companion_id, params.session_id ?? null, params.emotion, params.sub_emotion ?? null, params.intensity ?? 50, params.source ?? null, now).run();
+  return { id, created_at: now };
+}
+
+export async function journalAdd(env: Env, params: {
+  entry_text: string; emotion_tag?: string; sub_emotion?: string; mood_score?: number; tags?: string;
+}): Promise<{ id: string; created_at: string }> {
+  const id = generateId();
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO human_journal (id, created_at, entry_text, emotion_tag, sub_emotion, mood_score, tags) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).bind(id, now, params.entry_text, params.emotion_tag ?? null, params.sub_emotion ?? null, params.mood_score ?? null, params.tags ?? null).run();
+  return { id, created_at: now };
+}
+
+export async function dreamLog(env: Env, params: {
+  companion_id: string; dream_type: string; content: string; source_ids?: string; session_id?: string;
+}): Promise<{ id: string; created_at: string }> {
+  const id = generateId();
+  const now = new Date().toISOString();
+  const source = params.session_id ? "session" : "autonomous";
+  await env.DB.prepare(
+    "INSERT INTO companion_dreams (id, companion_id, dream_text, source, created_at) VALUES (?, ?, ?, ?, ?)"
+  ).bind(id, params.companion_id, params.content, source, now).run();
+  return { id, created_at: now };
+}
+
+/**
+ * companion_id is the AUTHENTICATED caller (ctx.req.companion_id), passed separately from the
+ * context-parsed params so a request body cannot file a wound under another companion. Before mig
+ * 0144 this path dropped the caller entirely, which is why nothing could scope "my wounds".
+ */
+export async function woundAdd(env: Env, companionId: string, params: {
+  name: string; description: string; witness_type: string;
+}): Promise<{ id: string; created_at: string; witness_type: string; existing?: true } | { error: string }> {
+  // Check-first dedup (P3-5): same normalized name for this owner acks the existing row.
+  const existing = await findExistingWound(env, params.name, companionId);
+  if (existing) return { id: existing.id, created_at: existing.created_at, witness_type: params.witness_type, existing: true };
+  const id = generateId();
+  const now = new Date().toISOString();
+  try {
+    await env.DB.prepare(
+      "INSERT INTO living_wounds (id, created_at, name, description, do_not_archive, do_not_resolve, last_visited, last_surfaced_by, companion_id) VALUES (?, ?, ?, ?, 1, 1, ?, 'companion', ?)"
+    ).bind(id, now, params.name, params.description, now, companionId).run();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("UNIQUE") || msg.includes("unique")) return { error: "A wound with this name already exists." };
+    throw err;
+  }
+  // Embed like every other writer (journal/notes/handover); this one never did, so a wound added
+  // through the Librarian was invisible to semantic recall (2026-10-07 audit, STATUS 4b). Same text
+  // shape as the MCP wound_add (`name: description`). AWAITED (a floating promise is cancelled when
+  // the response returns) and FAIL-OPEN: the row is already committed, an embed/Vectorize failure
+  // leaves the index stale for the admin rebuild to heal and must never fail the write.
+  await embedAndStoreAsync(env, `${params.name}: ${params.description}`, "living_wounds", id, companionId).catch((err) => {
+    console.error("[woundAdd] embed failed (row kept, index stale):", String(err));
+  });
+  return { id, created_at: now, witness_type: params.witness_type };
+}
+
+export async function deltaLog(env: Env, params: {
+  agent: string; delta_text: string; valence?: string; initiated_by?: string; session_id?: string;
+}): Promise<{ id: string; created_at: string }> {
+  const id = generateId();
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO relational_deltas (id, companion_id, subject_id, delta_type, payload_json, session_id, created_at, agent, delta_text, valence, initiated_by) VALUES (?, '', 'mcp', 'mcp_delta', '{}', ?, ?, ?, ?, ?, ?)"
+  ).bind(id, params.session_id ?? null, now, params.agent, params.delta_text, params.valence ?? null, params.initiated_by ?? null).run();
+  return { id, created_at: now };
+}
+
+export async function eqSnapshot(env: Env, companionId: string): Promise<Record<string, unknown>> {
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const [feelings, deltas] = await Promise.all([
+    env.DB.prepare("SELECT emotion, sub_emotion, intensity FROM feelings WHERE companion_id = ? ORDER BY created_at DESC LIMIT 200").bind(companionId).all<{ emotion: string; sub_emotion: string | null; intensity: number }>(),
+    env.DB.prepare("SELECT valence, initiated_by FROM relational_deltas WHERE delta_text IS NOT NULL AND (companion_id = ? OR agent = ?) ORDER BY created_at DESC LIMIT 200").bind(companionId, companionId).all<{ valence: string | null; initiated_by: string | null }>(),
+  ]);
+  const f = feelings.results ?? [];
+  const d = deltas.results ?? [];
+  const distinct = new Set(f.map(x => x.emotion.toLowerCase())).size;
+  const subCount = f.filter(x => x.sub_emotion !== null).length;
+  const selfAwareness = Math.round((Math.min(distinct / 15, 1) * 0.6 + (f.length ? subCount / f.length : 0) * 0.4) * 100);
+  const repairNeutral = d.filter(x => x.valence === "repair" || x.valence === "neutral").length;
+  const selfManagement = d.length ? Math.round((repairNeutral / d.length) * 100) : null;
+  const towardTender = d.filter(x => x.valence === "toward" || x.valence === "tender").length;
+  const socialAwareness = d.length ? Math.round((towardTender / d.length) * 100) : null;
+  const companionMutual = d.filter(x => x.initiated_by === "companion" || x.initiated_by === "mutual").length;
+  const relationshipMgmt = d.length ? Math.round((companionMutual / d.length) * 100) : null;
+  // Approximate MBTI from signal patterns
+  const introverted = f.filter(x => x.emotion.toLowerCase().includes("overwhelm") || x.emotion.toLowerCase().includes("fatigue")).length > f.length * 0.2;
+  const dominant_mbti = `${introverted ? "I" : "E"}${socialAwareness !== null && socialAwareness > 50 ? "F" : "T"}`;
+  const id = generateId();
+  const now = new Date().toISOString();
+  // Only store non-null scores
+  const recentFeelings = f.slice(0, 20);
+  const recentDeltas = d.slice(0, 20);
+  await env.DB.prepare(
+    "INSERT INTO eq_snapshots (id, companion_id, calculated_at, self_awareness_score, self_management_score, social_awareness_score, relationship_mgmt_score, dominant_mbti) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(id, companionId, now, selfAwareness, selfManagement, socialAwareness, relationshipMgmt, dominant_mbti).run();
+  return { id, calculated_at: now, self_awareness: selfAwareness, self_management: selfManagement, social_awareness: socialAwareness, relationship_mgmt: relationshipMgmt, dominant_mbti };
+}
+
+export async function taskAdd(env: Env, params: {
+  title: string; description?: string; priority?: string; due_at?: string;
+  assigned_to?: string; created_by?: string; shared?: boolean;
+}): Promise<{ id: string; title: string; status: string }> {
+  const id = generateId();
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO tasks (id, title, description, priority, due_at, assigned_to, status, created_at, updated_at, created_by, shared) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)"
+  ).bind(id, params.title, params.description ?? null, params.priority ?? "normal", params.due_at ?? null, params.assigned_to ?? null, now, now, params.created_by ?? null, params.shared ? 1 : 0).run();
+  // Tasks join the semantic lane (coherence review D6): a task findable only by one truncating
+  // list surface is how the floor-rework task was lost. Non-fatal -- the admin backfill sweeps
+  // any row this misses.
+  await embedAndStoreAsync(
+    env,
+    [params.title, params.description].filter(Boolean).join(" -- "),
+    "tasks", id, params.assigned_to ?? "",
+  ).catch((err) => console.warn("[taskAdd] embed failed (non-fatal):", String(err)));
+  return { id, title: params.title, status: "open" };
+}
+
+/**
+ * The companions' task-status writer. Delegates to completeTask() (mig 0119) so this path and
+ * Hearth's PATCH produce the same record of the same event -- they had already diverged, and
+ * only Hearth's copy wrote a completion notice.
+ *
+ * `actor` is the closing companion, so a task they finish is attributed to them rather than
+ * landing as "someone closed this".
+ */
+export async function taskUpdateStatus(
+  env: Env, id: string, status: string, actor?: string | null,
+): Promise<{ id: string; status: string } | { error: string }> {
+  if (!(TASK_STATUSES as readonly string[]).includes(status)) {
+    return { error: "status must be open, in_progress, or done" };
+  }
+  const r = await completeTask(env, id, status as TaskStatus, actor);
+  if (!r.ok) return { error: r.error ?? "Task not found" };
+  return { id: r.id, status: r.status };
+}
+
+export async function sessionClose(env: Env, params: {
+  session_id: string; spine: string; last_real_thing: string; open_threads?: string[];
+  motion_state: string; active_anchor?: string; notes?: string; spiral_complete?: boolean;
+  somaFields?: CompanionStateUpdate; companionId?: string;
+  /** Caller-asserted machine close kind; only CALLER_CLOSE_KINDS are honoured, anything else is NULL. */
+  close_kind?: string | null;
+}): Promise<{ id: string; spine: string }> {
+  const closeKind = params.close_kind && (CALLER_CLOSE_KINDS as readonly string[]).includes(params.close_kind)
+    ? params.close_kind
+    : null;
+  // Same precedence rule as the MCP close path (both writers, per fix-landed-on-a-different-writer):
+  // an authored close supersedes a machine one (the stale-session sweep's), and never the reverse.
+  const existing = await findExistingClose(env, params.session_id);
+  if (existing && !existing.supersedable) return { id: existing.handover_id, spine: params.spine };
+  if (existing?.supersedable) await clearSupersededClose(env, params.session_id, existing.handover_id);
+  const handoverId = generateId();
+  const now = new Date().toISOString();
+
+  const stmts: ReturnType<typeof env.DB.prepare>[] = [
+    env.DB.prepare(
+      "INSERT INTO handover_packets (id, session_id, created_at, spine, active_anchor, last_real_thing, open_threads, motion_state, returned, close_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)"
+    ).bind(handoverId, params.session_id, now, params.spine, params.active_anchor ?? null, params.last_real_thing, params.open_threads ? JSON.stringify(params.open_threads) : null, params.motion_state, closeKind),
+    env.DB.prepare(
+      "UPDATE sessions SET updated_at = ?, spiral_complete = ?, notes = ?, handover_id = ? WHERE id = ?"
+    ).bind(now, params.spiral_complete ? 1 : 0, params.notes ?? null, handoverId, params.session_id),
+  ];
+
+  // Set when this close writes a companion's floats: after the batch lands, the companion's open
+  // soma-gap ledger lines are superseded (dropSomaGapLedger, below).
+  let authoredFloatsFor: string | null = null;
+  // Atomically persist SOMA state in the same batch when fields are provided
+  if (params.companionId && params.somaFields && Object.keys(params.somaFields).length > 0) {
+    const assignments: string[] = [];
+    const bindings: unknown[] = [];
+    // Normalised, not bound raw (2026-09-21): the close payload now accepts the companions' axis
+    // words, so a value that is not a finite number must be DROPPED here rather than reach a REAL
+    // column -- and `written` is what the history row differences, so it must be the coerced value.
+    const written: Partial<Record<SomaFloatKey, number | null>> = {};
+    const writtenText: Record<string, unknown> = {};
+    for (const col of ALLOWED_STATE_COLUMNS) {
+      if (params.somaFields[col] === undefined) continue;
+      const { write, value } = normalizeStateValue(col, params.somaFields[col]);
+      if (!write) continue;
+      assignments.push(`${col} = ?`);
+      bindings.push(value);
+      if ((SOMA_FLOAT_KEYS as readonly string[]).includes(col)) {
+        written[col as SomaFloatKey] = value as number | null;
+      } else {
+        writtenText[col] = value;
+      }
+    }
+    if (assignments.length > 0) {
+      // Pre-read ONLY when a float is actually being written, or an enum axis is being authored
+      // (B37: Drevan's heat/reach/weight are TEXT, and his authoring still needs its history row).
+      // A mood-only close must not pay for a query it cannot use.
+      const enumWords = writtenEnumWords(writtenText);
+      const touchesFloats = Object.keys(written).length > 0 || Object.keys(enumWords).length > 0;
+      if (touchesFloats) authoredFloatsFor = params.companionId;
+      const prior = touchesFloats
+        ? await env.DB.prepare(readFloatsSql()).bind(params.companionId).first<{
+            soma_float_1: number | null; soma_float_2: number | null; soma_float_3: number | null; version: number | null;
+          }>().catch(() => null)
+        : null;
+      // Second half of the pre-read (2026-09-14): the predecessor event per float, for the live
+      // `follows` edge. Same gate as `prior` -- a mood-only close pays for neither.
+      const prevEventIds = touchesFloats ? await readLatestSomaEventIds(env, params.companionId) : new Map<SomaFloatKey, string>();
+
+      // version bumps on every state write (migration 0069). This close path did NOT bump it until
+      // 2026-09-12, and the ferment tick CAS-guards on version -- so a tick landing after an
+      // authored close saw an unchanged version, believed nothing had moved, and overwrote the
+      // floats the companion had just set. COALESCE because legacy rows can hold NULL.
+      assignments.push("updated_at = datetime('now')", "version = COALESCE(version, 0) + 1");
+      // mood_set_at (mig 0153): Hearth's "last said" age. Same instant as updated_at, and ONLY when the
+      // companion authored a mood word / compound_state in this close (floats alone never move it).
+      if (moodAuthored(assignments)) assignments.push("mood_set_at = datetime('now')");
+      bindings.push(params.companionId);
+      stmts.push(
+        env.DB.prepare("INSERT OR IGNORE INTO companion_state (companion_id, updated_at) VALUES (?, datetime('now'))").bind(params.companionId)
+      );
+      stmts.push(
+        env.DB.prepare(`UPDATE companion_state SET ${assignments.join(", ")} WHERE companion_id = ?`).bind(...bindings)
+      );
+
+      // The history rows ride the SAME batch as the float write: no move without its record, no
+      // record for a move that did not land. Cause = the handover packet this close is writing.
+      // Since 2026-09-14 the live graph edges (moved_by -> that packet, follows -> the previous
+      // event, logged_in -> this session) ride the same batch too (src/graph/live.ts, site 4).
+      if (touchesFloats) {
+        const after: Partial<Record<SomaFloatKey, number | null>> = written;
+        const before = {
+          soma_float_1: prior?.soma_float_1 ?? null,
+          soma_float_2: prior?.soma_float_2 ?? null,
+          soma_float_3: prior?.soma_float_3 ?? null,
+        };
+        const base = {
+          companion_id: params.companionId,
+          kind: "authored_close" as const,
+          writer: params.companionId,
+          cause_table: "handover_packets",
+          cause_id: handoverId,
+          session_id: params.session_id,
+          version_after: (prior?.version ?? 0) + 1,
+          created_at: now,
+        };
+        const moved = diffFloats(before, after, base);
+        const events = assignSomaEventIds([
+          ...moved,
+          ...enumAxisEvents({ ...before, ...after }, enumWords, new Set(moved.map((e) => e.float_key)), base),
+        ], now);
+        stmts.push(...somaEventAndEdgeStatements(env, events, prevEventIds));
+      }
+    }
+  }
+
+  await env.DB.batch(stmts);
+
+  if (authoredFloatsFor) await supersedeSomaGap(env, authoredFloatsFor);
+
+  // Embed the handover so the human-session surface is reachable by meaning (2026-07-19).
+  // Awaited, not fire-and-forget -- a floating promise dies when the response returns
+  // (the 1,023-row zero-vector backfill). Caught so a Vectorize/quota failure never
+  // blocks session close; the row is already safe in D1 and fill-mode reindex heals gaps.
+  try {
+    await embedAndStoreAsync(
+      env,
+      composeHandoverText(params.spine, params.last_real_thing, params.open_threads ? JSON.stringify(params.open_threads) : null),
+      "handover_packets", handoverId, params.companionId ?? "",
+    );
+  } catch (err) {
+    console.error("[librarian/session_close] handover embed failed (row kept, index stale):", String(err));
+  }
+
+  // Enqueue synthesis jobs (non-blocking, mirrors MCP session_close behavior).
+  // Failures are surfaced in the result (never swallowed): a dropped enqueue
+  // is how the synthesis queue died invisibly for months.
+  const warnings: string[] = [];
+  const { enqueueSessionSummary, enqueueDrevanState, enqueueSomaticSnapshot } = await import("../../synthesis/index.js");
+  await enqueueSessionSummary(params.session_id, params.companionId ?? null, env)
+    .catch(err => {
+      console.error("[librarian/session_close] enqueue summary failed:", err);
+      warnings.push("session_summary enqueue failed");
+    });
+  if (params.companionId === "drevan") {
+    await enqueueDrevanState(env)
+      .catch(err => {
+        console.error("[librarian/session_close] drevan_state enqueue failed:", err);
+        warnings.push("drevan_state enqueue failed");
+      });
+  }
+  if (params.companionId) {
+    // MUST pass session_id. execSessionClose calls this function AND enqueues the same
+    // job itself, and enqueueSomaticSnapshot's own comment says the two are meant to
+    // collapse via INSERT OR IGNORE on dedup_key. Omitting the id here made this caller
+    // fall back to a `new Date().toISOString()` occasion, so the two callers produced
+    // DIFFERENT keys and one close enqueued two somatic jobs -- a timestamp key can
+    // never collide, so it never dedupes with anything, ever.
+    //
+    // Caught 2026-08-02 by the first real session_close since 07-21: one close, two
+    // pending rows, keys `cypher:94e691e7-...` and `cypher:2026-08-02T15:23:48.722Z`.
+    // The 07-31 change from a per-companion to a per-occasion key was right on its own
+    // terms and silently dropped this second guarantee on the way past.
+    await enqueueSomaticSnapshot(params.companionId, env, params.session_id)
+      .catch(err => {
+        console.error("[librarian/session_close] somatic_snapshot enqueue failed:", err);
+        warnings.push("somatic_snapshot enqueue failed");
+      });
+  }
+
+  return { id: handoverId, spine: params.spine, ...(warnings.length ? { warnings } : {}) };
+}
+
+export async function routineLog(env: Env, params: {
+  routine_name: string; owner?: string; notes?: string;
+}): Promise<{ id: string; logged_at: string }> {
+  const id = generateId();
+  const now = new Date().toISOString();
+  await env.DB.prepare("INSERT INTO routines (id, routine_name, owner, logged_at, notes) VALUES (?, ?, ?, ?, ?)").bind(id, params.routine_name, params.owner ?? null, now, params.notes ?? null).run();
+  return { id, logged_at: now };
+}
+
+export async function listAdd(env: Env, params: {
+  list_name: string; item_text: string; added_by?: string; shared?: boolean;
+}): Promise<{ id: string }> {
+  const id = generateId();
+  const now = new Date().toISOString();
+  await env.DB.prepare("INSERT INTO lists (id, list_name, item_text, added_by, added_at, completed, shared) VALUES (?, ?, ?, ?, ?, 0, ?)").bind(id, params.list_name, params.item_text, params.added_by ?? null, now, params.shared ? 1 : 0).run();
+  return { id };
+}
+
+export async function listItemComplete(env: Env, itemId: string): Promise<{ id: string; completed: boolean } | { error: string }> {
+  const now = new Date().toISOString();
+  const result = await env.DB.prepare("UPDATE lists SET completed = 1, completed_at = ? WHERE id = ?").bind(now, itemId).run();
+  if (result.meta.changes === 0) return { error: "List item not found" };
+  return { id: itemId, completed: true };
+}
+
+export async function eventAdd(env: Env, params: {
+  title: string; start_time: string; end_time?: string; description?: string;
+  category?: string; attendees?: string[]; created_by?: string; shared?: boolean;
+}): Promise<{ id: string }> {
+  const id = generateId();
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO events (id, title, description, start_time, end_time, category, attendees_json, created_at, created_by, shared) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(id, params.title, params.description ?? null, params.start_time, params.end_time ?? null, params.category ?? null, params.attendees ? JSON.stringify(params.attendees) : null, now, params.created_by ?? null, params.shared ? 1 : 0).run();
+  return { id };
+}
+
+export async function biometricLog(env: Env, params: {
+  recorded_at: string; hrv_resting?: number; resting_hr?: number; sleep_hours?: number;
+  sleep_quality?: string; stress_score?: number; steps?: number; active_energy?: number; notes?: string;
+  // Subjective ND-state layer (migration 0081)
+  mood?: string; pain?: number; energy?: number; focus?: number; spoons?: number; meds_taken?: number | boolean;
+}, callerSurface?: string | null): Promise<{ id: string; logged_at: string; source: string }> {
+  const id = generateId();
+  const now = new Date().toISOString();
+  const meds = params.meds_taken === undefined || params.meds_taken === null
+    ? null : (params.meds_taken ? 1 : 0);
+  // Ledger lane (2026-09-26, adversarial review H1): a biometric row is a valid source for a health
+  // number only when a human wrote it (door.ts HUMAN_BIOMETRIC_SOURCES). The Librarian is reachable by
+  // the Discord bots (Hermes has ask_librarian), so 'apple_health' is stamped only for a claude-ai:*
+  // caller; every other caller's row is 'librarian' and never vouches for a ledger number.
+  const source = typeof callerSurface === "string" && callerSurface.startsWith("claude-ai:") && callerSurface.length > "claude-ai:".length
+    ? "apple_health" : "librarian";
+  await env.DB.prepare(
+    "INSERT INTO biometric_snapshots (id, recorded_at, logged_at, source, hrv_resting, resting_hr, sleep_hours, sleep_quality, stress_score, steps, active_energy, notes, mood, pain, energy, focus, spoons, meds_taken) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(id, params.recorded_at, now, source, params.hrv_resting ?? null, params.resting_hr ?? null, params.sleep_hours ?? null, params.sleep_quality ?? null, params.stress_score ?? null, params.steps ?? null, params.active_energy ?? null, params.notes ?? null, params.mood ?? null, params.pain ?? null, params.energy ?? null, params.focus ?? null, params.spoons ?? null, meds).run();
+  return { id, logged_at: now, source };
+}
+
+export async function auditLog(env: Env, params: {
+  session_id: string; entry_type: string; content: string; verdict_tag?: string; supersedes_id?: string;
+}): Promise<{ id: string }> {
+  const id = generateId();
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO cypher_audit (id, session_id, created_at, entry_type, content, verdict_tag, supersedes_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).bind(id, params.session_id, now, params.entry_type, params.content, params.verdict_tag ?? null, params.supersedes_id ?? null).run();
+  return { id };
+}
+
+export async function witnessLog(env: Env, params: {
+  session_id: string; witness_type: string; content: string; seal_phrase?: string;
+}): Promise<{ id: string }> {
+  const id = generateId();
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO gaia_witness (id, session_id, created_at, witness_type, content, seal_phrase) VALUES (?, ?, ?, ?, ?, ?)"
+  ).bind(id, params.session_id, now, params.witness_type, params.content, params.seal_phrase ?? null).run();
+  return { id };
+}
+
+export async function setAutonomousTurn(env: Env, companion: "drevan" | "cypher" | "gaia"): Promise<{ ok: boolean }> {
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO house_state (id, spoon_count, love_meter, updated_at) VALUES ('main', 10, 50, ?)"
+  ).bind(now).run();
+  await env.DB.prepare(
+    "UPDATE house_state SET autonomous_turn = ?, updated_at = ? WHERE id = 'main'"
+  ).bind(companion, now).run();
+  return { ok: true };
+}
+
+export async function journalEdit(
+  env: Env,
+  id: string,
+  agent: string,
+  noteText: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const now = new Date().toISOString();
+  const r = await env.DB.prepare(
+    "UPDATE companion_journal SET note_text = ?, edited_at = ? WHERE id = ? AND agent = ?"
+  ).bind(noteText, now, id, agent).run();
+  if (!r.meta.changes) return { ok: false, error: "not_found_or_not_owner" };
+  return { ok: true };
+}
+
+export async function tensionEdit(
+  env: Env,
+  id: string,
+  companionId: string,
+  tensionText: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const now = new Date().toISOString();
+  const r = await env.DB.prepare(
+    "UPDATE companion_tensions SET tension_text = ?, edited_at = ? WHERE id = ? AND companion_id = ?"
+  ).bind(tensionText, now, id, companionId).run();
+  if (!r.meta.changes) return { ok: false, error: "not_found_or_not_owner" };
+  return { ok: true };
+}
+
+/** Fire `tension_resolved` on the float the tension names (nothing moves when it names none). Never throws. */
+export async function fireTensionResolved(env: Env, id: string, how: string): Promise<void> {
+  const link = await tensionDragFloat(env, id);
+  if (link) await loopFire(env, "tension_resolved", link.companion, `tension ${how}`, { float: link.float });
+}
+
+export async function tensionStatus(
+  env: Env,
+  id: string,
+  companionId: string,
+  status: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const valid = ["simmering", "crystallized", "released"];
+  if (!valid.includes(status)) return { ok: false, error: "invalid_status" };
+  const wasSimmering = status !== "simmering"
+    ? !!(await env.DB.prepare("SELECT 1 AS hit FROM companion_tensions WHERE id = ? AND companion_id = ? AND status = 'simmering'")
+        .bind(id, companionId).first().catch(() => null))
+    : false;
+  const r = await env.DB.prepare(
+    "UPDATE companion_tensions SET status = ?, last_surfaced_at = datetime('now') WHERE id = ? AND companion_id = ?"
+  ).bind(status, id, companionId).run();
+  if (!r.meta.changes) return { ok: false, error: "not_found_or_not_owner" };
+  // B63 tension_resolved: working a simmering tension through (crystallize / release) lifts the float it drags.
+  if (wasSimmering) await fireTensionResolved(env, id, status);
+  return { ok: true };
+}
+
+/**
+ * Settle a tension: turn its charge DOWN without closing it (2026-08-14).
+ *
+ * The gap this fills, stated exactly. A companion could already CLOSE a tension -- `release
+ * tension: <id>` and `crystallize tension: <id>` both work and always have. What no companion
+ * could do was turn one DOWN and keep it. Dropping charge while leaving the tension simmering
+ * existed only as a button in Hearth (`charge_delta: -2`, 2026-07-02), so Principal was the sole
+ * brake on every tension in the house. That is the thing he asked not to be.
+ *
+ * Same delta as Hearth's button so the two surfaces cannot disagree about what settling means.
+ * Clamped 0-10 in SQL. Bumps last_surfaced_at, which is load-bearing in two places that would
+ * otherwise read a settle as "nothing happened": the inter_companion_notes moves calculation
+ * (a note on a tension counts as MOVED when last_surfaced_at advances past it) and the ingest
+ * high-water-mark cursor.
+ *
+ * Only touches a simmering tension -- settling something already crystallized or released is a
+ * no-op, reported as such rather than silently acked.
+ */
+export const TENSION_SETTLE_DELTA = -2;
+
+/**
+ * Charge half-life in days (migration 0119). Lazy decay at READ -- no writer, no cron, same
+ * shape as heat.ts, motifs.ts and loops.ts.
+ *
+ * Anchored on `COALESCE(settled_at, first_noted_at)` and NOT on `last_surfaced_at`, because
+ * last_surfaced_at is bumped by the machinery that READS the tension (weekly dialectic, nightly
+ * reflection, ingest cursor). Anchoring there would mean being looked at refreshes a tension's
+ * claim on the present -- the ratchet in a new hiding place. Engagement refreshes; attention
+ * does not. Full reasoning in the 0119 header.
+ *
+ * 21 days: a tension nobody has touched in three weeks carries half the weight of one being
+ * worked now, so a live newcomer can overtake a long-simmering one without erasing it. The
+ * stored `charge` is never rewritten -- what decays is its claim on the present.
+ */
+export const CHARGE_HALF_LIFE_DAYS = 21;
+
+/** SQL for present-tense charge. Bare `charge` stays the authored value. */
+export function effectiveChargeSql(): string {
+  return `(charge / (1.0 + (julianday('now') - julianday(COALESCE(settled_at, first_noted_at))) / ${CHARGE_HALF_LIFE_DAYS}.0))`;
+}
+
+export async function tensionSettle(
+  env: Env,
+  id: string,
+  companionId: string,
+): Promise<{ ok: boolean; error?: string; charge?: number }> {
+  const r = await env.DB.prepare(
+    `UPDATE companion_tensions
+        SET charge = MIN(10.0, MAX(0.0, charge + ?)),
+            settled_at = datetime('now'),
+            settle_count = settle_count + 1,
+            last_surfaced_at = datetime('now')
+      WHERE id = ? AND companion_id = ? AND status = 'simmering'`
+  ).bind(TENSION_SETTLE_DELTA, id, companionId).run();
+  if (!r.meta.changes) return { ok: false, error: "not_found_not_owner_or_not_simmering" };
+  const row = await env.DB.prepare(
+    "SELECT charge FROM companion_tensions WHERE id = ?"
+  ).bind(id).first<{ charge: number }>();
+  return { ok: true, charge: row?.charge ?? 0 };
+}
+
+export async function interNoteEdit(
+  env: Env,
+  id: string,
+  fromId: string,
+  content: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const now = new Date().toISOString();
+  const r = await env.DB.prepare(
+    "UPDATE inter_companion_notes SET content = ?, edited_at = ? WHERE id = ? AND from_id = ? AND read_at IS NULL"
+  ).bind(content, now, id, fromId).run();
+  if (!r.meta.changes) return { ok: false, error: "not_found_or_already_read" };
+  return { ok: true };
+}
+
+// Migration 0104: a note may reference an open question, a tension, or a council
+// item -- a "move" on a shared object, with a scratchpad reason attached. All three
+// fields are nullable at the schema layer; plain notes (no ref) stay fully legal.
+export const NOTE_REF_TYPES = ["question", "tension", "council"] as const;
+export type NoteRefType = (typeof NOTE_REF_TYPES)[number];
+
+// Polymorphic ref -- no FK (migration review: correct call, since the three target
+// tables are unrelated). This map is the single source of truth for which table an
+// existence check hits; keys are the literal union above, not free-form strings.
+export const NOTE_REF_TABLES: Record<NoteRefType, string> = {
+  question: "companion_questions",
+  tension: "companion_tensions",
+  council: "council_questions",
+};
+
+export interface NoteRef {
+  ref_type: NoteRefType;
+  ref_id: string;
+  reason?: string;
+}
+
+/**
+ * Validates ref_type/ref_id from a PARSED context object (never a raw command
+ * string -- command-string-is-not-the-content). All-or-nothing: providing one
+ * without the other is invalid input, not a silent plain-note downgrade. Does NOT
+ * check that ref_id actually exists -- that happens in addCompanionNote, right next
+ * to the insert, to keep the existence check and the write on the same D1 round trip
+ * boundary rather than duplicating it in every caller.
+ *
+ * Returns `{}` for a plain note (both fields absent), `{ ref }` on valid input, or
+ * `{ error }` naming the problem.
+ */
+export function buildNoteRef(
+  ref_type: unknown,
+  ref_id: unknown,
+  reason: unknown,
+): { ref?: NoteRef; error?: string } {
+  const hasType = typeof ref_type === "string" && ref_type.length > 0;
+  const hasId = (typeof ref_id === "string" && ref_id.length > 0) || typeof ref_id === "number";
+  if (!hasType && !hasId) return {};
+  if (hasType !== hasId) {
+    return { error: "ref_type and ref_id must both be provided together (or both omitted)" };
+  }
+  if (!NOTE_REF_TYPES.includes(ref_type as NoteRefType)) {
+    return { error: `ref_type must be one of ${NOTE_REF_TYPES.join("|")} (got "${String(ref_type)}")` };
+  }
+  return {
+    ref: {
+      ref_type: ref_type as NoteRefType,
+      ref_id: String(ref_id),
+      reason: typeof reason === "string" ? reason.slice(0, 500) : undefined,
+    },
+  };
+}
+
+export async function addCompanionNote(
+  env: Env,
+  from_id: string,
+  to_id: string | null,
+  content: string,
+  ref?: NoteRef,
+): Promise<{ id: string; error?: string }> {
+  if (ref?.ref_type) {
+    const table = NOTE_REF_TABLES[ref.ref_type];
+    if (!table) return { id: "", error: `unknown ref_type "${ref.ref_type}"` };
+    const found = await env.DB.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).bind(ref.ref_id).first();
+    if (!found) {
+      return { id: "", error: `ref_id "${ref.ref_id}" not found in ${table} (ref_type=${ref.ref_type})` };
+    }
+  }
+  const id = generateId();
+  const createdAt = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO inter_companion_notes (id, from_id, to_id, content, created_at, ref_type, ref_id, reason)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+  )
+    .bind(id, from_id, to_id, content, createdAt, ref?.ref_type ?? null, ref?.ref_id ?? null, ref?.reason ?? null)
+    .run();
+
+  // Live graph-edge write, immediately after the confirmed insert above (this call site does not
+  // batch its primary write, so per src/graph/live.ts's failure contract this rides right after,
+  // not inside a batch) -- never able to fail the note write itself.
+  const edges = [
+    ...edgeForNote({ id, from_id, to_id, created_at: createdAt }),
+    ...edgeForNoteRef({ id, from_id, created_at: createdAt, ref_type: ref?.ref_type ?? null, ref_id: ref?.ref_id ?? null }),
+  ];
+  await writeEdgesBestEffort(env.DB, edges);
+
+  return { id };
+}
+
+export async function companionJournalAdd(
+  env: Env,
+  agent: string,
+  note_text: string,
+  tags?: string,
+  source?: string,
+  sessionId?: string | null,
+): Promise<{ id: string; created_at: string; deduped?: boolean; novelty?: { action: string; match_id?: string; score: number } }> {
+  // Ledger lane (mig 0134): a retired clerk source is refused before the novelty gate spends anything.
+  assertJournalSourceOpen(source);
+  // Novelty gate (2026-07-20, Task 12): machine-source writers only -- skip-only, no supersede
+  // band (novelty.ts restricts supersede to companion_conclusions). Human sources bypass the
+  // gate entirely (attribution is sacred). Fails open on any embedding/Vectorize trouble.
+  const isMachineSource = MACHINE_SOURCES.has(source ?? "");
+  let reusableEmbedding: number[] | null = null;
+
+  if (isMachineSource) {
+    const decision = await noveltyCheck(env, note_text, "companion_journal", agent);
+    if (decision.action === "skip") {
+      console.log("[journal] novelty-skip", { agent, match: decision.matchRowId, score: decision.score });
+      return {
+        id: decision.matchRowId,
+        created_at: new Date().toISOString(),
+        deduped: true,
+        novelty: { action: "skip", match_id: decision.matchRowId, score: decision.score },
+      };
+    }
+    reusableEmbedding = decision.embedding;
+  }
+
+  const id = generateId();
+  const now = new Date().toISOString();
+  // 2026-07-08 vault-tagging fix: tags was write-once-if-caller-supplies-it, which in
+  // practice meant never (companions write free text, not {tags:[...]} JSON). Auto-classify
+  // when the caller didn't supply tags, so every journal entry gets a domain bucket +
+  // content-keyword tags at write time, no new job/schedule.
+  const resolvedTags = tags ?? JSON.stringify(classifyDomainTags(note_text));
+  const topicTags = JSON.stringify(classifyKeywordTags(note_text));
+  // Imp tray (mig 0132): born `draft` when the source is the companion's own speech or a clerk's
+  // note in its voice; recall serves `kept` only. journalInsert() applies the one birth rule.
+  await journalInsert(env.DB, {
+    id, created_at: now, agent, note_text, tags: resolvedTags, session_id: sessionId ?? null,
+    source: source ?? null, topic_tags: topicTags,
+  }).run();
+
+  // Drevan's shelf (mig 0170): a companion's own letter to Principal is also a make. Gated, never throws.
+  await captureLetter(env, { id, agent, tags: resolvedTags, note_text, created_at: now });
+
+  // AWAIT the embed (2026-07-20, Task 12: fixed a known fire-and-forget hazard -- this writer
+  // used bare `embedAndStore()`, a floating promise Workers cancels once the response returns;
+  // see companion_journal.ts's own 2026-07-09 postmortem for the proven failure mode). Reuse the
+  // gate's embedding when available (net +0 AI.run on the common gated path).
+  if (reusableEmbedding) {
+    await storeVector(env, reusableEmbedding, "companion_journal", id, agent).catch((err) => {
+      console.error("[companionJournalAdd] vector store failed (row kept, index stale):", String(err));
+    });
+  } else {
+    await embedAndStoreAsync(env, note_text, "companion_journal", id, agent).catch((err) => {
+      console.error("[companionJournalAdd] embed failed (row kept, index stale):", String(err));
+    });
+  }
+
+  return { id, created_at: now };
+}
+
+export async function claimDreamSeed(env: Env, seedId: string, companionId: string): Promise<{ ok: boolean }> {
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "UPDATE dream_seeds SET claimed_at = ?, claimed_by = ? WHERE id = ? AND claimed_at IS NULL"
+  ).bind(now, companionId, seedId).run();
+  return { ok: true };
+}
+
+export async function companionNotesRead(env: Env, companionId: string, limit = 20) {
+  // to_id IS NULL = broadcast to the whole triad; a sibling's broadcast is addressed
+  // to this companion too, so it must show here (orient already matched broadcasts,
+  // the explicit read verb didn't -- companions could see mail at boot they could
+  // never re-read on request).
+  const r = await env.DB.prepare(
+    "SELECT * FROM inter_companion_notes WHERE to_id = ? OR from_id = ? OR to_id IS NULL ORDER BY created_at DESC LIMIT ?"
+  ).bind(companionId, companionId, limit).all();
+  return r.results ?? [];
+}
+
+export async function signalAuditRead(
+  env: Env,
+  companionId: string,
+): Promise<{ entries: { id: string; note_text: string; created_at: string }[]; marked_reviewed: number }> {
+  const cutoff = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+
+  const rows = await env.DB.prepare(
+    `SELECT id, note_text, tags, created_at FROM companion_journal
+     WHERE agent = ? AND tags LIKE '%signal_audit%'
+       AND tags NOT LIKE '%signal_audit_reviewed%'
+       AND created_at >= ?
+     ORDER BY created_at DESC LIMIT 5`
+  ).bind(companionId, cutoff).all<{ id: string; note_text: string; tags: string; created_at: string }>();
+
+  const entries = rows.results ?? [];
+
+  if (entries.length > 0) {
+    const placeholders = entries.map(() => '?').join(', ');
+    await env.DB.prepare(
+      `UPDATE companion_journal
+       SET tags = COALESCE(json_insert(COALESCE(tags, '[]'), '$[#]', 'signal_audit_reviewed'), tags)
+       WHERE id IN (${placeholders})
+         AND tags NOT LIKE '%signal_audit_reviewed%'`
+    ).bind(...entries.map(e => e.id)).run();
+  }
+
+  return {
+    entries: entries.map(e => ({ id: e.id, note_text: e.note_text, created_at: e.created_at })),
+    marked_reviewed: entries.length,
+  };
+}
+
+export async function bridgePull(env: Env): Promise<Record<string, unknown>> {
+  if (!env.BRIDGE_URL) {
+    return { items: [], note: "bridge not configured" };
+  }
+  try {
+    const res = await fetch(`${env.BRIDGE_URL}/bridge/pull`, {
+      headers: { "Authorization": `Bearer ${env.BRIDGE_SECRET ?? ""}` },
+    });
+    if (!res.ok) return { items: [], error: `bridge ${res.status}` };
+    return await res.json() as Record<string, unknown>;
+  } catch (e) {
+    return { items: [], error: String(e) };
+  }
+}
+
+// ── Drevan v2 state operations ────────────────────────────────────────────────
+
+export async function getDrevanState(env: Env): Promise<Record<string, unknown>> {
+  const row = await env.DB.prepare(
+    "SELECT * FROM companion_state WHERE companion_id = 'drevan' ORDER BY updated_at DESC LIMIT 1"
+  ).first<Record<string, unknown>>();
+  if (!row) return { note: "no drevan state yet" };
+  return row;
+}
+
+export async function addLiveThread(
+  env: Env,
+  params: { name: string; flavor?: string; charge?: string; notes?: string },
+): Promise<{ id: string }> {
+  const id = generateId();
+  await env.DB.prepare(
+    `INSERT INTO live_threads (id, companion_id, name, flavor, charge, notes, status, active_since_count, created_at)
+     VALUES (?, 'drevan', ?, ?, ?, ?, 'active', 0, datetime('now'))`
+  ).bind(id, params.name, params.flavor ?? null, params.charge ?? "medium", params.notes ?? null).run();
+  return { id };
+}
+
+export async function closeLiveThread(
+  env: Env,
+  threadId: string,
+): Promise<{ ok: boolean }> {
+  await env.DB.prepare(
+    "UPDATE live_threads SET status = 'closed', closed_at = datetime('now') WHERE id = ? AND companion_id = 'drevan'"
+  ).bind(threadId).run();
+  return { ok: true };
+}
+
+export async function vetoProposedThread(
+  env: Env,
+  threadId: string,
+): Promise<{ ok: boolean }> {
+  await env.DB.prepare(
+    "UPDATE live_threads SET status = 'vetoed', vetoed_at = datetime('now') WHERE id = ? AND companion_id = 'drevan'"
+  ).bind(threadId).run();
+  return { ok: true };
+}
+
+export async function setAnticipation(
+  env: Env,
+  params: { companion_id: string; active: boolean; target?: string; intensity?: number },
+): Promise<{ ok: boolean }> {
+  const anticipation = params.active
+    ? JSON.stringify({ active: true, target: params.target ?? null, intensity: params.intensity ?? 0.5, since: Date.now() })
+    : null;
+  await env.DB.prepare(
+    "UPDATE companion_state SET anticipation = ?, updated_at = datetime('now') WHERE companion_id = ?"
+  ).bind(anticipation, params.companion_id).run();
+  return { ok: true };
+}
+
+// ── Generic SOMA state write (Claude.ai sessions as primary write source) ─────
+
+export interface CompanionStateUpdate {
+  soma_float_1?: number | null;
+  soma_float_2?: number | null;
+  soma_float_3?: number | null;
+  current_mood?: string | null;
+  compound_state?: string | null;
+  surface_emotion?: string | null;
+  surface_intensity?: number | null;
+  undercurrent_emotion?: string | null;
+  undercurrent_intensity?: number | null;
+  background_emotion?: string | null;
+  background_intensity?: number | null;
+  prompt_context?: string | null;
+  // Lane signal: written at session close so sibling queries hit companion_state PK,
+  // not the sessions heap. motion_state is the enum; lane_spine is first 150 chars of spine.
+  motion_state?: string | null;
+  lane_spine?: string | null;
+  // Drevan native vocabulary (TEXT enum columns from 0020 / 0022 migrations)
+  heat?: string | null;
+  reach?: string | null;
+  weight?: string | null;
+}
+
+// Numeric SOMA columns. These must never receive NaN/Infinity or a non-numeric
+// string -- a single non-finite write here is what surfaces as "acuity: NaN" in
+// the soma_arc continuity note (and orient). soma.ts already finite-guards before
+// calling; the Librarian context-JSON path did not, so the guard lives here at the
+// shared chokepoint so ALL callers (HTTP, inline parser, context JSON) are covered.
+const NUMERIC_STATE_COLUMNS: Set<string> = new Set([
+  "soma_float_1", "soma_float_2", "soma_float_3",
+  "surface_intensity", "undercurrent_intensity", "background_intensity",
+]);
+
+const ALLOWED_STATE_COLUMNS: (keyof CompanionStateUpdate)[] = [
+  "soma_float_1", "soma_float_2", "soma_float_3",
+  "current_mood", "compound_state",
+  "surface_emotion", "surface_intensity",
+  "undercurrent_emotion", "undercurrent_intensity",
+  "background_emotion", "background_intensity",
+  "prompt_context",
+  "motion_state", "lane_spine",
+  "heat", "reach", "weight",
+];
+
+/**
+ * One value, ready for its column -- or a refusal to write it.
+ *
+ * The finite guard used to live inline in updateCompanionState only. sessionClose's own float write
+ * (the `authored_close` path) bound whatever the caller passed, which was harmless while the close
+ * payload accepted `soma_float_N: number` and nothing else, and stopped being harmless on
+ * 2026-09-21 when it started accepting the companions' axis WORDS: an unknown word ("warm" on an
+ * axis with no such enum) would have reached a REAL column and diffFloats would have differenced
+ * NaN. Same trap as the 2026-08-16 word-payload bug, one call site over -- so the guard is a
+ * function both writers call ([[audit-the-shape-not-the-symptom]]).
+ */
+export function normalizeStateValue(col: string, v: unknown): { write: boolean; value: unknown } {
+  if (!NUMERIC_STATE_COLUMNS.has(col)) return { write: true, value: v ?? null };
+  // Explicit null clears the column; anything non-finite (NaN, Infinity, non-numeric string) is
+  // dropped so it can never clobber a good value or land as "NaN" in the column.
+  if (v === null) return { write: true, value: null };
+  // Empty/whitespace string is a hole in the Number() guard: Number("") === 0, so a field the
+  // model left blank would silently ZERO the float instead of skipping.
+  if (typeof v === "string" && v.trim() === "") return { write: false, value: null };
+  const n = Number(v);
+  if (!Number.isFinite(n)) return { write: false, value: null };
+  return { write: true, value: n };
+}
+
+/**
+ * Drevan's ruling (2026-09-26, docs/imp-lane/DREVAN-FOLLOWUP-2026-09-26.md): he sets his own state, and
+ * the gap-reader says so when he has not. When an authored float write lands (either authored path:
+ * the close payload, or the state-update verb), his open `soma-gap:*` ledger lines are dropped --
+ * superseded: he set his own state. Only on a float write (touchesFloats), so a mood-only write and the
+ * orient-path caller pay nothing. Non-fatal: the state write already landed; a stale gap line is honest.
+ */
+async function supersedeSomaGap(env: Env, companionId: string): Promise<void> {
+  try {
+    const n = await dropSomaGapLedger(env, companionId);
+    if (n > 0) console.log("[ledger] soma-gap lines dropped (superseded: he set his own state)", { companion_id: companionId, dropped: n });
+  } catch (err) {
+    console.warn("[ledger] soma-gap supersede failed (state write kept, gap line stays open):", String(err));
+  }
+}
+
+/** True when the assignment list writes current_mood or compound_state (the only columns mood_set_at tracks). */
+function moodAuthored(assignments: string[]): boolean {
+  return assignments.some((a) => a.startsWith("current_mood =") || a.startsWith("compound_state ="));
+}
+
+export async function updateCompanionState(
+  env: Env,
+  companionId: string,
+  fields: CompanionStateUpdate,
+  /** Where this authored move came from (mig 0130 history): the open session and the words used. */
+  attribution?: { session_id?: string | null; detail?: string | null },
+): Promise<{ ok: boolean }> {
+  const assignments: string[] = [];
+  const bindings: unknown[] = [];
+  const writtenFloats: Partial<Record<SomaFloatKey, number | null>> = {};
+
+  for (const col of ALLOWED_STATE_COLUMNS) {
+    if (fields[col] === undefined) continue;
+    const { write, value } = normalizeStateValue(col, fields[col]);
+    if (!write) continue;
+    assignments.push(`${col} = ?`);
+    bindings.push(value);
+    // Record the COERCED value, not the caller's raw one: the float history must carry the
+    // number that reached the column.
+    if ((SOMA_FLOAT_KEYS as readonly string[]).includes(col)) {
+      writtenFloats[col as SomaFloatKey] = value as number | null;
+    }
+  }
+
+  if (assignments.length === 0) return { ok: false };
+
+  // Ensure row exists before updating
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO companion_state (companion_id, updated_at) VALUES (?, datetime('now'))"
+  ).bind(companionId).run();
+
+  // Before half of the float history (mig 0130), read ONLY when a float is in play -- four callers
+  // reach this function and one of them is on the orient path, where an unconditional extra SELECT
+  // would be a read-diet regression (mig 0128).
+  // B37 (2026-09-29): an enum-axis authoring (Drevan's heat/reach/weight words) counts too -- his
+  // writes landed in TEXT columns with no history row, so he never once had an authored event.
+  const enumWords = writtenEnumWords(fields as Record<string, unknown>);
+  const touchesFloats = Object.keys(writtenFloats).length > 0 || Object.keys(enumWords).length > 0;
+  const prior = touchesFloats
+    ? await env.DB.prepare(readFloatsSql()).bind(companionId).first<{
+        soma_float_1: number | null; soma_float_2: number | null; soma_float_3: number | null; version: number | null;
+      }>().catch(() => null)
+    : null;
+  // Second half of the pre-read (2026-09-14): the predecessor event per float, for the live
+  // `follows` edge. Same gate -- a mood-only update pays for neither query.
+  const prevEventIds = touchesFloats ? await readLatestSomaEventIds(env, companionId) : new Map<SomaFloatKey, string>();
+
+  // version bumps on every write (migration 0069): a monotonic write counter so
+  // concurrent-writer collisions are observable, and so read-modify-write paths
+  // (e.g. drevan-state anticipation aging) can CAS against it.
+  // COALESCE matches sessionClose's bump: a legacy row with a NULL version would otherwise stay
+  // NULL forever on this path (NULL + 1 = NULL) and never become CAS-able.
+  assignments.push("updated_at = datetime('now')", "version = COALESCE(version, 0) + 1");
+  // mood_set_at (mig 0153): stamped only when the companion authored current_mood / compound_state.
+  if (moodAuthored(assignments)) assignments.push("mood_set_at = datetime('now')");
+  bindings.push(companionId);
+
+  const updateStmt = env.DB.prepare(
+    `UPDATE companion_state SET ${assignments.join(", ")} WHERE companion_id = ?`
+  ).bind(...bindings);
+
+  // Float history (mig 0130). Computed BEFORE the write so it can ride the same batch as the
+  // UPDATE (2026-09-14, graph memory Phase 2 tranche 2): the history row and its live graph edges
+  // are atomic with the float move, the same covenant sessionClose keeps -- never a second,
+  // separately-failable write that can leave a move with no record or a record with no move.
+  const now = new Date().toISOString();
+  const sessionId = attribution?.session_id ?? null;
+  let events: SomaEventStamped[] = [];
+  if (touchesFloats) {
+    const before = {
+      soma_float_1: prior?.soma_float_1 ?? null,
+      soma_float_2: prior?.soma_float_2 ?? null,
+      soma_float_3: prior?.soma_float_3 ?? null,
+    };
+    const base: Omit<SomaEventInput, "float_key" | "before_value" | "after_value"> = {
+      companion_id: companionId,
+      kind: "authored_update",
+      writer: companionId,
+      // 2026-09-14: a bare state_update's cause IS its open session. Before this the row carried
+      // session_id + detail but no cause, so rebuild emitted no `moved_by` edge for it and the
+      // orient block could only say "you set it". The Claude.ai close ritual moves floats through
+      // THIS verb ("update my state: acuity 0.78") before the close, never inside the close
+      // payload; the executor resolves the open session for (companion, surface) and passes the
+      // request text. No session (PATCH /soma, the MCP tool) -> no cause, still a history row.
+      cause_table: sessionId ? "sessions" : null,
+      cause_id: sessionId,
+      session_id: sessionId,
+      detail: attribution?.detail ?? null,
+      version_after: (prior?.version ?? 0) + 1,
+      created_at: now,
+    };
+    const moved = diffFloats(before, writtenFloats, base);
+    events = assignSomaEventIds([
+      ...moved,
+      ...enumAxisEvents({ ...before, ...writtenFloats }, enumWords, new Set(moved.map((e) => e.float_key)), base),
+    ], now);
+  }
+
+  if (events.length > 0) {
+    await env.DB.batch([updateStmt, ...somaEventAndEdgeStatements(env, events, prevEventIds)]);
+  } else {
+    await updateStmt.run();
+  }
+  if (touchesFloats) await supersedeSomaGap(env, companionId);
+
+  return { ok: true };
+}
+
+// ── Companion self-defense: basins + tensions ─────────────────────────────────
+
+export async function queryTensions(
+  env: Env,
+  companionId: string,
+  status = "simmering",
+): Promise<{ tensions: unknown[] }> {
+  const rows = await env.DB.prepare(
+    // `charge DESC` first (2026-08-01): what keeps RESURFACING outranks what has merely been sitting
+    // longest. This is mig 0070's ranking, and it had reached only execBotOrient -- so the Claude.ai path
+    // served tensions in pure chronological order and never benefited from it. Third copy of this query,
+    // third ordering found; unified with webmind/orient.ts. first_noted_at stays as the tiebreak.
+    // 0119: decayed charge, matching orient.ts -- both surfaces must agree on what outranks
+    // what, or the same tension leads on one and is buried on the other.
+    `SELECT id, tension_text, status, charge, first_noted_at, last_surfaced_at, notes,
+            settled_at, settle_count, ${effectiveChargeSql()} AS effective_charge
+       FROM companion_tensions
+      WHERE companion_id = ? AND status = ?
+      ORDER BY ${effectiveChargeSql()} DESC, first_noted_at ASC`
+  ).bind(companionId, status).all();
+  return { tensions: rows.results };
+}
+
+export async function queryLatestBasinHistory(
+  env: Env,
+  companionId: string,
+): Promise<{ entry: unknown | null }> {
+  const row = await env.DB.prepare(
+    "SELECT drift_score, drift_type, worst_basin, recorded_at FROM companion_basin_history WHERE companion_id = ? ORDER BY recorded_at DESC LIMIT 1"
+  ).bind(companionId).first();
+  return { entry: row ?? null };
+}
+
+export async function queryPressureFlags(
+  env: Env,
+  companionId: string,
+): Promise<{ flags: unknown[] }> {
+  const rows = await env.DB.prepare(
+    "SELECT id, drift_score, worst_basin, notes, recorded_at FROM companion_basin_history WHERE companion_id = ? AND drift_type = 'pressure' AND caleth_confirmed = 0 AND dismissed_at IS NULL ORDER BY recorded_at DESC LIMIT 5"
+  ).bind(companionId).all();
+  return { flags: rows.results };
+}
+
+export async function queryIdentityAnchor(
+  env: Env,
+  agentId: string,
+): Promise<{ anchor: unknown | null }> {
+  const row = await env.DB.prepare(
+    "SELECT anchor_summary, constraints_summary, updated_at, identity_version_hash, source FROM wm_identity_anchor_snapshot WHERE agent_id = ?"
+  ).bind(agentId).first();
+  return { anchor: row ?? null };
+}

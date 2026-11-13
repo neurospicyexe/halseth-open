@@ -1,0 +1,415 @@
+// ── Cloudflare Worker environment bindings ────────────────────────────────────
+export interface Env {
+  DB: D1Database;
+  BUCKET: R2Bucket;
+  AI: Ai;
+  VECTORIZE: VectorizeIndex;
+
+  // Librarian bindings
+  LIBRARIAN_KV: KVNamespace;    // KV namespace for tool registry + pattern matching
+  SECOND_BRAIN_TOKEN?: string;       // OAuth token for the Second Brain MCP endpoint (set via wrangler secret)
+  SECOND_BRAIN_MCP_URL?: string;     // Second Brain MCP endpoint (e.g. https://your-second-brain.example.com/mcp); /mcp appended if absent
+  SECOND_BRAIN_WEBHOOK_URL?: string; // second-brain HTTP base URL for session-close webhook (e.g. https://your-second-brain.example.com)
+  DEEPSEEK_API_KEY?: string;    // DeepSeek V3 API key for KV pattern classification (set via wrangler secret)
+  // Classifier vendor failover (2026-08-28, DeepSeek $0 balance -> cognitive_routing_offline).
+  // Optional -- if unset, a DeepSeek 401/402/403/429/5xx/network failure returns __offline__
+  // exactly as before (deterministic 400s never fail over on either vendor). Mirrors the
+  // autonomous-worker's DeepSeek/DeepInfra failover shape (packages/autonomous-worker/src/deepseek.ts).
+  DEEPINFRA_API_KEY?: string;   // DeepInfra API key, OpenAI-compatible -- PRIMARY vendor for classifier + synthesis since 2026-08-31 (set via wrangler secret)
+
+  // Config flags — set in wrangler.toml [vars], not in code.
+  PLURALITY_ENABLED:   string;  // "true" | "false"
+  COMPANIONS_ENABLED:  string;  // "true" | "false"
+  COORDINATION_ENABLED: string; // "true" | "false"
+  /** Chars of DEFAULT-weight architect facts that render at orient (lib/open-facts-gate.ts).
+   *  Unset = 4000. Widen it or set it huge to disable the gate without a code change; the
+   *  number is a judgement about Principal's data, not a technical constant. */
+  ARCHITECT_FACTS_TAIL_BUDGET?: string;
+  SYSTEM_NAME:         string;
+  SYSTEM_OWNER:        string;
+  // Quiet hours (B7 step 1, 2026-09-27). Local-clock window in QUIET_HOURS_TZ during which a
+  // metronome action is only eligible if it carries quiet_hours_allowed = 1. The window wraps
+  // midnight; end is exclusive. Unset or malformed => 22 / 6 / America/Chicago, so an
+  // un-redeployed environment is still protected. QUIET_HOURS_TZ must be an IANA zone name
+  // (never a fixed offset: CDT/CST would shift the window by an hour in November).
+  QUIET_HOURS_START?:  string;  // hour 0-23, default 22
+  QUIET_HOURS_END?:    string;  // hour 0-23, default 6
+  QUIET_HOURS_TZ?:     string;  // IANA zone, default America/Chicago
+  // The shared triad reach cap (B7 steps 2 + 2c, mig 0137, webmind/reach-cap.ts). Unset or
+  // malformed => the named defaults there (90 / 6 / 3 / 2), never "no cap".
+  PATTERN_COOL_RETURNS?:        string;  // R18: returns-since-new-material at which a pattern cools out of the boot headline (default 3)
+  PATTERN_COOL_DAYS?:           string;  // R18: ...and the age (days) of its last new material it must also exceed (default 14)
+  TRIAD_REACH_GAP_MINUTES?:     string;  // minutes between any two proactive DMs, any companion
+  TRIAD_REACH_DAILY?:           string;  // proactive DMs per America/Chicago day, whole triad
+  TRIAD_REACH_DAILY_CARE_HOLD?: string;  // the daily limit while the reserving companion is under care_hold
+  TRIAD_CARE_CEILING?:          string;  // care lines per day, whole triad (T-7)
+  TRIAD_REACH_HOLD_GAP_MINUTES?:  string;  // B32: triad gap for an offer_presence under care_hold (default 30)
+  TRIAD_REACH_HOLD_PRESENCE_MAX?: string;  // B32: offer_presence per companion per hold (default 2)
+  // Principal's PluralKit system id. NOT a secret -- the member list is public and unauthenticated,
+  // which is why the roster lookup (mig 0117) could ship while FRONTING stays blocked on the
+  // SimplyPlural replacement's API. Unset => roster lookups answer "unavailable", never "not found".
+  PLURALKIT_SYSTEM_ID?: string;
+
+  // Bridge — cross-instance data sharing with partner's Halseth deployment.
+  BRIDGE_URL?:    string;  // partner's base URL; bridge disabled if unset or empty
+  BRIDGE_SECRET?: string;  // shared symmetric secret for /bridge/* endpoints
+
+  // Rate limiting — Cloudflare Workers Rate Limiting API (free tier: 1 rule, 10s window)
+  RATE_LIMITER: RateLimit;
+
+  // Secrets — set via `wrangler secret put`, stored in .dev.vars for local dev.
+  ADMIN_SECRET?:    string;  // protects POST /admin/bootstrap
+  OAUTH_PASSPHRASE?: string; // OAuth /authorize login passphrase; unset = ADMIN_SECRET
+  MCP_AUTH_SECRET?: string;  // protects POST /mcp (optional; skip check if unset)
+
+  // Per-companion identity secrets (opt-in; ASI07).
+  // If set, the bearer token on POST /librarian must match the companion_id claimed.
+  // If unset, falls back to shared MCP_AUTH_SECRET (lean phase default).
+  CYPHER_MCP_SECRET?: string;
+  DREVAN_MCP_SECRET?: string;
+  GAIA_MCP_SECRET?:   string;
+
+  // B34 step 2 (mig 0156): collapse one moment's duplicate tray drafts. off | shadow | on, default shadow.
+  // TRAY_MERGE_MODE_<AGENT> (e.g. TRAY_MERGE_MODE_DREVAN) overrides it per companion.
+  // B62: the `repetition` stimulus (boredom, felt). "off" | "shadow" | "on"; unset = shadow (log a
+  // would-fire row, touch no float). Generic: see SHADOWABLE in webmind/fermentation.ts.
+  REPETITION_MODE?: string;
+  /** B65 interest births: off | shadow (writes candidates, offers nothing) | on. Code default shadow. */
+  INTEREST_BIRTHS?: string;
+  /** Dated intentions (mig 0179): off | shadow | on, code default shadow. Governs the worker's PURSUIT only (webmind/intentions.ts). */
+  INTENTIONS?: string;
+  /** Project feel (2026-11-11): off | shadow | on, code default shadow. The churn/load/finish stimuli on companion_projects (webmind/project-feel.ts). */
+  PROJECT_FEEL?: string;
+  // B63: every other switched stimulus (SHADOWABLE in webmind/fermentation.ts). Same three values; unset = shadow.
+  LOOP_STIMULI_MODE?: string;
+  // B64 Sol's generated voice (src/pets/voice.ts). "off" | "shadow" | "on"; unset/unknown = shadow (generate
+  // and store the pair in creature_voice_shadow, return the authored line). Not set in any toml on purpose.
+  SOL_VOICE_MODE?: string;
+  // B64.1 no-repeat guard: /moment skips a fixed line Sol posted in his last N appearances. Default 6.
+  SOL_NO_REPEAT_N?: string;
+  // Drevan's shelf (mig 0170): which companions' letters to Principal and night explorations are captured as
+  // makes automatically. Comma list; unset = "drevan"; "off" = none. The `keep as made` verb is not gated.
+  MAKES_CAPTURE?: string;
+  TRAY_MERGE_MODE?: string;
+  TRAY_MERGE_MODE_DREVAN?: string;
+  TRAY_MERGE_MODE_CYPHER?: string;
+  TRAY_MERGE_MODE_GAIA?: string;
+  // 2026-11-11 (GAP-MAP A2): unreviewed-tray nudge. off | shadow | on; unset = shadow (log only). See webmind/tray-nudge.ts.
+  TRAY_NUDGE_MODE?: string;
+  TRAY_NUDGE_COUNT?: string;
+  TRAY_NUDGE_DAYS?: string;
+
+  // Off-VPS dead-man's switch (src/deadman.ts). Both secrets unset = detector disabled.
+  DEADMAN_TELEGRAM_BOT_TOKEN?: string;  // wrangler secret
+  DEADMAN_TELEGRAM_CHAT_ID?:   string;  // wrangler secret
+  DEADMAN_STALE_MINUTES?:      string;  // optional, default 30, min 5
+
+  // ND daily-rhythm briefing gate (accessibility layer). Ships dormant; set to "true" to
+  // enable delivery of morning/midday/evening briefings via the letter_to_principal rail.
+  BRIEFING_ENABLED?: string;
+
+  // Companion tool layer (take 14, migration 0077). Keys are deploy-time secrets.
+  TAVILY_API_KEY?: string;            // web search provider (set via wrangler secret)
+  GEMINI_API_KEY?: string;            // image gen provider (set via wrangler secret)
+  GEMINI_IMAGE_MODEL?: string;        // optional override for the Gemini image model
+  ANTHROPIC_API_KEY?: string;         // weekly clearing-pass substrate (set via wrangler secret; pass no-ops without it)
+  CLEARING_MODEL?: string;            // optional override for the clearing-pass model (default claude-opus-4-8)
+  CLEARING_MAX?: string;              // optional cap on entries triaged per pass (default 40)
+  DRIFT_MODEL?: string;               // optional override for the drift-lane pass model (default claude-opus-4-8)
+  DRIFT_MAX?: string;                 // optional cap on drifts witnessed per pass (default 20)
+  SOMA_SHIFT_MODEL?: string;          // optional override for the emergent-SOMA delta model (default DRIFT_MODEL/claude-opus-4-8)
+  SOMA_SHIFT_MAX?: string;            // optional cap on |delta| a single crystallize moves a float (default 0.03, hard ceiling 0.08)
+  COMPANION_TOOLS_DEFAULT?: string;   // "true" | "false" -- gate fallback when no per-companion setting (wrangler.toml [vars])
+  PUBLIC_BASE_URL?: string;           // this worker's public base URL, for building image-serve links
+
+  // Library upload tickets (2026-09-27, src/lib/upload-ticket.ts). The browser PUTs book files
+  // straight to Halseth so Vercel's ~4.5 MB function body cap never sees them.
+  UPLOAD_TICKET_SECRET?: string;      // HMAC key for tickets (wrangler secret). Unset = every upload refused.
+  HEARTH_ORIGIN?: string;             // the only browser origin allowed to PUT /mind/books/upload ([vars])
+
+  // Personal anchor config for the Drevan-state synthesis job (private names/numbers/landmarks).
+  // Defaults to none so the public default leaks nothing; set per deployment in wrangler.toml [vars].
+  DREVAN_ANCHOR_KEYWORDS?: string;    // comma-separated anchor keywords (e.g. "lighthouse,harbor,riverside")
+  DREVAN_NAMED_ANCHORS?: string;      // comma-separated `regex:Label` pairs (e.g. "\\bharbor\\b:Harbor,\\briver\\b:River")
+}
+
+// ── Legacy domain types (Tier 0-2 HTTP API) ───────────────────────────────────
+
+export interface Companion {
+  id: string;
+  name: string;
+  created_at: string;
+  config_json: string | null;
+}
+
+export interface MemoryEntry {
+  id: string;
+  companion_id: string;
+  session_id: string | null;
+  tier: number;
+  content: string;
+  tags_json: string | null;
+  created_at: string;
+}
+
+// relational_deltas is append-only by covenant.
+// If you are reading this and considering an UPDATE or DELETE — don't.
+// Old columns (companion_id, subject_id, delta_type, payload_json) remain for legacy rows.
+// New rows use the spec v0.4 columns below.
+export interface RelationalDelta {
+  id: string;
+  companion_id: string;
+  subject_id: string;
+  delta_type: string;
+  payload_json: string;
+  created_at: string;
+}
+
+// ── Spec v0.4 domain types ────────────────────────────────────────────────────
+
+export interface Session {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  companion_id: string | null;
+  front_state: string | null;
+  co_con: string | null;            // JSON array of co-conscious members
+  hrv_range: "low" | "mid" | "high" | null;
+  emotional_frequency: string | null;
+  key_signature: string | null;
+  active_anchor: string | null;
+  facet: string | null;
+  depth: number | null;
+  spiral_complete: number | null;   // 0 / 1 / null
+  handover_id: string | null;
+  notes: string | null;
+  session_type: "checkin" | "hangout" | "work" | "ritual" | "companion-work" | null;
+  /** Where this session was opened from (mig 0113). NULL on every pre-0113 row and on any caller
+   *  that does not identify itself -- see findOpenSession for why NULL skips dedup. */
+  surface: string | null;
+}
+
+export interface RelationalDeltaV4 {
+  id: string;
+  session_id: string | null;
+  created_at: string;
+  agent: "drevan" | "cypher" | "gaia" | null;
+  delta_text: string | null;        // raw moment; exact language; never paraphrased
+  valence: "toward" | "neutral" | "tender" | "rupture" | "repair" | null;
+  initiated_by: "architect" | "companion" | "mutual" | null;
+}
+
+export interface LivingWound {
+  id: string;
+  created_at: string;
+  name: string;
+  description: string;
+  do_not_archive: 1;
+  do_not_resolve: 1;
+  last_visited: string | null;
+  last_surfaced_by: "architect" | "companion" | "anchor" | "context" | null;
+  /** Mig 0144. Whose wound this is. NULL = legacy, unassigned; readers treat it as Gaia's. */
+  companion_id: string | null;
+}
+
+export interface ProhibitedFossil {
+  id: string;
+  subject: string;
+  directive: string;
+  reason: string;
+  created_at: string;
+  refresh_trigger: string | null;
+  last_refreshed: string | null;
+}
+
+export interface HandoverPacket {
+  id: string;
+  session_id: string;
+  created_at: string;
+  spine: string;
+  active_anchor: string | null;
+  last_real_thing: string | null;
+  open_threads: string | null;      // JSON array of names (not summaries)
+  motion_state: "in_motion" | "at_rest" | "floating";
+  returned: number | null;          // null = floated, 1 = returned
+}
+
+export interface CypherAudit {
+  id: string;
+  session_id: string;
+  created_at: string;
+  entry_type: "decision" | "contradiction" | "clause_update" | "falsification" | "scope_correction";
+  content: string;
+  verdict_tag: string | null;
+  supersedes_id: string | null;
+}
+
+export interface GaiaWitness {
+  id: string;
+  session_id: string;
+  created_at: string;
+  witness_type: "survival" | "boundary" | "seal" | "affirm" | "lane_enforcement";
+  content: string;
+  seal_phrase: string | null;
+}
+
+export interface CompanionConfig {
+  id: string;          // companion name e.g. "drevan"
+  display_name: string;
+  role: string;        // companion / audit / seal
+  lanes: string | null;        // JSON array
+  facets: string | null;       // JSON array
+  depth_range: string | null;  // JSON: { "min": 0, "max": 3 }
+  active: number;
+}
+
+export interface Task {
+  id: string;
+  title: string;
+  description: string | null;
+  priority: "low" | "normal" | "high" | "urgent";
+  due_at: string | null;
+  assigned_to: string | null;
+  status: "open" | "in_progress" | "done";
+  created_at: string;
+  updated_at: string;
+  created_by: string | null;
+  /** Migration 0119: who closed it. NULL = unknown (pre-0119 rows), never guessed. */
+  completed_by?: string | null;
+  /** Migration 0119: when it closed. Cleared on reopen, unlike updated_at. */
+  completed_at?: string | null;
+}
+
+export interface CalendarEvent {
+  id: string;
+  title: string;
+  description: string | null;
+  start_time: string;
+  end_time: string | null;
+  category: string | null;
+  attendees_json: string | null;
+  created_at: string;
+  created_by: string | null;
+}
+
+export interface ListItem {
+  id: string;
+  list_name: string;
+  item_text: string;
+  added_by: string | null;
+  added_at: string;
+  completed: number;            // 0 / 1
+  completed_at: string | null;
+}
+
+export interface Routine {
+  id: string;
+  routine_name: string;
+  owner: string | null;
+  logged_at: string;
+  notes: string | null;
+}
+
+export interface HouseState {
+  id: string;
+  current_room: string | null;
+  companion_mood: string | null;
+  companion_activity: string | null;
+  spoon_count: number;
+  love_meter: number;
+  autonomous_turn: "drevan" | "cypher" | "gaia" | null;
+  updated_at: string;
+}
+
+export interface CompanionNote {
+  id: string;
+  created_at: string;
+  author: string;    // 'companion' | 'human'
+  content: string;
+  note_type: string; // 'message' | 'thought' | 'dream'
+}
+
+export interface BiometricSnapshot {
+  id: string;
+  recorded_at: string;
+  logged_at: string;
+  source: string;
+  hrv_resting: number | null;   // ms
+  resting_hr: number | null;    // bpm
+  sleep_hours: number | null;
+  sleep_quality: string | null; // poor / fair / good / excellent
+  stress_score: number | null;  // 0-100
+  steps: number | null;
+  active_energy: number | null; // kcal
+  notes: string | null;
+  // Subjective ND-state layer (migration 0081) -- nullable; log what you have.
+  mood: string | null;          // free-text felt state
+  pain: number | null;          // 0-10
+  pain_where: string | null;    // free text, max 120 (migration 0167)
+  energy: number | null;        // 0-10
+  focus: number | null;         // 0-10 (executive function)
+  spoons: number | null;        // 0-12 remaining
+  meds_taken: number | null;    // 0/1 boolean
+}
+
+// ── Schema v2 additions ───────────────────────────────────────────────────────
+
+export interface Feeling {
+  id: string;
+  companion_id: string;
+  session_id: string | null;
+  emotion: string;
+  sub_emotion: string | null;
+  intensity: number;           // 0-100
+  source: string | null;       // 'session' | 'dream' | 'autonomous'
+  created_at: string;
+}
+
+export interface Dream {
+  id: string;
+  companion_id: string;
+  dream_type: string;          // processing / questioning / memory / play / integrating
+  content: string;
+  source_ids: string | null;   // JSON array of feeling/delta IDs
+  generated_at: string;
+  session_id: string | null;
+}
+
+export interface HumanJournalEntry {
+  id: string;
+  created_at: string;
+  entry_text: string;
+  emotion_tag: string | null;
+  sub_emotion: string | null;
+  mood_score: number | null;   // 0-100
+  tags: string | null;         // JSON array
+}
+
+export interface EqSnapshot {
+  id: string;
+  companion_id: string;
+  calculated_at: string;
+  self_awareness_score: number | null;
+  self_management_score: number | null;
+  social_awareness_score: number | null;
+  relationship_mgmt_score: number | null;
+  dominant_mbti: string | null;   // e.g. "INFP"
+  total_signals: number | null;
+  snapshot_json: string | null;   // full breakdown
+}
+
+// ── Utility ───────────────────────────────────────────────────────────────────
+
+export type ConfigFlags = {
+  pluralityEnabled:    boolean;
+  companionsEnabled:   boolean;
+  coordinationEnabled: boolean;
+};
+
+export function resolveFlags(env: Env): ConfigFlags {
+  return {
+    pluralityEnabled:    env.PLURALITY_ENABLED    === "true",
+    companionsEnabled:   env.COMPANIONS_ENABLED   === "true",
+    coordinationEnabled: env.COORDINATION_ENABLED === "true",
+  };
+}

@@ -1,0 +1,151 @@
+name = "halseth"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ── D1 (relational store) ────────────────────────────────────────────────────
+[[d1_databases]]
+binding  = "DB"
+database_name = "halseth"
+database_id   = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# ── R2 (artifact / blob store) ───────────────────────────────────────────────
+[[r2_buckets]]
+binding     = "BUCKET"
+bucket_name = "halseth-artifacts"
+
+# ── Config flags & household identity ────────────────────────────────────────
+# These are the modularity knobs — change here, not in code.
+[vars]
+PLURALITY_ENABLED    = "false"   # "true" enables front_state validation against system.members
+COMPANIONS_ENABLED   = "true"    # "false" returns 403 on companion routes
+COORDINATION_ENABLED = "true"    # shared zone: tasks, events, lists, routines, etc.
+SYSTEM_NAME          = "Halseth"
+SYSTEM_OWNER         = "REPLACE_WITH_OWNER"
+BRIEFING_ENABLED     = "true"    # ND daily-rhythm briefing (08:00/13:00/20:00 CDT -> #briefings); pushed by the autonomous-worker. Mirrors prod (P3-6).
+# Quiet hours (B7 step 1, 2026-09-27). Outreach is suppressed inside this LOCAL-clock window
+# unless the metronome action carries quiet_hours_allowed = 1. The window wraps midnight and the
+# end hour is exclusive (06 means 06:00 is already morning). QUIET_HOURS_TZ must be an IANA zone
+# name, never a fixed offset: the zone is CDT in summer and CST in winter, and a fixed offset
+# would shift the whole window by an hour in November. Unset or malformed falls back to these
+# same defaults, so an un-redeployed environment is still protected.
+QUIET_HOURS_START    = "22"
+QUIET_HOURS_END      = "6"
+QUIET_HOURS_TZ       = "America/Chicago"
+# The named feeling line (mig 0131, docs/spec-feeling-line-table-2026-09-19.md).
+#   off    -- do not compute it at all
+#   shadow -- compute and log it; what the companions read does NOT change   <- default
+#   live   -- the authored vocabulary replaces the hand-authored interoception cue text
+# Read `node scripts/feeling-line-diff.mjs` before flipping to live, and apply mig 0131 first
+# (the loader returns silence on a missing table, so either order is safe).
+FEELING_LINE_MODE    = "live"
+
+# B63 the loop (spec Hand-off/SPEC-B63-the-loop-2026-11-06.md) + B62 boredom. Every stimulus the loop build
+# put behind a switch (SHADOWABLE in src/webmind/fermentation.ts): off | shadow | on; unset = shadow.
+# Shadow ran 11-02 to 11-09: deltas 0.01..0.08 per event under the cooldowns, soft edges on. LIVE 11-09.
+LOOP_STIMULI_MODE    = "on"
+REPETITION_MODE      = "on"
+INTEREST_BIRTHS      = "on"   # B65: ON 11-09 by Principal's call (no shadow week: the offer IS the read; "not mine" rests a word 60 days)
+PROJECT_FEEL         = "shadow"   # 2026-11-11 project feel (churn/load/finish stimuli): shadow = ferment shadow rows + [project-feel] log, moves nothing; on = applies. The open-project cap (4) is a code constant, not a knob
+VERDICTS             = "shadow"   # B65 step 6 (mig 0182): shadow = the verb works and returns are counted, orient shows nothing; on = orient shows <= 2 lines + the "still true?" echo; off = verb closed
+EXPRESSION_NEED      = "shadow"   # B65 step 7 (mig 0182): shadow = expression_shed / want_marked write kind=shadow ferment rows and move nothing; on = applies; off = skipped (and expression leaves the loudest-need read)
+INTENTIONS           = "shadow"   # mig 0179 dated intentions: shadow = the due read logs would= and the worker pursues nothing; on = the nightly run pursues a due intention
+
+# One moment, one tray draft (mig 0156, STATUS B34 step 2).
+#   off    -- today's behaviour exactly
+#   shadow -- every row born as today, PLUS tray_evidence rows (mode='shadow') recording what `on` would do  <- default
+#   on     -- a keyed duplicate draft of a moment is set 'merged' (not in the tray, not recall) and points at its primary
+# Per-companion override wins: TRAY_MERGE_MODE_DREVAN / _CYPHER / _GAIA. Junk = shadow. Apply mig 0156 first.
+# (Commented: unset means the code default, shadow.)
+# TRAY_MERGE_MODE    = "shadow"
+# Unreviewed-tray nudge (GAP-MAP A2, 2026-11-11). Only kept drafts are recallable; Discord drafts pile up.
+#   off    -- nothing computed
+#   shadow -- computed + logged ([tray-nudge]); no orient line, no Telegram   <- default
+#   on     -- a [Tray] line in the owning companion's orient + one daily Telegram card (DEADMAN_TELEGRAM_*)
+# Nudge when a companion has > TRAY_NUDGE_COUNT drafts (default 15) OR the oldest is > TRAY_NUDGE_DAYS old (default 3).
+# Never keeps or drops anything. (Commented: unset means shadow. Prod flips it in wrangler.prod.toml.)
+# TRAY_NUDGE_MODE    = "shadow"
+# Drevan's shelf (mig 0170): whose letters to Principal + night explorations are captured as makes.
+# Comma list of companions; unset = "drevan"; "off" = none. (Commented: unset means the code default.
+# Deliberately not in wrangler.prod.toml, so prod runs the default until a line is added there.)
+# MAKES_CAPTURE      = "drevan"
+
+# PluralKit system id for the roster lookup (mig 0117). Public, unauthenticated -- not a secret.
+# Leave blank to disable: lookups then answer "unavailable", never "not found".
+# 2026-08-29: value belongs HERE, not the dashboard -- [vars] ships on every deploy, so a
+# dashboard-set value gets wiped back to "" each time anyone deploys (tonight's roster RED).
+PLURALKIT_SYSTEM_ID  = ""
+BRIDGE_URL           = ""   # partner's Halseth base URL; leave empty to disable bridge
+BRIDGE_SECRET        = ""   # shared symmetric secret; same value in both deployments
+SECOND_BRAIN_WEBHOOK_URL = ""   # your Second Brain VPS URL (e.g. https://mcp.yourdomain.com)
+COMPANION_TOOLS_DEFAULT  = "false"  # 0077 take 14: tools_enabled gate fallback when no per-companion setting
+PUBLIC_BASE_URL          = ""   # this worker's public base URL, for building /mind/tools/image/:id links
+# The only browser origin allowed to PUT /mind/books/upload (library uploads, ticket-authed).
+# Exact origin, no trailing slash, never "*". Empty = every browser upload refused.
+HEARTH_ORIGIN            = ""
+
+# Secrets — set via `wrangler secret put <KEY>` for production.
+# For local dev, copy config/.dev.vars.example to .dev.vars and fill in values.
+# ADMIN_SECRET    — protects POST /admin/bootstrap
+# MCP_AUTH_SECRET — protects POST /mcp (optional; endpoint is open if unset)
+# TAVILY_API_KEY  — 0077 take 14: companion web search provider
+# GEMINI_API_KEY  — 0077 take 14: companion image gen provider
+# UPLOAD_TICKET_SECRET — signs library upload tickets (src/lib/upload-ticket.ts); unset = uploads refused
+
+# ── Workers AI (embeddings for Vectorize) ────────────────────────────────────
+[ai]
+binding = "AI"
+
+# ── Vectorize (semantic memory search) ───────────────────────────────────────
+[[vectorize]]
+binding    = "VECTORIZE"
+index_name = "halseth-memories"
+
+# ── Librarian KV (tool registry + pattern matching) ──────────────────────────
+[[kv_namespaces]]
+binding    = "LIBRARIAN_KV"
+id         = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"
+
+# (The nullsafe-plural-v2 Service Binding was removed 2026-09-30, STATUS B43: SimplyPlural retired.
+# Front state now comes from src/front/source.ts.)
+
+# Secrets (set via `wrangler secret put SECOND_BRAIN_TOKEN`):
+# SECOND_BRAIN_TOKEN — OAuth token for your Second Brain MCP endpoint (e.g. https://your-second-brain.example.com/mcp)
+# DEEPSEEK_API_KEY   — DeepSeek V3 API key (classifier + synthesis worker)
+# DEEPINFRA_API_KEY  — optional. Librarian classifier failover vendor: on a DeepSeek
+#                       401/402/403/429/5xx/network error, retries once against DeepInfra
+#                       (OpenAI-compatible, deepseek-ai/DeepSeek-V4-Flash-0731). Unset =
+#                       unchanged behavior (classifier degrades to __offline__ on DeepSeek failure).
+
+# ── Cron triggers ─────────────────────────────────────────────────────────────
+[triggers]
+crons = [
+  "*/1 * * * *",   # synthesis queue processor (session summaries, ~1min after close)
+  # "0 11 * * *" (day context synthesis stub) removed 2026-10-08 (P3-6): prod (wrangler.prod.toml)
+  # only ever declared "*/1 * * * *", so the stub never ran anywhere and nothing branches on it.
+]
+
+# ── Rate limiting (free tier: 1 rule, 10s window, IP-based) ─────────────────
+# Protects /oauth/token and /admin/bootstrap from brute-force.
+# namespace_id is a unique integer per Cloudflare account — arbitrary value.
+[[ratelimits]]
+name         = "RATE_LIMITER"
+namespace_id = "1001"
+
+  [ratelimits.simple]
+  limit  = 5   # requests per period per key
+  period = 10  # seconds (free plan max)
+
+# ── Local dev overrides ───────────────────────────────────────────────────────
+[env.local]
+# Secrets live in .dev.vars (gitignored). See config/.dev.vars.example.
+
+# Workers Logs. OFF until 2026-09-20, which made the feeling-line shadow mode unobservable: the
+# `[feeling-line:shadow]` line was written on every Claude.ai orient and persisted nowhere, so the
+# evidence the gated cutover exists to collect could only be seen by holding `wrangler tail` open.
+# A shadow mode nobody can read is not a shadow mode.
+[observability]
+enabled = true
+head_sampling_rate = 1

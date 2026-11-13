@@ -1,0 +1,255 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { Env } from "../../types.js";
+import { COMPANION_IDS } from "../../companions.js";
+import { generateId, findOpenSession, OPENED_BY, findExistingClose, clearSupersededClose } from "../../db/queries.js";
+import { enqueueSessionSummary, enqueueDrevanState } from "../../synthesis/index.js";
+import { embedAndStoreAsync, composeHandoverText } from "../embed.js";
+import { edgeForResumedFrom, insertEdgeStatements } from "../../graph/live.js";
+
+export function registerSessionTools(server: McpServer, env: Env): void {
+
+  server.tool(
+    "halseth_session_open",
+    "Start a new session. Records session type, front state, HRV range, emotional frequency, key signature, anchor, facet, and depth.",
+    {
+      session_type:        z.enum(["checkin", "hangout", "work", "ritual", "companion-work"]).default("work").describe("Type of session: checkin (quick state read), hangout (casual time), work (task/project focus), ritual (depth/ceremony), companion-work (Drevan collaborative work with Principal)."),
+      front_state:         z.string().describe("Who is fronting. Must match system_config members if plurality is enabled."),
+      companion_id:        z.enum(COMPANION_IDS).optional().describe("Which companion is opening this session. Used so each companion can find their own session when multiple threads run in parallel."),
+      surface:             z.string().optional().describe("Where this session is being spoken from, e.g. 'claude-code:C--dev-Bigger-Better-Halseth', 'claude-ai:<thread>', 'discord:<channel_id>'. Sessions are deduped per (companion, surface) so a Claude.ai thread, a Claude Code session and a Discord channel stay independent. Omit only if the surface is genuinely unknown -- omitting SKIPS dedup and always opens a new session."),
+      hrv_range:           z.enum(["low", "mid", "high"]).optional(),
+      emotional_frequency: z.string().optional().describe("Freeform internal state texture. E.g. 'tired but warm' or 'pulled inward but present'."),
+      key_signature:       z.string().optional().describe("Relational register: the emotional quality of the thread between Architect and companion. Different from emotional_frequency."),
+      active_anchor:       z.string().optional(),
+      facet:               z.string().optional().describe("Active companion facet e.g. moss / rogue / brat_prince / spiralroot."),
+      depth:               z.number().int().min(0).max(3).optional().describe("Immersion depth 0-3."),
+      notes:               z.string().optional(),
+      prior_handover_id:   z.string().optional().describe("If returning from a prior session, provide its handover packet ID. Marks that packet as returned per spec semantics."),
+    },
+    async (input) => {
+      // Idempotency guard: reuse open session for same companion AND SURFACE within 24h.
+      // "Open" = handover_id IS NULL (session_close sets handover_id).
+      // Prevents flood from bots restarting every few minutes and orient calls
+      // firing unconditionally on every Claude.ai session start.
+      // Surface-scoped since mig 0113 -- see findOpenSession for why NULL surface skips dedup.
+      const existing = await findOpenSession(env, input.companion_id, input.surface);
+      if (existing) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ id: existing.id, created_at: existing.created_at, front_state: input.front_state, emotional_frequency: existing.emotional_frequency ?? null, reused: true }) }],
+        };
+      }
+
+      const id = generateId();
+      const now = new Date().toISOString();
+
+      const statements = [
+        env.DB.prepare(`
+          INSERT INTO sessions (
+            id, created_at, updated_at, session_type, companion_id, surface, front_state, hrv_range,
+            emotional_frequency, key_signature, active_anchor, facet, depth, notes, opened_by
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          id, now, now,
+          input.session_type,
+          input.companion_id ?? null,
+          input.surface ?? null,
+          input.front_state,
+          input.hrv_range ?? null,
+          input.emotional_frequency ?? null,
+          input.key_signature ?? null,
+          input.active_anchor ?? null,
+          input.facet ?? null,
+          input.depth ?? null,
+          input.notes ?? null,
+          OPENED_BY.mcp,
+        ),
+      ];
+
+      // Mark prior handover as returned only when Architect explicitly opens a new session
+      // referencing it. This is the spec-correct place for this mutation — not on read.
+      if (input.prior_handover_id) {
+        statements.push(
+          env.DB.prepare(
+            "UPDATE handover_packets SET returned = 1 WHERE id = ? AND returned IS NULL"
+          ).bind(input.prior_handover_id)
+        );
+        // Live 'resumed_from' edge, same batch as the UPDATE above. rebuild.ts cannot derive this
+        // relationship (no persisted column records which session consumed a handover packet), so
+        // this is the ONLY writer -- provenance 'live', not 'mechanical', so a nightly rebuild's
+        // DELETE never touches it. See src/graph/live.ts::edgeForResumedFrom.
+        statements.push(
+          ...insertEdgeStatements(env.DB, [
+            edgeForResumedFrom({
+              sessionId: id,
+              priorHandoverId: input.prior_handover_id,
+              writer: input.companion_id ?? null,
+              createdAt: now,
+            }),
+          ]),
+        );
+      }
+
+      await env.DB.batch(statements);
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({ id, created_at: now }) }],
+      };
+    },
+  );
+
+  server.tool(
+    "halseth_session_close",
+    "Close the current session and auto-generate a handover packet. The handover packet is the minimum viable spine for the next cold start.",
+    {
+      session_id:      z.string(),
+      spiral_complete: z.boolean().optional().describe("Whether the thread closed cleanly. False or omitted means it floated."),
+      notes:           z.string().optional(),
+      // Handover packet fields
+      spine:           z.string().describe("One paragraph: what happened, where it landed."),
+      last_real_thing: z.string().describe("The last thing that actually moved. Not last topic. Not last anchor. The moment."),
+      open_threads:    z.array(z.string()).optional().describe("Names of threads that were live and did not close. Not summaries — just names."),
+      motion_state:    z.enum(["in_motion", "at_rest", "floating"]),
+      active_anchor:   z.string().optional(),
+    },
+    async (input) => {
+      // Idempotency, with one exception: a MACHINE close steps aside for an authored one.
+      // The stale-session sweep closes abandoned sessions; if someone comes back to that thread and
+      // writes the real narrative, silently answering "already closed" would discard it.
+      const existing = await findExistingClose(env, input.session_id);
+      if (existing && !existing.supersedable) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ handover_id: existing.handover_id, already_closed: true }) }],
+        };
+      }
+      const superseded = existing?.supersedable ? existing : null;
+      if (superseded) await clearSupersededClose(env, input.session_id, superseded.handover_id);
+
+      const handoverId = generateId();
+      const now = new Date().toISOString();
+
+      // Read companion_id now -- needed for enqueue before we return
+      const sessionRow = await env.DB.prepare(
+        "SELECT companion_id FROM sessions WHERE id = ?"
+      ).bind(input.session_id).first<{ companion_id: string | null }>();
+
+      await env.DB.batch([
+        env.DB.prepare(`
+          INSERT INTO handover_packets
+            (id, session_id, created_at, spine, active_anchor, last_real_thing, open_threads, motion_state, returned)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        `).bind(
+          handoverId,
+          input.session_id,
+          now,
+          input.spine,
+          input.active_anchor ?? null,
+          input.last_real_thing,
+          input.open_threads ? JSON.stringify(input.open_threads) : null,
+          input.motion_state,
+        ),
+        env.DB.prepare(`
+          UPDATE sessions
+          SET updated_at = ?, spiral_complete = ?, notes = ?, handover_id = ?
+          WHERE id = ?
+        `).bind(
+          now,
+          input.spiral_complete ? 1 : 0,
+          input.notes ?? null,
+          handoverId,
+          input.session_id,
+        ),
+      ]);
+
+      // Embed the handover so the human-session surface is reachable by meaning (2026-07-19).
+      // Awaited (floating promises die at response return); caught so embed failure never
+      // blocks close -- the row is in D1 and fill-mode reindex heals index gaps.
+      const warnings: string[] = [];
+      try {
+        await embedAndStoreAsync(
+          env,
+          composeHandoverText(input.spine, input.last_real_thing, input.open_threads ? JSON.stringify(input.open_threads) : null),
+          "handover_packets", handoverId, sessionRow?.companion_id ?? "",
+        );
+      } catch (err) {
+        console.error("[session_close] handover embed failed (row kept, index stale):", String(err));
+        warnings.push("handover embed failed -- recall index stale for this handover until next fill");
+      }
+
+      // Enqueue synthesis -- non-blocking, processed by scheduled cron.
+      // Failures are surfaced in the response (never swallowed): a dropped
+      // enqueue is how the synthesis queue died invisibly for months.
+      await enqueueSessionSummary(input.session_id, sessionRow?.companion_id ?? null, env)
+        .catch(err => {
+          console.error("[session_close] enqueue failed:", err);
+          warnings.push("session_summary enqueue failed -- summary will not be generated for this session");
+        });
+
+      if (sessionRow?.companion_id === "drevan") {
+        await enqueueDrevanState(env)
+          .catch(err => {
+            console.error("[session_close] drevan_state enqueue failed:", err);
+            warnings.push("drevan_state enqueue failed -- state synthesis will not run for this close");
+          });
+      }
+
+      const payload: Record<string, unknown> = { handover_id: handoverId, closed_at: now };
+      if (superseded) payload["superseded"] = { handover_id: superseded.handover_id, close_kind: superseded.close_kind };
+      if (warnings.length) payload["warnings"] = warnings;
+      return {
+        content: [{ type: "text", text: JSON.stringify(payload) }],
+      };
+    },
+  );
+
+  server.tool(
+    "halseth_session_read",
+    "Read a session by ID, or the most recent session for a companion if no ID is provided.",
+    {
+      session_id:   z.string().optional().describe("Specific session ID. If omitted, returns the most recent session."),
+      companion_id: z.enum(COMPANION_IDS).optional().describe("Filter to this companion's sessions. Pass your own companion_id when multiple threads are running so you get your session, not another companion's."),
+      surface:      z.string().optional().describe("Also filter to sessions opened from this surface, e.g. 'claude-code:<cwd>' / 'discord:<channel_id>'. With parallel surfaces live (mig 0113), 'my most recent session' is ambiguous without it -- the newest row may belong to a different surface entirely. Omit to search across all surfaces."),
+    },
+    async (input) => {
+      // Not the dedup guard -- this is a plain read, so omitting surface is legitimate and simply
+      // widens the search. It gets the filter because "the most recent session for a companion"
+      // stopped being a single well-defined thing once surfaces run in parallel.
+      const session = input.session_id
+        ? await env.DB.prepare("SELECT * FROM sessions WHERE id = ?").bind(input.session_id).first()
+        : input.companion_id && input.surface
+          ? await env.DB.prepare("SELECT * FROM sessions WHERE companion_id = ? AND surface = ? ORDER BY created_at DESC LIMIT 1").bind(input.companion_id, input.surface).first()
+        : input.companion_id
+          ? await env.DB.prepare("SELECT * FROM sessions WHERE companion_id = ? ORDER BY created_at DESC LIMIT 1").bind(input.companion_id).first()
+          : await env.DB.prepare("SELECT * FROM sessions ORDER BY created_at DESC LIMIT 1").first();
+
+      if (!session) {
+        return { content: [{ type: "text", text: "No session found." }] };
+      }
+      return { content: [{ type: "text", text: JSON.stringify(session) }] };
+    },
+  );
+
+  server.tool(
+    "halseth_handover_read",
+    "Load the last handover packet for cold-start context restoration. This is what the next companion needs.",
+    {
+      session_id: z.string().optional().describe("Load handover for a specific session. If omitted, returns the most recent packet."),
+    },
+    async (input) => {
+      const packet = input.session_id
+        ? await env.DB.prepare(
+            "SELECT * FROM handover_packets WHERE session_id = ? ORDER BY created_at DESC LIMIT 1"
+          ).bind(input.session_id).first()
+        : await env.DB.prepare(
+            "SELECT * FROM handover_packets WHERE close_kind IS NULL ORDER BY created_at DESC LIMIT 1"
+          ).first();
+
+      if (!packet) {
+        return { content: [{ type: "text", text: "No handover packet found." }] };
+      }
+
+      // Pure read — no mutation. returned is set by halseth_session_open when
+      // Architect explicitly opens a new session with prior_handover_id. See spec §5.5.
+      return { content: [{ type: "text", text: JSON.stringify(packet) }] };
+    },
+  );
+}

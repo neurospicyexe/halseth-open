@@ -1,0 +1,263 @@
+// src/care/tick.ts
+//
+// The care-loop detection rider (consequence layer C1). Rides runScheduledWork like every other
+// autonomic tick: self-gates hourly on its OWN stamp (companion_settings 'system'/'care_tick_at'),
+// gathers the signals with READS ONLY, runs the pure rule table (src/care/rules.ts), and logs
+// firings to care_actions with exactly one assigned companion each.
+//
+// THE ANCHOR RULE (ferment-tick lesson, fermentation.ts:165-168): this tick never writes the
+// anchors it reads. Owner activity, biometrics, routines, the relational_need drive -- all of them
+// stay untouched, or the detector becomes a phantom contact and silences itself. The only writes
+// here are care_actions INSERTs and the tick's own gate stamp, which no rule reads.
+
+import { loopFire } from "../webmind/loop-stimuli.js";
+import type { Env } from "../types.js";
+import { hoursSinceIso } from "../webmind/drives.js";
+import { readOwnerLastSeen } from "./owner-activity.js";
+import {
+  evaluateCareRules,
+  assignCompanion,
+  evaluateEscalationRules,
+  assignEscalationCompanion,
+  PENDING_DECAY_HOURS,
+  ESC_REDLINE_HOURS,
+  type CareSignals,
+  type CareRule,
+  type EscalationSignals,
+  type EscalationRule,
+} from "./rules.js";
+import { missingVoidedAt, onlyIf } from "./schema-gap.js";
+
+const TICK_GATE_HOURS = 1;
+
+function newId(): string {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+/** Hours since an ISO/D1 timestamp, or null when the timestamp itself is absent. hoursSinceIso
+ *  coerces null to 0, which here would read "no signal ever" as "signal just now" -- the exact
+ *  absent-vs-zero conflation the rule table refuses. */
+function ageHoursOrNull(iso: string | null | undefined, nowMs: number): number | null {
+  return iso ? hoursSinceIso(iso, nowMs) : null;
+}
+
+/** The newest DM "taken" for a DAILY slot. outcome = 'taken' is load-bearing: a stated miss
+ *  (mig 0141) must never count as confirmation, or a "forgot the morning one" would hide an
+ *  esc_meds gap from Spouse. Exported so a real-schema test runs this exact text. */
+export const MED_DM_TAKEN_SQL =
+  `SELECT MAX(a.answered_at) AS at FROM med_answers a
+   JOIN med_schedule s ON s.slot_key = a.slot_key WHERE s.weekday_mask = 127 AND a.outcome = 'taken'`;
+/** The same read on a DB before 0141 (no outcome column, so every row is a taken). */
+export const MED_DM_TAKEN_SQL_PRE_0141 =
+  `SELECT MAX(a.answered_at) AS at FROM med_answers a
+   JOIN med_schedule s ON s.slot_key = a.slot_key WHERE s.weekday_mask = 127`;
+
+/** Per-rule last firing (cooldown) and the rules with a live pending firing; voided rows excluded
+ *  (mig 0155), with the pre-0155 text as the fallback. Exported so a real-schema test runs them. */
+export const FIRED_SQL = `SELECT rule, MAX(detected_at) AS at FROM care_actions WHERE voided_at IS NULL GROUP BY rule`;
+export const FIRED_SQL_PRE_0155 = `SELECT rule, MAX(detected_at) AS at FROM care_actions GROUP BY rule`;
+export const PENDING_RULES_SQL =
+  `SELECT DISTINCT rule FROM care_actions WHERE acted_at IS NULL AND voided_at IS NULL AND detected_at > ?`;
+export const PENDING_RULES_SQL_PRE_0155 =
+  `SELECT DISTINCT rule FROM care_actions WHERE acted_at IS NULL AND detected_at > ?`;
+
+/** The newest wellness-bridge row that carries a derived score (B8). recorded_at is the end of the
+ *  wearable DAY (capped at fetch time), so its age is the age of the data, not of the bridge run.
+ *  Exported so a real-schema test runs this exact text. */
+export const STRESS_ROW_SQL =
+  `SELECT recorded_at, stress_score FROM biometric_snapshots
+   WHERE source = 'wellness' AND stress_score IS NOT NULL ORDER BY recorded_at DESC LIMIT 1`;
+
+/** The fresher of two ages; null only when both are null ("never confirmed" stays absent). */
+export function newestAge(a: number | null, b: number | null): number | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return Math.min(a, b);
+}
+
+export async function runCareTick(
+  env: Env,
+  nowMs = Date.now(),
+  opts: { force?: boolean } = {},
+): Promise<{ fired: number; skipped?: string }> {
+  // Self-gate: at most one evaluation per hour, taken as a CONDITIONAL CLAIM rather than
+  // check-then-act (reviewer, 2026-08-17): the every-minute kick-script and the CF scheduled()
+  // handler are two live drivers, and two overlapping runs at an hour boundary both passed the
+  // old SELECT gate, double-inserting escalations -- two DMs to a human for one condition.
+  // The claim UPDATE succeeds for exactly one caller. Trade-off accepted: a crash mid-run now
+  // skips up to an hour instead of retrying within it; care conditions persist across an hour,
+  // a duplicate page to Spouse does not un-happen. `force` (the /admin/care-tick live-fire door)
+  // skips the gate but never the rule cooldowns: even a forced pass cannot nag.
+  if (!opts.force) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO companion_settings (companion_id, key, value, updated_at)
+       VALUES ('system', 'care_tick_at', '1970-01-01T00:00:00.000Z', datetime('now'))`,
+    ).run();
+    const cutoff = new Date(nowMs - TICK_GATE_HOURS * 3_600_000).toISOString();
+    const claim = await env.DB.prepare(
+      `UPDATE companion_settings SET value = ?, updated_at = datetime('now')
+       WHERE companion_id = 'system' AND key = 'care_tick_at' AND value <= ?`,
+    ).bind(new Date(nowMs).toISOString(), cutoff).run();
+    if ((claim.meta?.changes ?? 0) === 0) {
+      return { fired: 0, skipped: "gate" };
+    }
+  }
+
+  // ── Gather signals (reads only) ──────────────────────────────────────────────
+  const [bio, meds, medsDm, ownerLast, firedRows, pendingRows, stressRow] = await Promise.all([
+    // Latest reading by recorded_at, matching orient's ordering (webmind/orient.ts) so the
+    // register tier and the rule table never disagree about which row is "latest".
+    env.DB.prepare(
+      `SELECT recorded_at, mood, spoons, meds_taken FROM biometric_snapshots WHERE source IS NOT 'wellness' ORDER BY recorded_at DESC LIMIT 1`,
+    ).first<{ recorded_at: string; mood: string | null; spoons: number | null; meds_taken: number | null }>(),
+    env.DB.prepare(
+      `SELECT MAX(logged_at) AS at FROM routines WHERE lower(routine_name) LIKE '%med%'`,
+    ).first<{ at: string | null }>(),
+    // A "taken" answered to a med_reminder DM (mig 0136) is the same fact as checking the meds
+    // routine off on Hearth (Principal, 2026-09-28: "it should accept both"). Only DAILY slots count
+    // (weekday_mask 127): a weekly dose confirmed on a Wednesday must not stand in for three days
+    // of daily meds and hide an esc_meds gap from Spouse. Since mig 0141 med_answers also holds a
+    // STATED miss ("I missed the morning one"); only outcome = 'taken' is confirmation, so a stated
+    // miss behaves here EXACTLY as no answer does (ruling 2026-10-01: escalation semantics are
+    // unchanged). This can still only make meds_missed / esc_meds fire LESS, never report
+    // "not taken" (P-2).
+    // A failed read falls back in two steps: without the outcome filter (a DB before 0141 has no
+    // column, and so no stated-miss rows: every row there IS a taken), then to the routine alone
+    // (no table: the pre-0136 behaviour), instead of taking the whole care tick down.
+    env.DB.prepare(MED_DM_TAKEN_SQL).first<{ at: string | null }>()
+      .catch(() => env.DB.prepare(MED_DM_TAKEN_SQL_PRE_0141).first<{ at: string | null }>())
+      .catch(() => null),
+    // Owner activity across every surface D1 can see -- the shared read (care/owner-activity.ts),
+    // one lane one filter with the C6 quiet-owner detector. The denominator is stated in the
+    // detail line the rule table builds -- a silence claim must name what it checked.
+    readOwnerLastSeen(env),
+    // A voided firing (a check-in undo, mig 0155) neither holds the cooldown nor blocks as pending:
+    // the reading it came from is gone. Before 0155 nothing is voided, so the plain read is the same;
+    // only the missing column falls back (anything else fails the run and the next kick retries).
+    env.DB.prepare(FIRED_SQL).all<{ rule: CareRule; at: string }>()
+      .catch(onlyIf(missingVoidedAt, () => env.DB.prepare(FIRED_SQL_PRE_0155).all<{ rule: CareRule; at: string }>())),
+    // Un-acted, un-decayed firings: while one exists for a rule, that rule must not fire again --
+    // otherwise two pendings for one condition end up assigned to two companions and the
+    // one-gesture rail breaks structurally.
+    (() => {
+      const cutoff = new Date(nowMs - PENDING_DECAY_HOURS * 3_600_000).toISOString();
+      return env.DB.prepare(PENDING_RULES_SQL).bind(cutoff).all<{ rule: CareRule }>()
+        .catch(onlyIf(missingVoidedAt, () => env.DB.prepare(PENDING_RULES_SQL_PRE_0155).bind(cutoff).all<{ rule: CareRule }>()));
+    })(),
+    // B8: the wellness bridge's newest scored day. A failed read is "no signal", never a firing.
+    env.DB.prepare(STRESS_ROW_SQL).first<{ recorded_at: string; stress_score: number }>().catch(() => null),
+  ]);
+
+  const lastFired: Partial<Record<CareRule, number>> = {};
+  for (const r of firedRows.results ?? []) {
+    if (r.at) lastFired[r.rule] = hoursSinceIso(r.at, nowMs);
+  }
+  const pendingRules = new Set((pendingRows.results ?? []).map(r => r.rule));
+
+  const signals: CareSignals = {
+    spoons: bio?.spoons ?? null,
+    mood: bio?.mood ?? null,
+    meds_taken: bio?.meds_taken ?? null,
+    biometrics_age_hours: ageHoursOrNull(bio?.recorded_at, nowMs),
+    meds_logged_age_hours: newestAge(ageHoursOrNull(meds?.at, nowMs), ageHoursOrNull(medsDm?.at, nowMs)),
+    owner_silence_hours: ageHoursOrNull(ownerLast?.at, nowMs),
+    owner_last_source: ownerLast?.source ?? null,
+    last_fired_hours: lastFired,
+    stress_score: stressRow?.stress_score ?? null,
+    stress_age_hours: ageHoursOrNull(stressRow?.recorded_at, nowMs),
+  };
+
+  const firings = evaluateCareRules(signals).filter(f => !pendingRules.has(f.rule));
+
+  const dayIndex = Math.floor(nowMs / 86_400_000);
+  const detectedAt = new Date(nowMs).toISOString();
+  for (const f of firings) {
+    const companion = assignCompanion(f.rule, dayIndex);
+    try {
+      await env.DB.prepare(
+        `INSERT INTO care_actions (id, rule, companion_id, detail, detected_at) VALUES (?, ?, ?, ?, ?)`,
+      ).bind(newId(), f.rule, companion, f.detail, detectedAt).run();
+    } catch (e) {
+      // Before mig 0162 the rule CHECK refuses 'stress_elevated': skip THAT firing, never the tick.
+      // Every other rule's insert failing stays loud, as before.
+      if (f.rule === "stress_elevated" && /CHECK constraint/i.test(String(e))) {
+        console.warn("[care] stress_elevated skipped: care_actions predates mig 0162");
+        continue;
+      }
+      throw e;
+    }
+    console.log(`[care] rule fired: ${f.rule} -> ${companion} (${f.detail})`);
+  }
+
+  // ── Tier 3: escalation to Spouse (R1, 2026-08-17) -- same gate, its own reads/cooldowns ──────
+  const escFired = await runEscalationPass(env, signals, nowMs, dayIndex, detectedAt);
+
+  // The gate stamp moved to the ENTRY claim (see above) -- stamping here again would be a
+  // second writer on the same anchor for no benefit.
+
+  return { fired: firings.length + escFired };
+}
+
+/** The tier-3 pass. Reads its own evidence (48h report window, escalation cooldowns, undelivered
+ *  rows) and reuses the already-gathered shared signals. Never throws into the tick: an escalation
+ *  detection failure must not take the tier-2 gestures down with it. */
+async function runEscalationPass(
+  env: Env,
+  shared: CareSignals,
+  nowMs: number,
+  dayIndex: number,
+  detectedAt: string,
+): Promise<number> {
+  try {
+    const [reportRows, escFiredRows, escPendingRows] = await Promise.all([
+      env.DB.prepare(
+        `SELECT recorded_at, mood, spoons FROM biometric_snapshots WHERE recorded_at > ? AND source IS NOT 'wellness' ORDER BY recorded_at DESC`,
+      ).bind(new Date(nowMs - ESC_REDLINE_HOURS * 3_600_000).toISOString()).all<{ recorded_at: string; mood: string | null; spoons: number | null }>(),
+      env.DB.prepare(
+        `SELECT rule, MAX(detected_at) AS at FROM care_escalations GROUP BY rule`,
+      ).all<{ rule: EscalationRule; at: string }>(),
+      // An undelivered escalation blocks re-fire for its rule, with NO decay: silent expiry is
+      // the one failure mode this tier exists to prevent. Delivery failure is the worker's loud
+      // problem, not a reason to write a second row.
+      env.DB.prepare(
+        `SELECT DISTINCT rule FROM care_escalations WHERE delivered_at IS NULL`,
+      ).all<{ rule: EscalationRule }>(),
+    ]);
+
+    const lastEscalated: Partial<Record<EscalationRule, number>> = {};
+    for (const r of escFiredRows.results ?? []) {
+      if (r.at) lastEscalated[r.rule] = hoursSinceIso(r.at, nowMs);
+    }
+    const pending = new Set((escPendingRows.results ?? []).map(r => r.rule));
+
+    const escSignals: EscalationSignals = {
+      meds_logged_age_hours: shared.meds_logged_age_hours,
+      meds_taken: shared.meds_taken,
+      biometrics_age_hours: shared.biometrics_age_hours,
+      owner_silence_hours: shared.owner_silence_hours,
+      owner_last_source: shared.owner_last_source,
+      recent_reports: (reportRows.results ?? []).map(r => ({
+        spoons: r.spoons,
+        mood: r.mood,
+        age_hours: hoursSinceIso(r.recorded_at, nowMs),
+      })),
+      last_escalated_hours: lastEscalated,
+    };
+
+    const escalations = evaluateEscalationRules(escSignals).filter(f => !pending.has(f.rule));
+    for (const f of escalations) {
+      const companion = assignEscalationCompanion(f.rule, dayIndex);
+      await env.DB.prepare(
+        `INSERT INTO care_escalations (id, rule, companion_id, detail, detected_at) VALUES (?, ?, ?, ?, ?)`,
+      ).bind(newId(), f.rule, companion, f.detail, detectedAt).run();
+      console.log(`[care] ESCALATION fired: ${f.rule} -> ${companion} (${f.detail})`);
+      // B63 pulled_to_speed: an escalation firing pulls Gaia toward speed (stillness down). Cause names the
+      // KIND, never the rule (the rule is health data).
+      await loopFire(env, "pulled_to_speed", "gaia", "a care escalation fired");
+    }
+    return escalations.length;
+  } catch (e) {
+    console.error("[care] escalation pass failed (tier-2 unaffected):", String(e));
+    return 0;
+  }
+}

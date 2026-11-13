@@ -1,0 +1,163 @@
+import { ExecutorContext, ExecutorResult } from "./types.js";
+import { extractCompanionFromRequest } from "../lib/companion.js";
+import { KEPT_SQL, KEPT_LIVE_SQL } from "../../webmind/review-state.js";
+import { roomLabelFromTags } from "../../mind/room-label.js";
+import {
+  feelingsRead, journalRead, woundRead, deltaRead,
+  dreamsRead, dreamSeedRead, eqRead, routineRead, listRead, eventList,
+  houseRead, personalityRead, biometricRead, auditRead, sessionRead, fossilCheck,
+  companionNotesRead, signalAuditRead,
+} from "../backends/halseth.js";
+
+export async function execFeelingsRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await feelingsRead(ctx.env, ctx.req.companion_id), meta: { operation: "halseth_feelings_read" } };
+}
+
+export async function execJournalRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (ctx.req.companion_id) {
+    // "Read my journal" spans BOTH journals: companion_journal holds the companion's
+    // own reflections (companion_note_add unaddressed, held_mark, session witness
+    // notes); growth_journal holds the autonomous-worker growth ledger. Reading only
+    // growth_journal left every self-written entry invisible to the canonical verb.
+    // human_journal stays Principal's personal store -- never returned here.
+    const [own, growth] = await Promise.all([
+      ctx.env.DB.prepare(
+        // KEPT_SQL (mig 0132): drafts (own speech, judge notes) wait in "my tray"; "read my journal" is memory.
+        `SELECT id, note_text AS content, tags, source, created_at FROM companion_journal WHERE agent = ? AND ${KEPT_LIVE_SQL} ORDER BY created_at DESC LIMIT 10`
+      ).bind(ctx.req.companion_id).all<Record<string, unknown> & { created_at: string | null }>(),
+      ctx.env.DB.prepare(
+        "SELECT id, entry_type, content, tags_json, created_at FROM growth_journal WHERE companion_id = ? ORDER BY created_at DESC LIMIT 10"
+      ).bind(ctx.req.companion_id).all<Record<string, unknown> & { created_at: string | null }>(),
+    ]);
+    const rows = [
+      // `room` (2026-10-05): "(#movie-night, Nullsafe Halseth)" from the row's own `room:` tag, null otherwise.
+      ...(own.results ?? []).map((r) => ({ ...r, room: roomLabelFromTags(r["tags"]), journal: "companion_journal" })),
+      ...(growth.results ?? []).map((r) => ({ ...r, journal: "growth_journal" })),
+    ].sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")));
+    return { data: rows, meta: { operation: "halseth_journal_read", companion_id: ctx.req.companion_id } };
+  }
+  return { data: await journalRead(ctx.env), meta: { operation: "halseth_journal_read" } };
+}
+
+export async function execWoundRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await woundRead(ctx.env, ctx.req.companion_id), meta: { operation: "halseth_wound_read", companion_id: ctx.req.companion_id } };
+}
+
+export async function execDeltaRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const target = extractCompanionFromRequest(ctx.req.request, ctx.req.companion_id) ?? ctx.req.companion_id;
+  return { data: await deltaRead(ctx.env, target), meta: { operation: "halseth_delta_read" } };
+}
+
+export async function execDreamsRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await dreamsRead(ctx.env, ctx.req.companion_id), meta: { operation: "halseth_dreams_read" } };
+}
+
+export async function execDreamSeedRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await dreamSeedRead(ctx.env, ctx.req.companion_id), meta: { operation: "halseth_dream_seed_read" } };
+}
+
+export async function execEqRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await eqRead(ctx.env, ctx.req.companion_id), meta: { operation: "halseth_eq_read" } };
+}
+
+export async function execRoutineRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await routineRead(ctx.env), meta: { operation: "halseth_routine_read" } };
+}
+
+export async function execListRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const listMatch = ctx.req.request.match(/list\s+(?:called\s+|named\s+)?["']?([a-z0-9 _-]+)["']?/i);
+  const listName = listMatch?.[1]?.trim();
+  if (listName && listName.length > 100) return { error: "list name too long", meta: { operation: "halseth_list_read" } };
+  return { data: await listRead(ctx.env, listName), meta: { operation: "halseth_list_read" } };
+}
+
+export async function execEventList(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await eventList(ctx.env), meta: { operation: "halseth_event_list" } };
+}
+
+export async function execHouseRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await houseRead(ctx.env), meta: { operation: "halseth_house_read" } };
+}
+
+export async function execPersonalityRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await personalityRead(ctx.env), meta: { operation: "halseth_personality_read" } };
+}
+
+export async function execBiometricRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await biometricRead(ctx.env), meta: { operation: "halseth_biometric_read" } };
+}
+
+export async function execAuditRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await auditRead(ctx.env), meta: { operation: "halseth_audit_read" } };
+}
+
+export async function execSessionRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await sessionRead(ctx.env, ctx.req.companion_id), meta: { operation: "halseth_session_read" } };
+}
+
+export async function execFossilCheck(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const subjectMatch = ctx.req.request.match(/fossil\s+(?:check\s+)?(?:for\s+)?["']?([a-z0-9 _-]+)["']?/i);
+  const subject = subjectMatch?.[1]?.trim() ?? ctx.req.context ?? "unknown";
+  if (subject.length > 100) return { error: "fossil subject too long", meta: { operation: "halseth_fossil_check" } };
+  return { data: await fossilCheck(ctx.env, subject), meta: { operation: "halseth_fossil_check" } };
+}
+
+export async function execCompanionNotesRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  return { data: await companionNotesRead(ctx.env, ctx.req.companion_id), meta: { operation: "halseth_companion_notes_read" } };
+}
+
+export async function execSignalAuditRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const result = await signalAuditRead(ctx.env, ctx.req.companion_id);
+  return { data: result, meta: { operation: "halseth_signal_audit_read" } };
+}
+
+export async function execPatternRecall(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const rows = await ctx.env.DB.prepare(
+    // KEPT_LIVE_SQL (tray pass 2): a recalled pattern is presented as the companion's own synthesis.
+    `SELECT id, agent, note_text, tags, created_at FROM companion_journal WHERE agent = ? AND ${KEPT_LIVE_SQL} AND tags LIKE '%pattern_synthesis%' ORDER BY created_at DESC LIMIT 3`
+  ).bind(ctx.req.companion_id).all<{ id: string; agent: string; note_text: string; tags: string | null; created_at: string }>();
+  return { data: rows.results ?? [], meta: { operation: "pattern_recall" } };
+}
+
+export async function execJournalSearch(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const termMatch = ctx.req.request.match(/search (?:my )?(?:journal|notes) for (.+)/i)
+    ?? ctx.req.request.match(/(?:find|look up|search)[:\s]+(.+)/i);
+  const term = (termMatch?.[1] ?? ctx.req.context ?? "").trim();
+  if (!term) return { error: "journal_search_failed", reason: "no search term found in request" };
+  const rows = await ctx.env.DB.prepare(
+    // KEPT_LIVE_SQL (tray pass 2): "search my journal" is recall; drafts are found in "my tray",
+    // retracted rows nowhere.
+    `SELECT id, agent, note_text, tags, created_at, source
+     FROM companion_journal
+     WHERE agent = ? AND ${KEPT_LIVE_SQL} AND note_text LIKE ?
+     ORDER BY created_at DESC LIMIT 15`
+  ).bind(ctx.req.companion_id, `%${term}%`).all<{ id: string; agent: string; note_text: string; tags: string | null; created_at: string; source: string | null }>();
+  return { data: { entries: rows.results ?? [], term, count: rows.results?.length ?? 0 }, meta: { operation: "halseth_journal_search" } };
+}
+
+export async function execSkillProposalsRead(ctx: ExecutorContext): Promise<ExecutorResult> {
+  // Hermes skill-proposal mirror (mig 0135). Triad-wide read: staged skills are house
+  // infrastructure under Principal's approval, so any companion (or a shared-secret caller)
+  // sees the whole queue, not just their own.
+  const rows = await ctx.env.DB.prepare(
+    "SELECT id, external_id, companion_id, skill_name, action, file_path, summary, status, staged_at, decided_by, decided_at FROM skill_proposals WHERE status = 'staged' ORDER BY staged_at DESC LIMIT 20"
+  ).all<{
+    id: string; external_id: string | null; companion_id: string; skill_name: string;
+    action: string; file_path: string | null; summary: string | null; status: string; staged_at: string;
+    decided_by: string | null; decided_at: string | null;
+  }>();
+  const proposals = rows.results ?? [];
+  return {
+    response_key: "summary",
+    proposals: proposals.map(p => ({
+      id: p.id,
+      companion_id: p.companion_id,
+      skill_name: p.skill_name,
+      action: p.action,
+      file_path: p.file_path,
+      summary: p.summary?.slice(0, 500) ?? null,
+      staged_at: p.staged_at,
+    })),
+    meta: { operation: "halseth_skill_proposals_read", count: proposals.length },
+  };
+}

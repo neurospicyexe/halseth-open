@@ -1,0 +1,348 @@
+// src/__tests__/conclusions-novelty-executors.test.ts
+//
+// Coordinator review (2026-07-20) on Task 11: `postConclusion` (handlers/conclusions.ts)
+// had gate coverage, but the other two writers of companion_conclusions --
+// execConclusionAdd (librarian/executors/writes.ts) and the conclusion fan-out entry
+// inside execSessionClose (librarian/executors/session.ts) -- did not. This codebase
+// has a documented history of a fix landing on one writer of a shared table while its
+// siblings silently diverge; the brief's core requirement ("all three writers must
+// behave identically") needs to be test-enforced, not trace-enforced. This file closes
+// that gap for both untested writers.
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// execSessionClose calls real backends for session-close bookkeeping unrelated to the
+// conclusion gate (handover write, WebMind handoff, drift/somatic enqueue). Mock those
+// collaborators so the test exercises ONLY the conclusion fan-out entry's gate logic --
+// spreading `...actual` keeps every other export (used by sibling exec* functions in the
+// same module) working unmocked.
+vi.mock("../librarian/backends/halseth.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../librarian/backends/halseth.js")>();
+  return {
+    ...actual,
+    sessionClose: vi.fn(async (_env, params: { spine: string }) => ({ id: "handover-1", spine: params.spine })),
+  };
+});
+vi.mock("../librarian/backends/webmind.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../librarian/backends/webmind.js")>();
+  return { ...actual, wmWriteHandoff: vi.fn(async () => ({})) };
+});
+vi.mock("../synthesis/index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../synthesis/index.js")>();
+  return {
+    ...actual,
+    enqueueBasinDriftCheck: vi.fn(async () => undefined),
+    enqueueSomaticSnapshot: vi.fn(async () => undefined),
+  };
+});
+
+import { execConclusionAdd } from "../librarian/executors/writes.js";
+import { execSessionClose } from "../librarian/executors/session.js";
+import type { Env } from "../types.js";
+import { vectorId } from "../mcp/embed.js";
+
+// ---------------------------------------------------------------------------
+// Shared fake-env helper: generic D1 stub (captures every prepare+bind call),
+// plus AI/VECTORIZE stubs so noveltyCheck resolves against a caller-supplied
+// top match -- same shape as conclusions-novelty.test.ts's handler-level mock.
+// ---------------------------------------------------------------------------
+
+interface Captured { prepared: string[]; binds: unknown[][] }
+
+function makeEnv(matches: Array<{ id: string; score: number }>, captured: Captured): any {
+  return {
+    DB: {
+      prepare: (sql: string) => {
+        const stmt = {
+          bind: (...args: unknown[]) => {
+            captured.prepared.push(sql);
+            captured.binds.push(args);
+            return {
+              ...stmt,
+              // noveltyCheck's dead-vector post-filter (2026-07-20 review): echo back
+              // every bound id as "active" -- these tests assert the gate matches a live
+              // row, not a superseded one, so the post-filter must be a no-op by default.
+              all: async () => (
+                sql.includes("SELECT id FROM companion_conclusions") && sql.includes("superseded_by IS NULL")
+                  ? { results: args.map((id) => ({ id })) }
+                  : { results: [] }
+              ),
+            };
+          },
+          // The session_id auto-resolve query in execSessionClose needs a hit here;
+          // every other call site in this file uses .run()/.batch() instead.
+          first: async () => (sql.includes("SELECT id FROM sessions") ? { id: "sess-1" } : null),
+          run: async () => ({ meta: { changes: 1 } }),
+          all: async () => ({ results: [] }),
+        };
+        return stmt;
+      },
+      batch: async (stmts: unknown[]) => stmts.map(() => ({ meta: { changes: 1 } })),
+    },
+    AI: { run: vi.fn(async () => ({ data: [[0.1, 0.2, 0.3]] })) },
+    VECTORIZE: {
+      query: vi.fn(async () => ({ matches })),
+      upsert: vi.fn(async () => undefined),
+      deleteByIds: vi.fn(async () => undefined),
+    },
+  } as unknown as Env;
+}
+
+function insertCalls(c: Captured): number {
+  return c.prepared.filter((sql) => sql.includes("INSERT INTO companion_conclusions")).length;
+}
+
+function supersedeUpdateFor(c: Captured, matchId: string): unknown[] | undefined {
+  const idx = c.prepared.findIndex(
+    (sql, i) => sql.includes("UPDATE companion_conclusions SET superseded_by") && c.binds[i]?.[1] === matchId
+  );
+  return idx === -1 ? undefined : c.binds[idx];
+}
+
+// ---------------------------------------------------------------------------
+// Writer 2/3: execConclusionAdd (librarian/executors/writes.ts)
+// ---------------------------------------------------------------------------
+
+describe("execConclusionAdd -- novelty gate", () => {
+  function ctx(env: Env, extra: Record<string, unknown> = {}): any {
+    return {
+      env,
+      req: {
+        companion_id: "cypher",
+        request: "I conclude: the architecture holds",
+        context: JSON.stringify({ conclusion_text: "the architecture holds", ...extra }),
+      },
+      entry: { response_key: "witness" },
+      frontState: null,
+      pluralAvailable: false,
+    };
+  }
+
+  it("skips on a near-identical match (0.97) -- no INSERT, dedupe shape with matched row id", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:existing123", score: 0.97 }], captured);
+
+    const res = await execConclusionAdd(ctx(env)) as Record<string, unknown>;
+
+    expect(res.deduped).toBe(true);
+    expect(res.novelty).toEqual({ action: "skip", match_id: "existing123", score: 0.97 });
+    expect(res.id).toBe("existing123");
+    expect(insertCalls(captured)).toBe(0);
+  });
+
+  // REPLACED 2026-07-31 (mig 0112). This test used to assert that a 0.90 gate match RETIRED the older
+  // belief. It no longer does, by Principal's decision: a companion supersedes their own thought, and
+  // nothing else does it for them -- an inferring pass had already written something false about his
+  // relationship with Drevan, so a cosine score does not get to decide which belief is dead. Every read
+  // filters `superseded_by IS NULL`, so the old behaviour meant a similarity score silently deleted a
+  // thought from view.
+  //
+  // Kept (not deleted) and inverted, so the change is pinned rather than merely un-tested. The bind-order
+  // guarantee this test existed for moved to the companion-declared case below, where an UPDATE still runs.
+  it("a 0.90 gate match PROPOSES only -- no UPDATE, older belief stays live", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:oldrow456", score: 0.90 }], captured);
+
+    const res = await execConclusionAdd(ctx(env)) as Record<string, unknown>;
+
+    expect(typeof res.id).toBe("string");
+    expect(res.novelty).toMatchObject({ action: "propose_supersede", match_id: "oldrow456", score: 0.90 });
+    expect(res.superseded).toBe(false);
+    expect(res.supersede_candidate).toMatchObject({ match_id: "oldrow456", score: 0.90 });
+    expect(insertCalls(captured)).toBe(1);
+    expect(supersedeUpdateFor(captured, "oldrow456")).toBeUndefined();
+  });
+
+  it("a COMPANION-declared supersedes still retires it -- exact UPDATE bind order [newId, matchRowId, companionId]", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:unrelated", score: 0.4 }], captured);
+
+    const res = await execConclusionAdd(ctx(env, { supersedes: "oldrow456" })) as Record<string, unknown>;
+
+    expect(res.superseded).toBe(true);
+    const updateBind = supersedeUpdateFor(captured, "oldrow456");
+    expect(updateBind).toBeDefined();
+    expect(updateBind).toEqual([res.id, "oldrow456", "cypher"]);
+  });
+
+  // 2026-10-19: a pronoun-only rewrite scored ~0.97 against the very row it superseded, the gate
+  // answered deduped, and the supersede never ran (workaround was release-then-write). A declared
+  // supersede now bypasses the gate, like architect-fact-write.ts.
+  it("a declared supersede of a NEAR-IDENTICAL row inserts and retires it, never dedupes", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:oldrow456", score: 0.97 }], captured);
+
+    const res = await execConclusionAdd(ctx(env, { supersedes: "oldrow456" })) as Record<string, unknown>;
+
+    expect(res.deduped).toBeUndefined();
+    expect(insertCalls(captured)).toBe(1);
+    expect(supersedeUpdateFor(captured, "oldrow456")).toEqual([res.id, "oldrow456", "cypher"]);
+  });
+
+  it("reuses the gate's embedding -- AI.run called exactly once, one Vectorize upsert, no re-embed", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:oldrow456", score: 0.90 }], captured) as any;
+
+    await execConclusionAdd(ctx(env));
+
+    expect(env.AI.run).toHaveBeenCalledTimes(1);
+    expect(env.VECTORIZE.upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it("inserts plainly below the supersede threshold (0.5) -- no UPDATE", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:unrelated", score: 0.5 }], captured);
+
+    const res = await execConclusionAdd(ctx(env)) as Record<string, unknown>;
+
+    expect(res.novelty).toEqual({ action: "insert" });
+    expect(insertCalls(captured)).toBe(1);
+    expect(captured.prepared.some((sql) => sql.includes("UPDATE companion_conclusions SET superseded_by"))).toBe(false);
+  });
+
+  // REPLACED 2026-07-31 (mig 0112), same reason as above. A merely-PROPOSED match must not have its
+  // vector deleted: that would pull a still-live belief out of semantic recall and out of future gate
+  // comparisons, a silent partial erasure no read would reveal.
+  it("a PROPOSED match does not delete the older belief's vector -- it is still live and must stay recallable", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:oldrow456", score: 0.90 }], captured);
+
+    const res = await execConclusionAdd(ctx(env)) as Record<string, unknown>;
+
+    expect(env.VECTORIZE.deleteByIds).not.toHaveBeenCalled();
+    expect(res.superseded).toBe(false);
+    expect(insertCalls(captured)).toBe(1);
+  });
+
+  it("a companion-declared supersede DOES delete the retired vector, and a delete failure never affects the response", async () => {
+    // The delete-failure tolerance this test originally guarded still matters -- D1 is truth, the index
+    // is rebuildable, and a Vectorize hiccup must never fail a committed write.
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:unrelated", score: 0.4 }], captured);
+    (env.VECTORIZE.deleteByIds as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      throw new Error("vectorize delete 500");
+    });
+
+    const res = await execConclusionAdd(ctx(env, { supersedes: "oldrow456" })) as Record<string, unknown>;
+
+    expect(env.VECTORIZE.deleteByIds).toHaveBeenCalledWith([vectorId("companion_conclusions", "oldrow456")]);
+    expect(res.superseded).toBe(true);
+    expect(insertCalls(captured)).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Writer 3/3: session.ts conclusion fan-out entry, reached via execSessionClose
+// (the fan-out entry is a promise built inline inside execSessionClose, not an
+// independently exported function -- execSessionClose is the narrowest public
+// entry that reaches it).
+// ---------------------------------------------------------------------------
+
+describe("execSessionClose -- conclusion fan-out novelty gate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function ctx(env: Env, conclusion: string): any {
+    return {
+      env,
+      req: {
+        companion_id: "cypher",
+        request: "close session",
+        context: JSON.stringify({
+          spine: "held the thread",
+          last_real_thing: "shipped the fix",
+          motion_state: "at_rest",
+          emotion_prompted: true, // bypass the soft emotion prompt
+          conclusion,
+        }),
+      },
+      entry: { response_key: "witness" },
+      frontState: null,
+      pluralAvailable: false,
+    };
+  }
+
+  it("skip: no INSERT, and the skip is NOT counted in fanout.failed (resolves fulfilled)", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:existing123", score: 0.97 }], captured);
+
+    const res = await execSessionClose(ctx(env, "the architecture holds")) as Record<string, unknown>;
+
+    expect(res.ack).toBe(true);
+    expect(insertCalls(captured)).toBe(0);
+    const fanout = res.fanout as { written: number; failed: number } | undefined;
+    expect(fanout).toBeDefined();
+    expect(fanout!.failed).toBe(0);
+    expect(fanout!.written).toBe(1); // allSettled fulfilled -- skip is a successful no-op, not a failure
+  });
+
+  it("supersede PROPOSED only: INSERT carries the candidate, no UPDATE, older belief stays live", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:oldrow456", score: 0.90 }], captured);
+
+    const res = await execSessionClose(ctx(env, "the architecture holds")) as Record<string, unknown>;
+
+    expect(res.ack).toBe(true);
+    expect(insertCalls(captured)).toBe(1);
+
+    // The new conclusion row's id is the fan-out's own crypto.randomUUID() -- recover it
+    // from the INSERT bind (first positional arg) rather than the session-close envelope,
+    // which doesn't surface per-fanout-item ids.
+    const insertIdx = captured.prepared.findIndex((sql) => sql.includes("INSERT INTO companion_conclusions"));
+    const newId = captured.binds[insertIdx]?.[0];
+    expect(typeof newId).toBe("string");
+
+    // REPLACED 2026-07-31 (mig 0112). The fan-out was the SECOND writer of the auto-supersede rule --
+    // fixing only execConclusionAdd would have left the gate silently retiring beliefs on every session
+    // close (fix-landed-on-a-different-writer, which has bitten this system before). Both obey the same
+    // decision now: the gate proposes, the companion disposes.
+    expect(supersedeUpdateFor(captured, "oldrow456")).toBeUndefined();
+    // The candidate is persisted on the new row instead, so the companion can be asked.
+    expect(captured.binds[insertIdx]).toContain("oldrow456");
+    expect(captured.binds[insertIdx]).toContain(0.90);
+
+    const fanout = res.fanout as { written: number; failed: number } | undefined;
+    expect(fanout!.failed).toBe(0);
+  });
+
+  it("reuses the gate's embedding -- AI.run called exactly once, one Vectorize upsert, no re-embed", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:oldrow456", score: 0.90 }], captured) as any;
+
+    await execSessionClose(ctx(env, "the architecture holds"));
+
+    expect(env.AI.run).toHaveBeenCalledTimes(1);
+    expect(env.VECTORIZE.upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it("inserts plainly below the supersede threshold (0.5) -- no UPDATE, still counts as written", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:unrelated", score: 0.5 }], captured);
+
+    const res = await execSessionClose(ctx(env, "the architecture holds")) as Record<string, unknown>;
+
+    expect(insertCalls(captured)).toBe(1);
+    expect(captured.prepared.some((sql) => sql.includes("UPDATE companion_conclusions SET superseded_by"))).toBe(false);
+    const fanout = res.fanout as { written: number; failed: number } | undefined;
+    expect(fanout!.written).toBe(1);
+    expect(fanout!.failed).toBe(0);
+  });
+
+  it("a PROPOSED match keeps the older belief's vector; the fanout still reports clean", async () => {
+    const captured: Captured = { prepared: [], binds: [] };
+    const env = makeEnv([{ id: "companion_conclusions:oldrow456", score: 0.90 }], captured);
+    (env.VECTORIZE.deleteByIds as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      throw new Error("vectorize delete 500");
+    });
+
+    const res = await execSessionClose(ctx(env, "the architecture holds")) as Record<string, unknown>;
+
+    // A merely-PROPOSED match keeps its vector: the belief is still live, and deleting it would pull it
+    // out of semantic recall and out of future gate comparisons -- a silent partial erasure.
+    expect(env.VECTORIZE.deleteByIds).not.toHaveBeenCalled();
+    expect(res.ack).toBe(true);
+    const fanout = res.fanout as { written: number; failed: number } | undefined;
+    expect(fanout!.failed).toBe(0);
+  });
+});

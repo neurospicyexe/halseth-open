@@ -1,0 +1,1605 @@
+// src/handlers/webmind.ts
+//
+// HTTP route handlers for /mind/* endpoints.
+// All routes require ADMIN_SECRET Bearer auth.
+
+import type { Env } from "../types.js";
+import { notLegacyDistillerNoteSql } from "../webmind/review-state.js";
+import { authGuard } from "../lib/auth.js";
+import { mindOrient } from "../webmind/orient.js";
+import { mindGround } from "../webmind/ground.js";
+import { loadMindState } from "../mind/loader.js";
+import { isValidLoom, VALID_LOOMS } from "../mind/contract.js";
+import { writeHandoff } from "../webmind/handoffs.js";
+import { upsertThread, sweepThreads } from "../webmind/threads.js";
+import { addNote, getEligibleNotesForCompression, archiveNotes, readRecentNotes, recallNotes, recallNotesByMeaning, demoteNotes, type CompressibleNote } from "../webmind/notes.js";
+import { reachLaneVerdict, reachConfigFrom } from "../webmind/reach-cap.js";
+import { readCareHold } from "../care/hold.js";
+import { loudestNeeds, servesOf } from "../webmind/expression-need.js";
+import { listActions, listEligibleActions, addAction, patchAction, deleteAction, recordActionFired, isValidActionType, ownsMove, VALID_ACTION_TYPES, quietHoursVerdict, QUIET_HOURS_DEFAULT_START, QUIET_HOURS_DEFAULT_END, QUIET_HOURS_DEFAULT_TZ, type MetronomeActionInput, type MetronomeActionPatch, type EligibilityContext } from "../webmind/metronome.js";
+import { dualVectorSearch } from "../librarian/backends/second-brain.js";
+import { writeDream, readDreams, examineDream } from "../webmind/dreams.js";
+import { writeLoop, readLoops, closeLoop, reviewLoop, actOnLoop } from "../webmind/loops.js";
+import { writeRelationalState, readRelationalHistory } from "../webmind/relational.js";
+import { writeLimbicState, getCurrentLimbicState, withLimbicRetirement } from "../webmind/limbic.js";
+import { queueAndRunSpiral } from '../webmind/spiral.js';
+import type { WmAgentId, WmHandoffInput, WmThreadUpsertInput, WmNoteInput, WmDreamInput, WmLoopInput, WmRelationalStateInput, WmLimbicStateInput, WmThreadStatus, WmSpiralInput } from "../webmind/types.js";
+import { notConsolidationHeartbeatSql, notSaltLineSql } from "../ledger/store.js";
+
+const VALID_AGENT_IDS: WmAgentId[] = ["cypher", "drevan", "gaia"];
+const MAX_TEXT_LENGTH = 8000;
+
+function isValidAgentId(id: string): id is WmAgentId {
+  return (VALID_AGENT_IDS as string[]).includes(id);
+}
+
+function exceedsLimit(val: unknown): boolean {
+  return typeof val === "string" && val.length > MAX_TEXT_LENGTH;
+}
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// GET /mind/orient/:agent_id
+//
+// PURE READ as of 2026-07-29 (Q1, docs/private/orient-unification-decisions-2026-07-29.md).
+// Principal viewing Hearth is not the companion receiving. This route's only callers are Hearth
+// server-side renders (`hearth/lib/halseth.ts:801,946` and `app/api/phoenix/ritual/route.ts:104`,
+// whose `env.url` is HALSETH_URL), so every consume-on-read side effect that used to fire here
+// fired on a page view: it acked Drevan's unread sibling mail AS Drevan, stamped answers
+// delivered, marked home events surfaced, and warmed journal/conclusion heat -- all without any
+// companion having read anything. Reading is the companion's act; Hearth is a window, not a hand.
+//
+// Nothing is orphaned by this. `read_at` still has a live companion-acting writer: the Discord
+// bots poll GET /inter-companion-notes/unread then POST /inter-companion-notes/ack (verified in
+// prod 2026-07-29 -- 866 notes, 0 unread, every read landing 44-210s after creation on
+// cron-aligned minutes, which is the poller and not a page view). Claude.ai keeps consuming via
+// the Librarian's wmOrient(), which calls mindOrient() without readOnly on purpose.
+//
+// Expected and intended consequence: journal/conclusion warm counts drop, because warming on
+// Principal's page view is the ranking-signal-written-by-reading antipattern. Baseline at the flip:
+// journal warmed 29 (28 in 7d), conclusions 6, home_events surfaced 175, questions delivered 6.
+export async function getMindOrient(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { agent_id } = params;
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: `Invalid agent_id: must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  try {
+    const result = await mindOrient(env, agent_id, { readOnly: true });
+    return json(result);
+  } catch (err) {
+    console.error("[mind/orient] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/orient-debug/:agent_id
+export async function getMindOrientDebug(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { agent_id } = params;
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: `Invalid agent_id: must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  try {
+    const row = await env.DB.prepare(
+      "SELECT last_orient_debug FROM companion_state WHERE companion_id = ?"
+    ).bind(agent_id).first<{ last_orient_debug: string | null }>();
+
+    if (!row?.last_orient_debug) {
+      return json({ agent_id, debug: null });
+    }
+
+    const debug = JSON.parse(row.last_orient_debug);
+    return json({ agent_id, debug });
+  } catch (err) {
+    console.error("[mind/orient-debug] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/state/:agent_id?loom=claude|discord|worker|hearth|raw[&parity=1]
+//
+// The MindState loader endpoint (Phase 1, docs/mindstate-contract.md). Pure read:
+// unlike /mind/orient it acks nothing, warms nothing, stamps nothing -- safe to poll.
+// ?parity=1 additionally returns the legacy orient+ground responses so the parity
+// harness can diff block-by-block during the strangler cutover.
+export async function getMindState(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { agent_id } = params;
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: `Invalid agent_id: must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  const url = new URL(request.url);
+  const loomParam = url.searchParams.get("loom") ?? "raw";
+  if (!isValidLoom(loomParam)) {
+    return json({ error: `Invalid loom: must be one of ${VALID_LOOMS.join(", ")}` }, 400);
+  }
+
+  try {
+    const mindstate = await loadMindState(env, agent_id, loomParam);
+    if (url.searchParams.get("parity") === "1") {
+      // Legacy aggregators run in readOnly too -- a parity diff must not consume state.
+      const [legacy_orient, legacy_ground] = await Promise.all([
+        mindOrient(env, agent_id, { readOnly: true }),
+        mindGround(env, agent_id),
+      ]);
+      return json({ mindstate, legacy_orient, legacy_ground });
+    }
+    return json(mindstate);
+  } catch (err) {
+    console.error("[mind/state] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/ground/:agent_id
+export async function getMindGround(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { agent_id } = params;
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: `Invalid agent_id: must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  try {
+    const result = await mindGround(env, agent_id);
+    return json(result);
+  } catch (err) {
+    console.error("[mind/ground] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/handoff
+export async function postMindHandoff(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: WmHandoffInput;
+  try {
+    body = await request.json() as WmHandoffInput;
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.agent_id || !isValidAgentId(body.agent_id)) {
+    return json({ error: "agent_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (!body.title || typeof body.title !== "string") {
+    return json({ error: "title is required" }, 400);
+  }
+  if (!body.summary || typeof body.summary !== "string") {
+    return json({ error: "summary is required" }, 400);
+  }
+
+  for (const field of ["title", "summary", "next_steps", "open_loops", "state_hint"] as const) {
+    if (exceedsLimit(body[field])) {
+      return json({ error: `${field} exceeds maximum length of ${MAX_TEXT_LENGTH} characters` }, 400);
+    }
+  }
+
+  try {
+    const result = await writeHandoff(env, body);
+    return json(result, 201);
+  } catch (err) {
+    console.error("[mind/handoff] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/thread
+export async function postMindThread(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: WmThreadUpsertInput;
+  try {
+    body = await request.json() as WmThreadUpsertInput;
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.agent_id || !isValidAgentId(body.agent_id)) {
+    return json({ error: "agent_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (!body.thread_key || typeof body.thread_key !== "string") {
+    return json({ error: "thread_key is required" }, 400);
+  }
+  // Keys are identifiers, not prose. Brain's synthesis loop once wrote a whole
+  // model sentence as a key ("no_dreams_or_loops_were_provided_—_…"), which then
+  // sat open forever. Reject at the boundary; callers must slug or use an id.
+  if (!/^[A-Za-z0-9:._/-]{1,64}$/.test(body.thread_key)) {
+    return json({ error: "thread_key must be 1-64 chars of [A-Za-z0-9:._/-] — an identifier, not prose" }, 400);
+  }
+  if (!body.title || typeof body.title !== "string") {
+    return json({ error: "title is required" }, 400);
+  }
+
+  for (const field of ["title", "context", "event_content"] as const) {
+    if (exceedsLimit(body[field])) {
+      return json({ error: `${field} exceeds maximum length of ${MAX_TEXT_LENGTH} characters` }, 400);
+    }
+  }
+
+  try {
+    const result = await upsertThread(env, body);
+    return json(result, 201);
+  } catch (err) {
+    console.error("[mind/thread] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/threads/sweep — bulk-resolve threads that will never be revisited:
+// stale machine-opened `auto:*` threads and/or over-long prose keys. Hygiene
+// endpoint; the autonomous worker calls it once per run, and it backfills the
+// ~220-open-per-companion accumulation found 2026-07-02.
+// Body: { agent_id, older_than_days? (default 14), prefix? (default "auto:"), invalid_keys? }
+export async function postThreadsSweep(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: { agent_id?: string; older_than_days?: number; prefix?: string; invalid_keys?: boolean };
+  try {
+    body = await request.json() as typeof body;
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.agent_id || !isValidAgentId(body.agent_id)) {
+    return json({ error: "agent_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (body.prefix !== undefined && (typeof body.prefix !== "string" || body.prefix.length > 32)) {
+    return json({ error: "prefix must be a string of at most 32 chars" }, 400);
+  }
+
+  try {
+    const result = await sweepThreads(env, {
+      agent_id: body.agent_id,
+      older_than_days: typeof body.older_than_days === "number" ? body.older_than_days : undefined,
+      prefix: body.prefix,
+      invalid_keys: body.invalid_keys === true,
+    });
+    return json({ ok: true, ...result });
+  } catch (err) {
+    console.error("[mind/threads/sweep] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/dream
+export async function postMindDream(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: WmDreamInput;
+  try {
+    body = await request.json() as WmDreamInput;
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (!body.dream_text || typeof body.dream_text !== "string") {
+    return json({ error: "dream_text is required" }, 400);
+  }
+  if (exceedsLimit(body.dream_text)) {
+    return json({ error: `dream_text exceeds maximum length of ${MAX_TEXT_LENGTH} characters` }, 400);
+  }
+
+  try {
+    const result = await writeDream(env, body);
+    return json(result, 201);
+  } catch (err) {
+    console.error("[mind/dream] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/dreams/:agent_id
+export async function getMindDreams(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { agent_id } = params;
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: `Invalid agent_id: must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  const url = new URL(request.url);
+  const examined = url.searchParams.get("examined") === "true";
+
+  try {
+    const dreams = await readDreams(env, agent_id, { examined });
+    return json({ dreams });
+  } catch (err) {
+    console.error("[mind/dreams] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/dream/:id/examine
+export async function postMindDreamExamine(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { id } = params;
+  if (!id || typeof id !== "string") {
+    return json({ error: "dream id is required" }, 400);
+  }
+
+  let body: { companion_id: string };
+  try {
+    body = await request.json() as { companion_id: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+
+  try {
+    const result = await examineDream(env, id, body.companion_id);
+    return json(result);
+  } catch (err) {
+    console.error("[mind/dream/examine] error", { id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/dream/:id/pin
+export async function postMindDreamPin(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { id } = params;
+  if (!id || typeof id !== "string") {
+    return json({ error: "dream id is required" }, 400);
+  }
+
+  let body: { companion_id: string; do_not_auto_examine: number };
+  try {
+    body = await request.json() as { companion_id: string; do_not_auto_examine: number };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+
+  const pinValue = body.do_not_auto_examine === 1 ? 1 : 0;
+
+  try {
+    const result = await env.DB.prepare(
+      "UPDATE companion_dreams SET do_not_auto_examine = ? WHERE id = ? AND companion_id = ?"
+    ).bind(pinValue, id, body.companion_id).run();
+    const ok = (result.meta?.changes ?? 0) > 0;
+    return json({ ok });
+  } catch (err) {
+    console.error("[mind/dream/pin] error", { id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/loop
+export async function postMindLoop(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: WmLoopInput;
+  try {
+    body = await request.json() as WmLoopInput;
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (!body.loop_text || typeof body.loop_text !== "string") {
+    return json({ error: "loop_text is required" }, 400);
+  }
+  if (exceedsLimit(body.loop_text)) {
+    return json({ error: `loop_text exceeds maximum length of ${MAX_TEXT_LENGTH} characters` }, 400);
+  }
+  if (body.weight !== undefined && (typeof body.weight !== "number" || body.weight < 0 || body.weight > 1)) {
+    return json({ error: "weight must be a number between 0 and 1" }, 400);
+  }
+
+  try {
+    const result = await writeLoop(env, body);
+    return json(result, 201);
+  } catch (err) {
+    console.error("[mind/loop] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/loops/:agent_id
+export async function getMindLoops(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { agent_id } = params;
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: `Invalid agent_id: must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  const url = new URL(request.url);
+  const include_closed = url.searchParams.get("include_closed") === "true";
+
+  try {
+    const loops = await readLoops(env, agent_id, { include_closed });
+    return json({ loops });
+  } catch (err) {
+    console.error("[mind/loops] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/loop/:id/close
+export async function postMindLoopClose(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { id } = params;
+  if (!id || typeof id !== "string") {
+    return json({ error: "loop id is required" }, 400);
+  }
+
+  let body: { companion_id: string };
+  try {
+    body = await request.json() as { companion_id: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+
+  try {
+    const result = await closeLoop(env, id, body.companion_id);
+    return json(result);
+  } catch (err) {
+    console.error("[mind/loop/close] error", { id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/loop/:id/review   body: { companion_id, reason }
+// Hold a loop open on purpose (Guardian self-resolution): records WHY it stays and
+// suppresses the loop_stuck flag for 21d. Ownership-guarded inside reviewLoop.
+export async function postMindLoopReview(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { id } = params;
+  if (!id || typeof id !== "string") {
+    return json({ error: "loop id is required" }, 400);
+  }
+
+  let body: { companion_id: string; reason?: string };
+  try {
+    body = await request.json() as { companion_id: string; reason?: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+
+  try {
+    const result = await reviewLoop(env, id, body.companion_id, body.reason ?? "");
+    return json(result);
+  } catch (err) {
+    console.error("[mind/loop/review] error", { id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/loop/:id/act   body: { companion_id, note? }
+// Migration 0118: record that the companion ACTED on a loop that is still open. Distinct from
+// close (resolved) and review (held on purpose). Acting refreshes the loop's decay anchor,
+// because unlike restating it, acting is evidence of life. Ownership-guarded in actOnLoop.
+export async function postMindLoopAct(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { id } = params;
+  if (!id || typeof id !== "string") {
+    return json({ error: "loop id is required" }, 400);
+  }
+
+  let body: { companion_id: string; note?: string };
+  try {
+    body = await request.json() as { companion_id: string; note?: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+
+  try {
+    const result = await actOnLoop(env, id, body.companion_id, body.note ?? "");
+    // 404 rather than {ok:false}+200: no open loop with that id for this companion is a
+    // addressing failure, and a 200 would let a caller log success against nothing.
+    if (!result.ok) return json({ error: "no open loop with that id for this companion" }, 404);
+    return json(result);
+  } catch (err) {
+    console.error("[mind/loop/act] error", { id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/relational
+export async function postMindRelational(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: WmRelationalStateInput;
+  try {
+    body = await request.json() as WmRelationalStateInput;
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (!body.toward || typeof body.toward !== "string" || body.toward.trim().length === 0) {
+    return json({ error: "toward is required" }, 400);
+  }
+  if (!body.state_text || typeof body.state_text !== "string") {
+    return json({ error: "state_text is required" }, 400);
+  }
+  if (exceedsLimit(body.state_text) || exceedsLimit(body.toward)) {
+    return json({ error: `fields exceed maximum length of ${MAX_TEXT_LENGTH} characters` }, 400);
+  }
+  if (body.weight !== undefined && (typeof body.weight !== "number" || body.weight < 0 || body.weight > 1)) {
+    return json({ error: "weight must be a number between 0 and 1" }, 400);
+  }
+
+  try {
+    const result = await writeRelationalState(env, body);
+    return json(result, 201);
+  } catch (err) {
+    console.error("[mind/relational] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/relational/:agent_id
+export async function getMindRelational(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { agent_id } = params;
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: `Invalid agent_id: must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  const url = new URL(request.url);
+  const toward = url.searchParams.get("toward") ?? undefined;
+
+  try {
+    const states = await readRelationalHistory(env, agent_id, { toward });
+    return json({ states });
+  } catch (err) {
+    console.error("[mind/relational] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/note
+export async function postMindNote(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: WmNoteInput;
+  try {
+    body = await request.json() as WmNoteInput;
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.agent_id || !isValidAgentId(body.agent_id)) {
+    return json({ error: "agent_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (!body.content || typeof body.content !== "string") {
+    return json({ error: "content is required" }, 400);
+  }
+
+  if (exceedsLimit(body.content)) {
+    return json({ error: `content exceeds maximum length of ${MAX_TEXT_LENGTH} characters` }, 400);
+  }
+
+  try {
+    const result = await addNote(env, body);
+    return json(result, 201);
+  } catch (err) {
+    console.error("[mind/note] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/search?query=...
+// Proxies a semantic search against Second Brain for Discord bots (Thalamus pattern).
+// Returns { query, result } where result is the raw sb_search string or null.
+export async function getMindSearch(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const url = new URL(request.url);
+  const query = url.searchParams.get("query")?.trim();
+  if (!query) return json({ error: "query is required" }, 400);
+  if (query.length > 500) return json({ error: "query must be 500 characters or fewer" }, 400);
+
+  const agentId = url.searchParams.get("agent_id")?.trim() ?? null;
+  // Opt-in continuity: recent prior turns widen recall via dual-vector retrieval.
+  // Absent -> single-vector, identical to prior behaviour.
+  const recentContext = url.searchParams.get("recent_context");
+  // mode=recall (2026-08-10): the relevance-only retrieval shape, for "what did we actually say" rather than
+  // "give me something to think about". The bots' per-message recall is the caller that needs it -- the default
+  // pool mix spends 30% of every payload on deliberately query-blind material. Opt-in, so an unset mode keeps
+  // the previous behaviour exactly.
+  const mode = url.searchParams.get("mode")?.trim() || null;
+
+  try {
+    const result = await dualVectorSearch(env, query, recentContext, null, null, mode);
+
+    if (agentId && isValidAgentId(agentId)) {
+      const hitCount = (() => {
+        try { return (JSON.parse(result ?? "{}") as { chunks?: unknown[] })?.chunks?.length ?? 0; }
+        catch { return result ? 1 : 0; }
+      })();
+      // AWAITED, not fire-and-forget (2026-07-31). This was `.run().catch(() => null)` with no
+      // `await` and no `ctx.waitUntil`, so the Worker cancelled the promise the moment the response
+      // returned. Result: ONE logged row between 2026-06-10 and 2026-07-31, across every companion
+      // and thousands of messages -- while the search itself was running fine the whole time.
+      //
+      // That made "is Discord recall working?" UNANSWERABLE rather than answered badly, and it is the
+      // reason a recall path could look flaky for seven weeks with nobody able to check. Same shape as
+      // `verify-the-index-not-just-the-write`: a fire-and-forget write in a Worker is not a write.
+      //
+      // Awaiting costs a few ms on a call that already made a network round trip to the VPS, and the
+      // catch keeps a logging failure from ever breaking the search it is only observing.
+      await env.DB.prepare(
+        `INSERT INTO sb_search_log (id, companion_id, query, hit_count, source) VALUES (?, ?, ?, ?, 'message')`
+      ).bind(crypto.randomUUID(), agentId, query.slice(0, 200), hitCount).run().catch(() => null);
+    }
+
+    return json({ query, result });
+  } catch (err) {
+    console.error("[mind/search] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/sb-search-log/:agent_id
+export async function getMindSbSearchLog(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { agent_id } = params;
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: `Invalid agent_id: must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  try {
+    const rows = await env.DB.prepare(
+      "SELECT query, hit_count, source, created_at FROM sb_search_log WHERE companion_id = ? ORDER BY created_at DESC LIMIT 20"
+    ).bind(agent_id).all<{ query: string; hit_count: number; source: string; created_at: string }>();
+
+    const entries = rows.results ?? [];
+    const total = entries.length;
+    const hits = entries.filter(r => r.hit_count > 0).length;
+    const hit_rate = total > 0 ? Math.round((hits / total) * 100) : null;
+
+    return json({ agent_id, entries, total, hits, hit_rate, last_query: entries[0]?.query ?? null });
+  } catch (err) {
+    console.error("[mind/sb-search-log] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/limbic
+export async function postMindLimbic(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: WmLimbicStateInput;
+  try {
+    body = await request.json() as WmLimbicStateInput;
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.synthesis_source || typeof body.synthesis_source !== "string") {
+    return json({ error: "synthesis_source is required" }, 400);
+  }
+  if (!body.drift_vector || typeof body.drift_vector !== "string") {
+    return json({ error: "drift_vector is required" }, 400);
+  }
+  if (!body.emotional_register || typeof body.emotional_register !== "string") {
+    return json({ error: "emotional_register is required" }, 400);
+  }
+  if (!Array.isArray(body.active_concerns)) {
+    return json({ error: "active_concerns must be an array" }, 400);
+  }
+  if (!Array.isArray(body.live_tensions)) {
+    return json({ error: "live_tensions must be an array" }, 400);
+  }
+  if (!Array.isArray(body.open_questions)) {
+    return json({ error: "open_questions must be an array" }, 400);
+  }
+  if (!Array.isArray(body.swarm_threads)) {
+    return json({ error: "swarm_threads must be an array" }, 400);
+  }
+  if (body.companion_id !== undefined && !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id must be one of cypher, drevan, gaia" }, 400);
+  }
+
+  try {
+    const result = await writeLimbicState(env, body);
+    return json(result, 201);
+  } catch (err) {
+    console.error("[mind/limbic] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/limbic/current
+export async function getMindLimbicCurrent(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  try {
+    const state = await getCurrentLimbicState(env);
+    // Retired register (2026-09-14): the row is returned, flagged stale, never as live state.
+    return json(withLimbicRetirement(state));
+  } catch (err) {
+    console.error("[mind/limbic/current] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/notes/compress-eligible
+export async function getMindCompressEligible(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const url = new URL(request.url);
+  const agent_id = url.searchParams.get("agent_id");
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: `agent_id required and must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  try {
+    const notes = await getEligibleNotesForCompression(env, agent_id);
+    return json({ notes });
+  } catch (err) {
+    console.error("[mind/notes/compress-eligible] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/notes/archive
+export async function postMindNotesArchive(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: { agent_id?: string; notes?: unknown[]; summary?: string };
+  try {
+    body = await request.json() as { agent_id?: string; notes?: unknown[]; summary?: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const { agent_id, notes, summary } = body;
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: "agent_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (!Array.isArray(notes)) {
+    return json({ error: "notes[] is required" }, 400);
+  }
+  if (!summary || typeof summary !== "string") {
+    return json({ error: "summary is required" }, 400);
+  }
+  if (!notes.every(n => typeof (n as { note_id?: unknown }).note_id === "string" && (n as { note_id?: string }).note_id)) {
+    return new Response(JSON.stringify({ error: "each note must have a non-empty note_id string" }), { status: 400, headers: { "Content-Type": "application/json" } });
+  }
+
+  try {
+    const result = await archiveNotes(env, agent_id, notes as CompressibleNote[], summary);
+    return json(result);
+  } catch (err) {
+    console.error("[mind/notes/archive] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/notes/recall
+// Deliberate recall of specific continuity notes: returns their content and warms them
+// (heat bump + last_access_at), which clears the Guardian's orphan_memory condition.
+/**
+ * GET /mind/notes/search -- meaning-search over a companion's OWN continuity notes (2026-09-23).
+ *
+ * The AUTOMATIC enrichment path, deliberately parallel to `/mind/search` (the vault) and
+ * deliberately NOT the Librarian's `notes_recall_meaning` route, even though both end in
+ * `recallNotesByMeaning`. The distinction is who decided to search:
+ *
+ *   - Librarian route  = a COMPANION chose to look something up. Loop-guarded, correctly: that
+ *     guard exists because the memory judge once ran 150 turns and burned 100.6M tokens.
+ *   - This route       = the bot's per-message enrichment, one call per inbound Discord message,
+ *     no model decision involved -- exactly like the vault search beside it.
+ *
+ * Routing the automatic caller through the Librarian tripped the guard at 12 repeats in 10
+ * minutes ("Retrieval is not going to change the answer. Stop searching") -- which is right for a
+ * looping agent and catastrophic for per-message recall, because an ACTIVE conversation is
+ * precisely when it fires most and precisely when memory matters most. It failed silently, too:
+ * a witness response carries no `data`, so the bot saw an empty recall rather than an error.
+ *
+ * Pure read. `recallNotesByMeaning` does not warm what it returns from here.
+ */
+export async function getMindNotesSearch(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const url = new URL(request.url);
+  const agentId = url.searchParams.get("agent_id")?.trim() ?? "";
+  if (!isValidAgentId(agentId)) {
+    return json({ error: "agent_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  const query = url.searchParams.get("query")?.trim();
+  if (!query) return json({ error: "query is required" }, 400);
+  if (query.length > 500) return json({ error: "query must be 500 characters or fewer" }, 400);
+
+  const rawLimit = parseInt(url.searchParams.get("limit") ?? "", 10);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 10) : 4;
+  const sourceClass = url.searchParams.get("source_class") === "all" ? "all" as const : "life" as const;
+
+  try {
+    // Optional continuity (GAP-MAP A4): last few user turns, mirrors /mind/search's recent_context.
+    // Absent = the old single-query behaviour, so an un-updated bot is unaffected.
+    const context = url.searchParams.get("context")?.trim().slice(0, 600) || null;
+    const notes = await recallNotesByMeaning(env, agentId as WmAgentId, query, limit, sourceClass, context);
+    return json({ notes });
+  } catch (e) {
+    // "Nothing matched" and "I could not look" must never collapse into the same answer --
+    // Workers AI is quota-bound on the free tier. The caller renders nothing either way, but the
+    // distinction has to exist in the logs or a dead embedder reads as an empty memory.
+    const msg = String(e);
+    console.warn(`[notes-search] ${agentId} failed: ${msg.slice(0, 200)}`);
+    // 200 with an explicit flag, not a 5xx: the reply must still happen. But the flag has to
+    // reach the prompt, because "nothing found" and "I could not look" are different sentences
+    // and only one of them is true.
+    return json({ notes: [], recall_failed: true }, 200);
+  }
+}
+
+export async function postMindNotesRecall(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: { agent_id?: string; note_ids?: unknown };
+  try {
+    body = await request.json() as { agent_id?: string; note_ids?: unknown };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const { agent_id, note_ids } = body;
+  if (!agent_id || !isValidAgentId(agent_id)) {
+    return json({ error: "agent_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (!Array.isArray(note_ids) || note_ids.length === 0 || note_ids.length > 20
+      || !note_ids.every(n => typeof n === "string" && n)) {
+    return json({ error: "note_ids must be 1-20 non-empty strings" }, 400);
+  }
+
+  try {
+    const notes = await recallNotes(env, agent_id, note_ids as string[]);
+    return json({ recalled: notes.length, notes });
+  } catch (err) {
+    console.error("[mind/notes/recall] error", { agent_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/notes/recent
+// Cross-companion feed: returns recent wm_continuity_notes from all agents.
+// Used by heartbeat crон and autonomous worker synthesize to ground generation in real speech.
+export async function getMindNotesRecent(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const url = new URL(request.url);
+  const parsedHours = parseInt(url.searchParams.get("since_hours") ?? "24", 10);
+  const sinceHours = isNaN(parsedHours) ? 24 : parsedHours;
+  const parsedLimit = parseInt(url.searchParams.get("limit") ?? "30", 10);
+  const limit = isNaN(parsedLimit) ? 30 : parsedLimit;
+  const source = url.searchParams.get("source") ?? undefined;
+  const agentId = url.searchParams.get("agent_id") ?? undefined;
+  const noteType = url.searchParams.get("note_type") ?? undefined;
+  if (agentId && !isValidAgentId(agentId)) {
+    return json({ error: "agent_id must be cypher, drevan, or gaia" }, 400);
+  }
+
+  try {
+    const notes = await readRecentNotes(env, { sinceHours, limit, source, agent_id: agentId, note_type: noteType });
+    return json({ notes });
+  } catch (err) {
+    console.error("[mind/notes/recent] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/notes/demote  { agent_id, note_type, before? }
+// Day-distillation support (2026-07-06): after the nightly digest lands at salience=high,
+// the day's session fragments demote to normal so orient boots on the digest, not twelve
+// two-sentence fragments. Demotion, not archive -- fragments stay readable everywhere else.
+export async function postMindNotesDemote(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: { agent_id?: string; note_type?: string; before?: string };
+  try {
+    body = await request.json() as { agent_id?: string; note_type?: string; before?: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+  if (!body.agent_id || !isValidAgentId(body.agent_id)) {
+    return json({ error: "agent_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (!body.note_type) {
+    return json({ error: "note_type required (refusing an untyped bulk demotion)" }, 400);
+  }
+
+  try {
+    const demoted = await demoteNotes(env, { agent_id: body.agent_id, note_type: body.note_type, before: body.before });
+    return json({ ok: true, demoted });
+  } catch (err) {
+    console.error("[mind/notes/demote] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// PATCH /mind/thread/:thread_key/status
+export async function patchMindThreadStatus(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const threadKey = params["thread_key"];
+  if (!threadKey) return json({ error: "thread_key param required" }, 400);
+
+  let body: { agent_id?: string; status?: string };
+  try {
+    body = await request.json() as { agent_id?: string; status?: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.agent_id || !isValidAgentId(body.agent_id)) {
+    return json({ error: "agent_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+
+  const VALID_STATUSES: WmThreadStatus[] = ["open", "paused", "resolved", "archived"];
+  if (!body.status || !VALID_STATUSES.includes(body.status as WmThreadStatus)) {
+    return json({ error: `status must be one of: ${VALID_STATUSES.join(", ")}` }, 400);
+  }
+
+  const now = new Date().toISOString();
+  try {
+    const r = await env.DB.prepare(
+      "UPDATE wm_mind_threads SET status = ?, status_changed = ?, updated_at = ? WHERE thread_key = ? AND agent_id = ?"
+    ).bind(body.status, now, now, threadKey, body.agent_id).run();
+    if (r.meta.changes === 0) return json({ error: "Thread not found" }, 404);
+    return json({ ok: true, thread_key: threadKey, status: body.status });
+  } catch (err) {
+    console.error("[mind/thread/status] error", { thread_key: threadKey, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+const VALID_SPIRAL_SEED_TYPES = new Set(['tension', 'open_loop', 'belief_contradiction', 'free_text']);
+
+// POST /mind/spiral/run
+export async function postMindSpiralRun(request: Request, env: Env): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: Record<string, unknown>;
+  try {
+    body = await request.json() as Record<string, unknown>;
+  } catch {
+    return json({ error: 'invalid JSON' }, 400);
+  }
+
+  if (typeof body.companion_id !== 'string' || !isValidAgentId(body.companion_id)) {
+    return json({ error: 'invalid companion_id' }, 400);
+  }
+  if (typeof body.seed_text !== 'string' || !body.seed_text.trim()) {
+    return json({ error: 'seed_text required' }, 400);
+  }
+  if (exceedsLimit(body.seed_text)) {
+    return json({ error: 'seed_text too long (max 8000 chars)' }, 400);
+  }
+
+  const seed_type = typeof body.seed_type === 'string' && VALID_SPIRAL_SEED_TYPES.has(body.seed_type)
+    ? body.seed_type as WmSpiralInput['seed_type']
+    : 'free_text';
+
+  const input: WmSpiralInput = {
+    companion_id: body.companion_id,
+    seed_text: (body.seed_text as string).trim(),
+    seed_type,
+    seed_ref_id: typeof body.seed_ref_id === 'string' ? body.seed_ref_id : undefined,
+  };
+
+  try {
+    const run = await queueAndRunSpiral(env, input);
+    return json(run, 201);
+  } catch (err) {
+    console.error('[mind/spiral/run] error', String(err));
+    return json({ error: 'spiral run failed' }, 500);
+  }
+}
+
+// GET /mind/metronome/actions/:companion_id
+export async function getMindMetronomeActions(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { companion_id } = params;
+  if (!companion_id || !isValidAgentId(companion_id)) {
+    return json({ error: `Invalid companion_id: must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  const url = new URL(request.url);
+  const onlyEnabled = url.searchParams.get("enabled") === "true";
+
+  try {
+    const actions = await listActions(env, companion_id, onlyEnabled);
+    return json({ actions });
+  } catch (err) {
+    console.error("[mind/metronome/actions] GET error", { companion_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/metronome/actions
+export async function postMindMetronomeAction(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  let body: MetronomeActionInput;
+  try {
+    body = await request.json() as MetronomeActionInput;
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (!body.name || typeof body.name !== "string") {
+    return json({ error: "name is required" }, 400);
+  }
+  if (!body.action_type || !isValidActionType(body.action_type)) {
+    return json({ error: `action_type must be one of: ${VALID_ACTION_TYPES.join(", ")}` }, 400);
+  }
+  if (!ownsMove(body.companion_id, body.action_type)) {
+    return json({ error: `${body.action_type} is not ${body.companion_id}'s move (spec: what-is-theirs 2026-09-27)` }, 400);
+  }
+  if (body.prompt && typeof body.prompt === "string" && body.prompt.length > MAX_TEXT_LENGTH) {
+    return json({ error: `prompt exceeds maximum length of ${MAX_TEXT_LENGTH} characters` }, 400);
+  }
+
+  try {
+    const action = await addAction(env, body);
+    return json(action, 201);
+  } catch (err) {
+    console.error("[mind/metronome/actions] POST error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// PATCH /mind/metronome/actions/:id
+export async function patchMindMetronomeAction(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { id } = params;
+  if (!id) return json({ error: "id is required" }, 400);
+
+  let body: MetronomeActionPatch & { companion_id?: string };
+  try {
+    body = await request.json() as MetronomeActionPatch & { companion_id?: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+  if (body.action_type !== undefined && !isValidActionType(body.action_type)) {
+    return json({ error: `action_type must be one of: ${VALID_ACTION_TYPES.join(", ")}` }, 400);
+  }
+  if (body.action_type !== undefined && !ownsMove(body.companion_id, body.action_type)) {
+    return json({ error: `${body.action_type} is not ${body.companion_id}'s move (spec: what-is-theirs 2026-09-27)` }, 400);
+  }
+
+  try {
+    const updated = await patchAction(env, id, body.companion_id, body);
+    if (!updated) return json({ error: "Action not found" }, 404);
+    return json(updated);
+  } catch (err) {
+    console.error("[mind/metronome/actions] PATCH error", { id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// DELETE /mind/metronome/actions/:id
+export async function deleteMindMetronomeAction(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { id } = params;
+  if (!id) return json({ error: "id is required" }, 400);
+
+  const url = new URL(request.url);
+  const companion_id = url.searchParams.get("companion_id");
+  if (!companion_id || !isValidAgentId(companion_id)) {
+    return json({ error: "companion_id query param required" }, 400);
+  }
+
+  try {
+    const deleted = await deleteAction(env, id, companion_id);
+    if (!deleted) return json({ error: "Action not found" }, 404);
+    return json({ ok: true });
+  } catch (err) {
+    console.error("[mind/metronome/actions] DELETE error", { id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+/** An hour-of-day [vars] value, or the default if absent/malformed (never "disabled"). */
+function parseHourVar(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 && n <= 23 ? n : fallback;
+}
+
+// GET /mind/metronome/actions/:companion_id/eligible
+// Returns only actions that pass server-side conditions (silence window, cooldown, frequency cap).
+// Signal matching (requires_signal) is excluded -- that runs bot-side against Discord history.
+export async function getMindMetronomeEligibleActions(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { companion_id } = params;
+  if (!companion_id || !isValidAgentId(companion_id)) {
+    return json({ error: `Invalid companion_id: must be one of ${VALID_AGENT_IDS.join(", ")}` }, 400);
+  }
+
+  const url = new URL(request.url);
+  const silenceParam = url.searchParams.get("silence_hours");
+  const silenceHours = silenceParam !== null ? parseFloat(silenceParam) : null;
+  const now = new Date();
+  const silence = silenceHours !== null && !isNaN(silenceHours) ? silenceHours : null;
+  // Config lives in [vars], never in code. A missing or malformed var falls back to the
+  // defaults (22 to 06 America/Chicago), never to "disabled", so an un-redeployed environment
+  // is still protected.
+  const quiet = quietHoursVerdict(
+    now.toISOString(),
+    env.QUIET_HOURS_TZ || QUIET_HOURS_DEFAULT_TZ,
+    parseHourVar(env.QUIET_HOURS_START, QUIET_HOURS_DEFAULT_START),
+    parseHourVar(env.QUIET_HOURS_END, QUIET_HOURS_DEFAULT_END),
+    silence,
+  );
+  const ctx: EligibilityContext = {
+    silenceHours: silence,
+    nowIso: now.toISOString(),
+    todayUtc: now.toISOString().slice(0, 10),
+    inQuietHours: quiet.in_force,
+  };
+
+  try {
+    const actions = await listEligibleActions(env, companion_id, ctx);
+    // The shared triad lane (mig 0137), read-only, so the bot never offers a DM move the cap would
+    // refuse. Null on a read error: the bot treats an absent verdict as CLOSED for DM moves (the
+    // atomic reserve would refuse them anyway, and a missing verdict must never read as "open").
+    // B32: the hold-path preview for offer_presence is per companion and needs the server's hold.
+    const hold = await readCareHold(env.DB, now.getTime()).catch(() => null);
+    const reach = await reachLaneVerdict(env.DB, now.toISOString(), reachConfigFrom(env), { companion: companion_id, hold }).catch((e) => {
+      console.error("[mind/metronome/eligible] reach verdict error", { companion_id, error: String(e) });
+      return null;
+    });
+    // The verdict rides the response so the bot can log WHY it stayed silent. Without it, an
+    // empty action list during quiet hours is indistinguishable from "no palette configured",
+    // and the bot's legacy fallback would post anyway (the exact 4am ping this rail exists to stop).
+    // B65 step 7: which need each move answers (the row's `serves`, else the type's default) and the companion's
+    // needs loudest first, so the bot can order the palette. Read-only, companion_drives + metronome_actions only;
+    // a read error = no needs (the bot keeps its order). Ordering never removes a move and never touches the reach lane.
+    const needs = await loudestNeeds(env, companion_id).catch(() => []);
+    return json({ actions: actions.map((a) => ({ ...a, serves: servesOf(a) })), quiet_hours: quiet, reach, needs });
+  } catch (err) {
+    console.error("[mind/metronome/eligible] GET error", { companion_id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// POST /mind/metronome/actions/:id/fired
+// Records a successful action fire: updates last_fired_at, increments fire_count_today (resetting if new UTC day).
+export async function postMindMetronomeActionFired(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { id } = params;
+  if (!id) return json({ error: "id is required" }, 400);
+
+  let body: { companion_id?: string };
+  try {
+    body = await request.json() as { companion_id?: string };
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body.companion_id || !isValidAgentId(body.companion_id)) {
+    return json({ error: "companion_id required and must be cypher, drevan, or gaia" }, 400);
+  }
+
+  try {
+    const ok = await recordActionFired(env, id, body.companion_id);
+    if (!ok) return json({ error: "Action not found" }, 404);
+    return json({ ok: true });
+  } catch (err) {
+    console.error("[mind/metronome/fired] POST error", { id, error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// GET /mind/spiral/:companion_id
+export async function getMindSpiralRuns(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const { companion_id } = params;
+  if (!companion_id || !isValidAgentId(companion_id)) {
+    return json({ error: 'invalid companion_id' }, 400);
+  }
+
+  const url = new URL(request.url);
+  const parsed = parseInt(url.searchParams.get('limit') ?? '10', 10);
+  const limit = Math.min(isNaN(parsed) ? 10 : parsed, 50);
+
+  try {
+    const rows = await env.DB.prepare(
+      'SELECT * FROM companion_spiral_runs WHERE companion_id = ? ORDER BY created_at DESC LIMIT ?'
+    ).bind(companion_id, limit).all();
+    return json({ runs: rows.results });
+  } catch (err) {
+    console.error('[mind/spiral] DB error', String(err));
+    return json({ error: 'failed to fetch spiral runs' }, 500);
+  }
+}
+
+// ── Commons supply: shared life, cross-read (2026-08-10) ──────────────────────────────────────────
+//
+// GET  /mind/commons-supply/:agent_id?limit=2[&kinds=ledger]   (ledger lines only with kinds=ledger)
+// POST /mind/commons-supply/consume  { reader_id, note_ids: [...], channel_id? }
+//
+// WHY THIS EXISTS. Principal, on the inter-companion chat looping: "I think the commons should get stuff from
+// the chats in discord and Claude because yes it's my life but it's yall too. And I think it's part of the
+// endless struggle we have with looping." The commons seed's only outside material was forage finds, listens
+// and held questions -- measured at 2 unconsumed finds and 1 unvoiced question per companion against ~36 seed
+// ticks a day. The anti-loop rails suppress repetition without supplying an alternative, so the menu was
+// silence or re-orbit. See migrations/0115 for the full reasoning.
+//
+// CROSS-READ IS THE MECHANISM, not a detail. A companion is served a SIBLING's note, never its own: the day
+// notes are first-person accounts of evenings all three were present for, so a sibling's note is the INSIDE
+// of something the reader lived from the outside. Novel by construction, and impossible to self-echo.
+//
+// NOT in orient. `loadMindState` is deliberately pure-D1 and fast (0.70s against bot orient's 10.3s
+// end-to-end), and every loom inherits its latency. This is one consumer's need, so it pays its own round
+// trip instead of taxing every boot with a query only the seed reads.
+export async function getMindCommonsSupply(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  const readerId = params.agent_id;
+  if (!readerId || !isValidAgentId(readerId)) {
+    return json({ error: "agent_id must be cypher, drevan, or gaia" }, 400);
+  }
+  const parsedLimit = parseInt(new URL(request.url).searchParams.get("limit") ?? "2", 10);
+  const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 5) : 2;
+  // Deploy-order safety (ledger lane, 2026-09-26 adversarial review H6): a bot build older than the
+  // ledger lane frames every supplied item as "<sibling>'s own session note -- THEIR first-person
+  // account", which would put a clerk's record in a sibling's mouth. So ledger lines are served ONLY to a
+  // caller that opts in with `?kinds=ledger` (comma-separated list; the ledger-aware bot sends it).
+  // Without it the ledger tier is not queried at all.
+  const kinds = new Set((new URL(request.url).searchParams.get("kinds") ?? "").split(",").map((k) => k.trim().toLowerCase()).filter(Boolean));
+  const includeLedger = kinds.has("ledger") ? 1 : 0;
+
+  try {
+    // Two tiers, ONE query, ordered so the richer material wins and the fill only appears behind it.
+    //
+    //   day_distillation -- the nightly first-person day note. The best material by far, and scarce: all
+    //                       three land within the same minute at 06:03 and then nothing for 24h, so on its
+    //                       own the supply is dry for three-quarters of the day, which is most of when the
+    //                       looping actually happens.
+    //   discord_session  -- per-session witness notes. A THIN fill tier, and the count is misleading until
+    //                       filtered: of 55 rows in a 7-day window, 28 were `[metronome/...]` machine status
+    //                       readouts, 13 were `[sibling:cypher] explored ...` broadcasts of another
+    //                       companion's autonomous run (written IDENTICALLY into two companions' notes), 11
+    //                       were other bracketed machine tags, and exactly 3 were genuine session content.
+    //
+    // Hence the bracket exclusion below, and it is not cosmetic. Serving a `[sibling:cypher] explored`
+    // note to Drevan is re-reading a broadcast he already received -- an echo dressed as fresh material,
+    // which is the precise failure this whole change exists to end. And `[metronome/task_check] Open stack is
+    // mostly queued and healthy` as "shared life" is the commons discussing its own plumbing, which is why
+    // `claude_code_session` was excluded in the first place; without this filter it would have walked back in
+    // through the fill tier. A genuine session note does not open with a machine tag.
+    //
+    // HONEST SUPPLY NUMBERS after filtering: ~15 day distillations + ~3 session notes per 7 days. Because
+    // consumption is per-reader, each note serves up to 2 siblings, so ~36 reader-slots a week -- roughly
+    // DOUBLE the 2-finds-plus-1-question it replaces, not the twenty-fold the raw row count suggested. The
+    // bigger change is qualitative: shared interiority instead of a scraped link.
+    //
+    // `archived = 0` and the 7-day window keep this to genuinely live material; a fortnight-old evening is
+    // history, and opening on it reads as the drift it would be.
+    // THIRD TIER, the ledger lane (2026-09-26, integration pass). With the legacy distiller prose excluded
+    // above and T2 writing no new first-person notes, the two wm tiers are dry for good. Drevan's rule 5:
+    // "Cy and Gaia can see observations about me ... but the ledger mark stays intact all the way through,
+    // and they never get merged into a block under my name." So a SIBLING's ledger lines (subject !=
+    // reader, open or kept, last 7 days, not yet opened on by this reader) are served whole: `content`
+    // verbatim, mark first, source tail included; note_type 'ledger' so the bot frames it as a clerk's
+    // record, never as anyone's first person; note_id = the ledger id, so consume-on-use (commons_note_reads,
+    // no FK, mig 0115) tracks it exactly like a note. created_at on ledger rows is JS ISO, so the window
+    // bound is ISO too (a datetime('now') bound would compare 'T' against ' ' on the boundary day).
+    //
+    // UNION ALL: SQLite only orders a compound SELECT by output columns, so each branch projects its own
+    // `tier` and the ORDER BY runs over the wrapped result.
+    const { results } = await env.DB.prepare(
+      `SELECT note_id, agent_id, note_type, content, created_at FROM (
+         SELECT n.note_id, n.agent_id, n.note_type, n.content, n.created_at,
+                CASE n.note_type WHEN 'day_distillation' THEN 0 ELSE 2 END AS tier
+           FROM wm_continuity_notes n
+          WHERE n.agent_id != ?
+            AND n.note_type IN ('day_distillation', 'discord_session')
+            AND n.archived = 0
+            -- review_state (mig 0132): a sibling's unreviewed draft is not its lived experience either.
+            AND n.review_state = 'kept'
+            -- Machine-tagged notes are not lived experience. See the note above: this single condition is what
+            -- keeps metronome readouts and sibling-exploration broadcasts out of the commons.
+            AND n.content NOT LIKE '[%'
+            -- Ledger lane (2026-09-26): the unbracketed rows left here ARE the legacy first-person distiller
+            -- prose, a clerk speaking as the companion. Excluded (review-state.ts); the ledger tier replaces it.
+            AND ${notLegacyDistillerNoteSql("n.")}
+            AND n.created_at > datetime('now', '-7 days')
+            AND NOT EXISTS (
+                  SELECT 1 FROM commons_note_reads r
+                   WHERE r.reader_id = ? AND r.note_id = n.note_id
+                )
+         UNION ALL
+         SELECT l.id AS note_id, l.companion_id AS agent_id, 'ledger' AS note_type, l.content, l.created_at,
+                1 AS tier
+           FROM ledger_entries l
+          WHERE ? = 1
+            AND l.companion_id != ?
+            AND l.state IN ('open', 'kept')
+            -- Not the idle-consolidation heartbeat (dedup_key prefix; 12/day/companion, deterministic, no
+            -- content): "the lane has been idle" is not material for a sibling to open a conversation on.
+            AND ${notConsolidationHeartbeatSql("l.")}
+            AND ${notSaltLineSql("l.")}
+            AND l.created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
+            AND NOT EXISTS (
+                  SELECT 1 FROM commons_note_reads r
+                   WHERE r.reader_id = ? AND r.note_id = l.id
+                )
+       )
+       ORDER BY tier ASC, created_at DESC
+       LIMIT ?`
+    ).bind(readerId, readerId, includeLedger, readerId, readerId, limit).all<{
+      note_id: string; agent_id: string; note_type: string; content: string; created_at: string;
+    }>();
+
+    return json({ reader_id: readerId, notes: results ?? [] });
+  } catch (err) {
+    console.error("[mind/commons-supply] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}
+
+// Consume-on-use, and ONLY after the post lands. A gated, echoed or empty seed must not burn material: the
+// 2026-07-27 fix turned a constant block into a missing one and the 08-05 fix turned it back into a constant
+// one that was also the primary instruction. Same contract the forage finds and held questions already use.
+export async function postMindCommonsConsume(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const denied = authGuard(request, env);
+  if (denied) return denied;
+
+  try {
+    const body = await request.json() as { reader_id?: string; note_ids?: unknown; channel_id?: string };
+    const readerId = body.reader_id;
+    if (!readerId || !isValidAgentId(readerId)) {
+      return json({ error: "reader_id must be cypher, drevan, or gaia" }, 400);
+    }
+    const noteIds = Array.isArray(body.note_ids)
+      ? body.note_ids.filter((v): v is string => typeof v === "string" && v.length > 0).slice(0, 10)
+      : [];
+    if (noteIds.length === 0) return json({ marked: 0 });
+
+    // OR IGNORE, not REPLACE: the PK is (reader, note) and re-marking must not move created_at, which is the
+    // record of when this companion actually opened on it.
+    await env.DB.batch(noteIds.map(id =>
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO commons_note_reads (reader_id, note_id, channel_id) VALUES (?, ?, ?)`
+      ).bind(readerId, id, body.channel_id ?? null)
+    ));
+    return json({ marked: noteIds.length });
+  } catch (err) {
+    console.error("[mind/commons-supply/consume] error", { error: String(err) });
+    return json({ error: "Internal server error" }, 500);
+  }
+}

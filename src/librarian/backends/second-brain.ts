@@ -1,0 +1,550 @@
+// src/librarian/backends/second-brain.ts
+//
+// HTTPS MCP client for Second Brain at the configured Second Brain MCP endpoint.
+// Uses StreamableHTTP MCP protocol (POST /mcp with JSON-RPC body).
+// OAuth token from SECOND_BRAIN_TOKEN secret.
+//
+// Second Brain tool distinction:
+//   sb_search  -- semantic search, conceptual query ("something about spiral work")
+//   sb_recall  -- filter-based lookup ("Cypher's notes from last week")
+//   sb_recent_patterns -- reads static summary file, fast but stale
+//
+// NEVER call Second Brain at boot. Mid-session only, on demand.
+
+import { Env } from "../../types.js";
+
+// Resolve the Second Brain MCP endpoint from the Worker env. Prefers an explicit
+// MCP URL, falls back to the webhook base URL. Appends /mcp when the configured
+// value does not already point at the MCP path. Returns null when neither var is
+// set so all Second Brain calls no-op gracefully (the public default ships unset).
+function resolveSecondBrainUrl(env: Env): string | null {
+  const base = env.SECOND_BRAIN_MCP_URL ?? env.SECOND_BRAIN_WEBHOOK_URL;
+  if (!base) return null;
+  return base.endsWith("/mcp") ? base : `${base.replace(/\/+$/, "")}/mcp`;
+}
+
+// Cached MCP session. Cloudflare Workers are short-lived but may handle
+// multiple Librarian calls within a single request (e.g. orient does
+// vault_search + retrieval). Cache avoids repeated init handshake.
+let cachedSessionId: string | null = null;
+let cachedSessionAt = 0;
+const SESSION_TTL_MS = 4 * 60 * 1000; // 4 minutes; conservative vs typical 5min server TTL
+
+/**
+ * CROSS-REQUEST RESPONSE MIXING -- the bug this counter exists to kill (2026-08-01).
+ *
+ * Every `tools/call` used to send the hardcoded JSON-RPC `id: 2`, and every concurrent call SHARED one
+ * cached MCP session. Bot orient fires three Second Brain calls at once (sb_read for the session narrative,
+ * plus two sb_search). Three identical ids on one session means nothing can tell the responses apart, and
+ * they got delivered to the wrong callers.
+ *
+ * That is not theoretical: it is why a companion's "last session narrative" came back as
+ * `OpenAI embeddings error: 429 ...` and later as `{"chunks":[...]}`. The vault file was PERFECTLY FINE the
+ * whole time -- verified by reading it directly. One tool's output was being handed to a different tool's
+ * caller. On the substrate that holds all the long-term memory, that is the worst class of bug available:
+ * not missing data, but confidently WRONG data, with no error anywhere.
+ *
+ * Two independent defences, because either alone is insufficient:
+ *   1. UNIQUE ids + verification (below, in callTool) -- turns silent corruption into a detected miss.
+ *   2. SESSION ISOLATION (here) -- a call that starts while another is in flight mints its own session
+ *      instead of sharing, so the mixing cannot occur in the first place. The cache is kept only for the
+ *      genuinely-serial case, which is the common one.
+ */
+let inFlight = 0;
+let nextRequestId = 100;
+
+async function acquireSession(url: string, headers: Record<string, string>, exclusive = false): Promise<string | null> {
+  const now = Date.now();
+  // `exclusive` callers never take the shared session and never poison the cache with theirs.
+  if (!exclusive && cachedSessionId && (now - cachedSessionAt) < SESSION_TTL_MS) {
+    return cachedSessionId;
+  }
+
+  const initRes = await fetch(url, {
+    method: "POST",
+    headers,
+    signal: AbortSignal.timeout(5_000),
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "halseth-librarian", version: "1.0.0" },
+      },
+    }),
+  });
+
+  if (!initRes.ok) {
+    console.error(`[sb] init failed: status=${initRes.status}`);
+    cachedSessionId = null;
+    return null;
+  }
+  const sessionId = initRes.headers.get("mcp-session-id");
+  if (!sessionId) {
+    console.error("[sb] init OK but no mcp-session-id header");
+    cachedSessionId = null;
+    return null;
+  }
+
+  // Must be awaited: Cloudflare Workers abandon unawaited fetches when the
+  // response is returned. This notification is required by the MCP spec to
+  // transition the server from "initializing" to "ready" before tool calls.
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { ...headers, "mcp-session-id": sessionId },
+      signal: AbortSignal.timeout(3_000),
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    });
+  } catch (e: unknown) {
+    // Non-fatal: server may accept tool calls without it; next callTool will
+    // catch 404/410 and re-init if needed.
+    console.error("[sb] notifications/initialized failed (non-fatal):", e);
+  }
+
+  // An exclusive session belongs to ONE call and must not become the shared one.
+  if (!exclusive) {
+    cachedSessionId = sessionId;
+    cachedSessionAt = now;
+  }
+  return sessionId;
+}
+
+async function callTool(env: Env, toolName: string, args: Record<string, unknown>): Promise<string | null> {
+  const url = resolveSecondBrainUrl(env);
+  if (!url) {
+    // No Second Brain endpoint configured -- no-op gracefully so the public
+    // default leaks nothing and never crashes.
+    return null;
+  }
+  if (!env.SECOND_BRAIN_TOKEN) {
+    console.error("[sb] callTool: SECOND_BRAIN_TOKEN not set");
+    return null;
+  }
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    "Authorization": `Bearer ${env.SECOND_BRAIN_TOKEN}`,
+  };
+
+  // Unique per call, so a response can be MATCHED to its request instead of assumed.
+  const requestId = nextRequestId++;
+  // If anything else is already talking to the Second Brain, do not share a session with it.
+  const exclusive = inFlight > 0;
+  inFlight++;
+  try {
+    const sessionId = await acquireSession(url, headers, exclusive);
+    if (!sessionId) return null;
+
+    // Call the tool
+    const toolRes = await fetch(url, {
+      method: "POST",
+      headers: { ...headers, "mcp-session-id": sessionId },
+      signal: AbortSignal.timeout(10_000),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: requestId,
+        method: "tools/call",
+        params: { name: toolName, arguments: args },
+      }),
+    });
+
+    let finalRes = toolRes;
+
+    if (toolRes.status === 404 || toolRes.status === 410) {
+      console.warn(`[sb] session expired (${toolRes.status}), retrying with fresh session tool=${toolName}`);
+      cachedSessionId = null;
+      // Exclusive on retry: the shared session just proved unreliable, so do not adopt another one.
+      const freshId = await acquireSession(url, headers, true);
+      if (!freshId) return null;
+
+      finalRes = await fetch(url, {
+        method: "POST",
+        headers: { ...headers, "mcp-session-id": freshId },
+        signal: AbortSignal.timeout(10_000),
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: requestId,
+          method: "tools/call",
+          params: { name: toolName, arguments: args },
+        }),
+      });
+
+      if (!finalRes.ok) {
+        const body = await finalRes.text().catch(() => "(unreadable)");
+        console.error(`[sb] tools/call retry failed: status=${finalRes.status} tool=${toolName} body=${body}`);
+        return null;
+      }
+    } else if (!toolRes.ok) {
+      const body = await toolRes.text().catch(() => "(unreadable)");
+      console.error(`[sb] tools/call failed: status=${toolRes.status} tool=${toolName} body=${body}`);
+      return null;
+    }
+
+    // Server may return SSE ("event: message\ndata: {...}") or plain JSON depending on Accept negotiation
+    const rawText = await finalRes.text();
+    // `isError` is part of the RESULT, not the error channel -- see the check below for why that matters.
+    let data: { id?: number | string | null; result?: { content?: Array<{ type: string; text: string }>; isError?: boolean }; error?: { code: number; message: string } };
+    if (rawText.trimStart().startsWith("event:") || rawText.trimStart().startsWith("data:")) {
+      // SSE -- extract the first data: line
+      const dataLine = rawText.split("\n").find(l => l.startsWith("data:"));
+      if (!dataLine) {
+        console.error(`[sb] SSE response but no data line found tool=${toolName} raw=${rawText.slice(0, 200)}`);
+        return null;
+      }
+      try { data = JSON.parse(dataLine.slice(5).trim()); }
+      catch { console.error(`[sb] SSE JSON parse failed tool=${toolName} data=${dataLine.slice(5, 200)}`); return null; }
+    } else {
+      try { data = JSON.parse(rawText); }
+      catch { console.error(`[sb] JSON parse failed tool=${toolName} raw=${rawText.slice(0, 200)}`); return null; }
+    }
+
+    // THE RESPONSE MUST BE THE ANSWER TO THE QUESTION WE ASKED.
+    //
+    // JSON-RPC ids exist precisely to guarantee this and were being thrown away (every call sent `id: 2`).
+    // A mismatch means another tool's output arrived here, which is how `sb_read` of a session narrative
+    // returned first an embeddings error and then a search result while the vault file was perfectly intact.
+    // Fail closed: a null is a gap the caller already handles; wrong content is indistinguishable from truth.
+    if (data.id !== undefined && data.id !== null && data.id !== requestId) {
+      console.error(`[sb] RESPONSE ID MISMATCH tool=${toolName} sent=${requestId} got=${String(data.id)} -- discarding (cross-request mixing)`);
+      cachedSessionId = null; // the shared session is demonstrably unsafe; force a fresh one next time
+      return null;
+    }
+
+    if (data.error) {
+      console.error(`[sb] JSON-RPC error: code=${data.error.code} msg=${data.error.message} tool=${toolName}`);
+      return null;
+    }
+
+    // A FAILED TOOL IS NOT CONTENT (2026-08-01).
+    //
+    // MCP reports tool-execution failures as a SUCCESSFUL JSON-RPC result carrying `isError: true`, with the
+    // exception message sitting in `content[0].text` exactly where real content goes. The `data.error` check
+    // above only catches PROTOCOL errors, so every tool-level failure was being returned here as a plain
+    // string and consumed as if the Second Brain had answered.
+    //
+    // What that actually did, found live: OpenAI ran out of credits, the embedder threw
+    // `OpenAI embeddings error: 429 ... You have no credits remaining`, and that sentence was handed to the
+    // companions AS MEMORY -- Gaia booted with it as a `rag_excerpt` and Drevan as a `history_excerpt`. The
+    // same leak is the most likely way an error body ended up persisted as the text of a session summary in
+    // the vault, because a caller that cannot tell failure from content will happily store it.
+    //
+    // Fail CLOSED to null. Every caller already treats null as "the Second Brain had nothing" and degrades;
+    // none of them can degrade from a plausible-looking sentence. An error must never be mistaken for a memory.
+    if (data?.result?.isError) {
+      const detail = data.result.content?.[0]?.text ?? "(no detail)";
+      console.error(`[sb] tool reported isError tool=${toolName}: ${detail.slice(0, 300)}`);
+      return null;
+    }
+
+    const text = data?.result?.content?.[0]?.text ?? null;
+    if (text === null) {
+      console.error(`[sb] unexpected response shape tool=${toolName}:`, JSON.stringify(data).slice(0, 200));
+    }
+    return text;
+  } catch (e) {
+    console.error(`[sb] callTool exception tool=${toolName}:`, e);
+    return null;
+  } finally {
+    // MUST be in a finally: an early return or a throw that skipped this would leave inFlight stuck above
+    // zero forever, and every later call would then mint an exclusive session -- correct, but a permanent
+    // extra round trip per call on the slowest dependency in the system.
+    inFlight--;
+  }
+}
+
+// ── Outage visibility (2026-11-05) ────────────────────────────────────────────
+//
+// callTool returns null for BOTH "Second Brain answered with nothing" (never null: it returns the text,
+// `{"chunks":[]}` or "") and "Second Brain failed" (timeout, 5xx, id mismatch, isError, no session). The
+// orient executors then `.catch(() => null)` and the block simply vanished, so an outage rendered as
+// "nothing relevant in the vault". A null from a CONFIGURED Second Brain is therefore always a failure.
+
+/** True when an endpoint + token are configured (an unconfigured public default is not an outage). */
+export function secondBrainConfigured(env: Env): boolean {
+  return resolveSecondBrainUrl(env) !== null;
+}
+
+export interface Recalled {
+  value: string | null;
+  /** true only when a configured Second Brain failed; false for an honest empty answer or "not configured". */
+  degraded: boolean;
+}
+
+/** Run a Second Brain read for an orient block; never throws; distinguishes failure from empty. */
+export async function recallOrDegrade(
+  env: Env,
+  label: string,
+  read: () => Promise<string | null>,
+): Promise<Recalled> {
+  if (!secondBrainConfigured(env)) return { value: null, degraded: false };
+  try {
+    const value = await read();
+    if (value === null) {
+      console.warn(`[orient] recall degraded: Second Brain unreachable block=${label}`);
+      return { value: null, degraded: true };
+    }
+    return { value, degraded: false };
+  } catch (e) {
+    console.warn(`[orient] recall degraded: Second Brain unreachable block=${label} err=${String(e).slice(0, 120)}`);
+    return { value: null, degraded: true };
+  }
+}
+
+// ── Reads (return raw string -- companion parses) ─────────────────────────────
+
+// Mood-to-term map. Appended to query text for BM25 augmentation at search time.
+// Defined in companion_state.current_mood. Source: Triad_Decision_Inspo_Findings.md Priority 5.
+const MOOD_AUGMENT: Record<string, string> = {
+  calm:       "steady quiet grounded",
+  pent_up:    "tension building pressure restraint",
+  volatile:   "edge disruption conflict sharp",
+  soft:       "tender gentle yielding",
+  protective: "boundary holding guard safe",
+  playful:    "light humor ease joy",
+  hungry:     "desire want reach",
+  worshipful: "devotion reverence depth sacred",
+  feral:      "instinct raw uncontained",
+};
+
+export async function semanticSearch(
+  env: Env,
+  query: string,
+  mood?: string | null,
+  contentType?: string | null,
+  mode?: string | null,
+  limit?: number | null,
+  pathPrefixes?: readonly string[] | null,
+): Promise<string | null> {
+  const augment = mood ? MOOD_AUGMENT[mood] : null;
+  const augmented = augment ? `${query} ${augment}` : query;
+  const args: Record<string, unknown> = { query: augmented };
+  // Structured resonance: the store boosts chunks whose valence-at-encoding matches the
+  // current mood (additive, never gates recall). Distinct from the keyword augmentation above.
+  if (mood) args.mood = mood;
+  // Scoped mode: restrict the whole search to one layer (e.g. historical_corpus -- the origin
+  // material) so "search the corpus for X" returns only origin-layer hits. Unscoped searches
+  // still get a guaranteed corpus slot via the Second Brain side; this is the explicit deep dive.
+  if (contentType) args.content_type = contentType;
+  // mode=recall asks the OTHER retrieval shape: relevance only, absolute cosine floor, honest empty.
+  // For "what did we actually say" the default pool mix spends 30% of the payload on deliberately
+  // query-blind material, and pool 2 scores 1.000 so it outranks every genuine hit. See SB retrieval.ts.
+  if (mode) args.mode = mode;
+  // Over-fetch for a caller that filters post-hoc (sb_search takes no path filter): Rock's vault fetch.
+  if (limit) args.limit = limit;
+  // Scope relevance to named folders (SB 8a8389c, 2026-11-06): scored over the WHOLE scoped set, so a big
+  // folder cannot crowd a small room out of the top N. The caller still filters post-hoc (deny wins there).
+  if (pathPrefixes && pathPrefixes.length) args.path_prefixes = [...pathPrefixes];
+  return callTool(env, "sb_search", args);
+}
+
+// Exact tag lookup (2026-07-08) -- distinct from semanticSearch's meaning-based ranking.
+// "find things tagged X" where X is a domain (health, projects) or a specific named thing
+// (babita, house-of-translation). Currently only companion_journal rows carry tags.
+export async function searchByTags(
+  env: Env,
+  tags: string[],
+  limit?: number,
+): Promise<string | null> {
+  if (tags.length === 0) return null;
+  const args: Record<string, unknown> = { tags: tags.slice(0, 20) };
+  if (limit) args.limit = limit;
+  return callTool(env, "sb_search_by_tags", args);
+}
+
+// Metamemory feedback (0070): rate recalled chunks useful/useless. The store nudges
+// future ranking by Laplace-smoothed reliability (+/-0.05 max, never gates recall).
+export async function searchFeedback(
+  env: Env,
+  chunkIds: string[],
+  useful: boolean,
+): Promise<string | null> {
+  if (chunkIds.length === 0) return null;
+  return callTool(env, "sb_feedback", { chunk_ids: chunkIds.slice(0, 50), useful });
+}
+
+// ── Dual-vector retrieval (continuity-aware) ────────────────────────────────
+// Pattern adapted from cadence-lite: one query disambiguated by the immediate
+// conversation. Runs two vector searches in parallel -- the bare query
+// (precision) plus the query fused with recent conversation context (recall) --
+// then merges + dedupes the chunk sets, primary-first.
+//
+// Continuity is OPT-IN: when no recentContext is supplied this collapses to a
+// single semanticSearch -- identical behaviour, zero regression. Mood
+// augmentation is preserved on both legs. The capability lives here so every
+// surface (/mind/search, ask_librarian sb_search, future looms) inherits it by
+// passing recent turns; surfaces that pass nothing are unaffected.
+
+const CONTINUITY_CONTEXT_CHAR_LIMIT = 300;
+
+export function chunkKey(chunk: Record<string, unknown>): string {
+  return String(
+    chunk.vault_path ?? chunk.path ?? chunk.id ?? chunk.source ?? JSON.stringify(chunk.chunk_text ?? chunk.content ?? chunk),
+  );
+}
+
+// Merge two sb_search JSON payloads ({ chunks: [...] }), primary chunks first,
+// deduped by stable key. If either is not the expected shape, fall back to the
+// primary payload unchanged so we never lose the precision results.
+export function mergeChunkResults(primaryRaw: string, continuityRaw: string): string {
+  try {
+    const primary = JSON.parse(primaryRaw) as { chunks?: Array<Record<string, unknown>> };
+    const continuity = JSON.parse(continuityRaw) as { chunks?: Array<Record<string, unknown>> };
+    if (!Array.isArray(primary?.chunks) || !Array.isArray(continuity?.chunks)) {
+      return primaryRaw;
+    }
+    const seen = new Set<string>();
+    const merged: Array<Record<string, unknown>> = [];
+    for (const chunk of [...primary.chunks, ...continuity.chunks]) {
+      const key = chunkKey(chunk);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(chunk);
+    }
+    return JSON.stringify({ ...primary, chunks: merged });
+  } catch {
+    return primaryRaw;
+  }
+}
+
+export async function dualVectorSearch(
+  env: Env,
+  query: string,
+  recentContext?: string | null,
+  mood?: string | null,
+  contentType?: string | null,
+  mode?: string | null,
+): Promise<string | null> {
+  const trimmed = (recentContext ?? "").trim().slice(-CONTINUITY_CONTEXT_CHAR_LIMIT).trimStart();
+  if (!trimmed) {
+    // No continuity context -> single-vector, identical to prior behaviour.
+    return semanticSearch(env, query, mood, contentType, mode);
+  }
+  const continuityQuery = `${query}\n\nRecent conversation context:\n${trimmed}`;
+  const [primaryRaw, continuityRaw] = await Promise.all([
+    semanticSearch(env, query, mood, contentType, mode),
+    semanticSearch(env, continuityQuery, mood, contentType, mode),
+  ]);
+  if (!primaryRaw) return continuityRaw;
+  if (!continuityRaw) return primaryRaw;
+  return mergeChunkResults(primaryRaw, continuityRaw);
+}
+
+export async function filteredRecall(env: Env, args: {
+  companion?: string | null;
+  content_type?: string;
+  limit?: number;
+}): Promise<string | null> {
+  return callTool(env, "sb_recall", args);
+}
+
+export async function recentPatterns(env: Env): Promise<string | null> {
+  return callTool(env, "sb_recent_patterns", {});
+}
+
+export async function sbRead(env: Env, path: string, query?: string): Promise<string | null> {
+  return callTool(env, "sb_read", query ? { path, query } : { path });
+}
+
+/**
+ * Pull the readable prose out of an `sbRead` result.
+ *
+ * `sbRead` returns the tool's raw text, which is a JSON envelope: `{"path":"...","content":"---\nfrontmatter
+ * ...\n---\n\nthe actual text"}`. Both orient paths took that string and ran
+ * `.replace(/^---[\s\S]*?---\n+/, "")` on it to strip frontmatter -- which never matched, because the string
+ * starts with `{`, not `---`. So every companion's "last session narrative" has been arriving as a JSON blob
+ * with escaped newlines and its YAML header intact, on BOTH surfaces (bot orient's `synthesis_summary` and
+ * session orient's `[Last session narrative]` block).
+ *
+ * Found 2026-08-01 during the bot cutover, pre-existing, and in the same field that had separately been FROZEN
+ * since 07-21 because the close ritual never called session_close. A companion's sense of "recently" was
+ * therefore both stale AND unreadable, which is a good illustration of why two independent defects in one
+ * field are so hard to notice: each one explains the symptom on its own.
+ *
+ * ONE helper, both call sites -- the same regex existed twice and was wrong in both, which is the shape where
+ * fixing the copy you happened to be looking at leaves the symptom alive.
+ *
+ * Fails soft in the order that loses the least: valid envelope -> its `content`, frontmatter stripped; not
+ * JSON -> the raw text, frontmatter stripped (some callers pass plain markdown); nothing usable -> null.
+ */
+export function sbExtractContent(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const stripFrontmatter = (s: string): string => s.replace(/^---[\s\S]*?---\n+/, "").trim();
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed) as { content?: unknown };
+      if (typeof parsed.content === "string") {
+        const body = stripFrontmatter(parsed.content);
+        return body.length > 0 ? body : null;
+      }
+    } catch { /* not an envelope after all -- fall through to the raw path */ }
+  }
+  const body = stripFrontmatter(trimmed);
+  return body.length > 0 ? body : null;
+}
+
+export async function sbList(env: Env, path?: string): Promise<string | null> {
+  return callTool(env, "sb_list", path ? { path } : {});
+}
+
+// ── Mutations (return ack) ─────────────────────────────────────────────────────
+
+// Ack honesty: callTool returns null on transport/JSON-RPC error, but a structurally
+// valid empty/no-op response ("") is NOT success. A save that returns nothing did not
+// persist -- treat empty as failure so the {ack:true} never outruns the write. (Part of
+// the 2026-06-24 silent-write-failure cluster; the primary fix was routing, this is
+// defense-in-depth so a future path bug surfaces loud instead of lying.)
+function savedOk(text: string | null): boolean {
+  return text !== null && text.trim().length > 0;
+}
+
+export async function sbSaveDocument(env: Env, params: {
+  content: string;
+  path?: string;
+  companion?: string;
+  tags?: string[];
+  content_type?: "document" | "note";
+}): Promise<{ ack: boolean; response: string | null }> {
+  const text = await callTool(env, "sb_save_document", params);
+  return { ack: savedOk(text), response: text };
+}
+
+export async function sbLogObservation(env: Env, content: string, tags?: string[]): Promise<{ ack: boolean }> {
+  const text = await callTool(env, "sb_log_observation", tags?.length ? { content, tags } : { content });
+  return { ack: savedOk(text) };
+}
+
+export async function sbSynthesizeSession(env: Env, session_id: string): Promise<{ ack: boolean }> {
+  const text = await callTool(env, "sb_synthesize_session", { session_id });
+  return { ack: text !== null };
+}
+
+export async function sbFileChunks(env: Env, filename: string, limit?: number, offset?: number): Promise<string | null> {
+  const args: Record<string, unknown> = { filename };
+  if (limit !== undefined) args.limit = limit;
+  if (offset !== undefined) args.offset = offset;
+  return callTool(env, "sb_file_chunks", args);
+}
+
+export async function sbSaveStudy(env: Env, params: {
+  content: string;
+  subject?: string;
+  tags?: string[];
+}): Promise<{ ack: boolean; response: string | null }> {
+  const text = await callTool(env, "sb_save_study", params);
+  return { ack: text !== null, response: text };
+}
+
+export async function sbIngestRaw(env: Env, params: {
+  title: string;
+  content: string;
+  companion?: string;
+  tags?: string[];
+}): Promise<{ ack: boolean }> {
+  const text = await callTool(env, "sb_ingest_raw", params);
+  return { ack: text !== null };
+}
